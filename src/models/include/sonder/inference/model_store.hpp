@@ -161,7 +161,9 @@ struct ModelRecord {
     std::vector<std::filesystem::path> shard_paths;
     std::vector<std::filesystem::path> projector_paths;
     std::vector<std::filesystem::path> adapter_paths;
-    std::vector<std::filesystem::path> draft_paths;
+    std::vector<std::filesystem::path> draft_paths;  // every image.draft layer in manifest order: the first is
+                                                     // the draft model, later ones its shards (images.go
+                                                     // DraftPath / DraftShardPaths)
     std::optional<GgufHeader> gguf;  // header of model_path
 
     ModelParams params;

@@ -4,6 +4,7 @@
 // native engine, without starting any daemon, copying any file or writing to the store.
 #include <cstdio>
 #include <iostream>
+#include <map>
 #include <optional>
 #include <string>
 #include <vector>
@@ -190,14 +191,31 @@ int models_main(const std::vector<std::string>& args, std::ostream& out, std::os
     }
 
     std::size_t ready = 0;
+    std::size_t shared_entries = 0;
     std::uint64_t ready_bytes = 0;
+    std::map<std::string, std::string> weight_owner;  // weight blob digest -> first ready entry that references it
     out << "Ollama models directory: " << path_text(store.value().root()) << " (read-only; nothing is copied)\n";
     for (std::size_t i = 0; i < scan.records.size(); ++i) {
         const ModelRecord& r = scan.records[i];
         out << pad(r.name.display(), 52) << " ";
         if (r.ready()) {
             ++ready;
-            ready_bytes += r.weights_bytes;
+            // Count each weight blob once: entries can share blobs (a manifest-list child and the
+            // legacy manifest that points at the same file, or tags built on one base model).
+            std::string shares_with;
+            for (const auto& b : r.blobs) {
+                if (b.role != BlobRole::model && b.role != BlobRole::projector && b.role != BlobRole::adapter &&
+                    b.role != BlobRole::draft) {
+                    continue;
+                }
+                const auto [it, inserted] = weight_owner.emplace(b.digest, r.name.display());
+                if (inserted) {
+                    ready_bytes += b.declared_size;
+                } else if (b.role == BlobRole::model && shares_with.empty()) {
+                    shares_with = it->second;
+                }
+            }
+            if (!shares_with.empty()) ++shared_entries;
             out << "ready        " << pad(human_bytes(r.weights_bytes), 10) << " "
                 << pad(r.config.quantization.empty() ? "-" : r.config.quantization, 8) << " "
                 << pad(r.config.parameter_size.empty() ? "-" : r.config.parameter_size, 7);
@@ -211,6 +229,8 @@ int models_main(const std::vector<std::string>& args, std::ostream& out, std::os
             for (const auto& p : r.shard_paths) out << "    shard: " << path_text(p) << "\n";
             for (const auto& p : r.projector_paths) out << "    projector: " << path_text(p) << "\n";
             for (const auto& p : r.adapter_paths) out << "    adapter: " << path_text(p) << "\n";
+            for (const auto& p : r.draft_paths) out << "    draft: " << path_text(p) << "\n";
+            if (!shares_with.empty()) out << "    note: same weights file as " << shares_with << "\n";
         } else {
             out << "unsupported  (" << to_string(r.reason) << ") " << r.detail << "\n";
         }
@@ -228,7 +248,9 @@ int models_main(const std::vector<std::string>& args, std::ostream& out, std::os
     }
     for (const auto& n : scan.notes) out << "note: " << n << "\n";
     out << scan.records.size() << " entries: " << ready << " ready (" << human_bytes(ready_bytes)
-        << " of weights referenced in place), " << (scan.records.size() - ready) << " unsupported\n";
+        << " of distinct weight files referenced in place";
+    if (shared_entries != 0) out << "; " << shared_entries << " entries share a weights file with an earlier one";
+    out << "), " << (scan.records.size() - ready) << " unsupported\n";
     if (!o.verify) {
         out << "digests not verified (pass --verify to hash the blobs; it reads every byte)\n";
     }

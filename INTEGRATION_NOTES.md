@@ -640,3 +640,41 @@ Not done / not verified:
   design decision (some faults are legitimately invisible to the driver).
 - `--request-timeout` is exact over the body; a server trickling header bytes
   can overrun it by up to one per-operation wait.
+
+## `claude/ret-04-model-store` (module `src/models`)
+
+Read-only reader that serves an existing Ollama model library in place (manifests-v2 and legacy
+trees, manifest lists, params/template/system records, unsupported-entry reasons, opt-in digest
+verification), the `ModelRegistry` lookup and `sonder-infer models import-ollama`. Reference:
+`docs/integration/model-store.md`.
+
+Changes outside the module, for the integrator:
+
+1. Root `CMakeLists.txt`: `src/models` added to `SONDER_MODULE_DIRS` (one line). The module needs
+   only core code (`json`, `common/sha256`) and defines `SONDER_HAS_MODEL_STORE`.
+2. `src/cli/sonder_infer_commands.hpp`: the `models` spec gains the `models import-ollama` usage
+   line, a note and an example. `tools/sonder-infer/main.cpp`: `models import-ollama` dispatches
+   to `models::models_main` behind `SONDER_HAS_MODEL_STORE` (before the generic `models` command,
+   so `models --backend ...` is unchanged); without the module it prints an error and exits 2.
+3. `tests/CMakeLists.txt`: six `sonder.cli.models_import_ollama_*` tests that run the real
+   `sonder-infer` binary against `tests/fixtures/model_store_empty` (an empty `manifests-v2/`), so
+   the executable dispatch, `--json`, `--help`, the exit codes and a drive-shaped host name
+   (`c:5000/ns/model:tag`) are covered end to end; gated on `SONDER_HAS_MODEL_STORE`.
+4. `docs/MODULES.md` (module row) and `docs/CLI.md` (`models` row).
+
+Integration hook (not wired in this lane): the native llamacpp backend should call
+`ModelRegistry::add_ollama_dir(default_ollama_models_dir())` once and `resolve(name)` when a model
+name is not an existing file path, then load `model_path` (plus `shard_paths`, `projector_paths`,
+`adapter_paths`, and `draft_paths`: first = draft model, rest = its shards) in place and use
+`params`, `template_text` and `system_prompt` as request defaults. `resolve` takes no registry
+lock while it reads the disk and a miss lists only the directories on the name's path.
+
+Open items:
+
+- No model was loaded and no inference service was started; loadability of `runner: ggml` entries
+  by llama.cpp is unverified.
+- No persistence for registered stores; digest references and the `@digest` name suffix are not
+  resolved; manifest files themselves are not hash-checked (see the doc's open-items list).
+- The case-insensitive directory lookup (`locate_ci`) is only reachable on case-sensitive file
+  systems, so on Windows it is covered by CI on Linux, not by the local run.
+- The real-store totals in the doc were measured before the CLI counted shared blobs once.

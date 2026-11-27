@@ -4,6 +4,7 @@
 #include <doctest/doctest.h>
 
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -490,6 +491,168 @@ TEST_CASE("model store: resolve rejects bad names and reports unknown ones") {
     CHECK(store.value().resolve("library/coder:7b").ok());
     CHECK(store.value().resolve("registry.ollama.ai/library/coder:7b").ok());
     CHECK_FALSE(store.value().resolve("coder").ok());  // default tag is latest, not 7b
+}
+
+namespace {
+
+// Changes the process working directory for one scope (doctest runs cases one at a time).
+struct CwdGuard {
+    fs::path old;
+    explicit CwdGuard(const fs::path& to) : old(fs::current_path()) { fs::current_path(to); }
+    ~CwdGuard() {
+        std::error_code ec;
+        fs::current_path(old, ec);
+    }
+    CwdGuard(const CwdGuard&) = delete;
+    CwdGuard& operator=(const CwdGuard&) = delete;
+};
+
+}  // namespace
+
+TEST_CASE("model store: a drive-shaped host cannot make resolve read outside the store") {
+    Store s;
+    make_full_model(s);
+    const auto cfg = s.config_blob(R"({"model_format":"gguf"})");
+    const auto model = s.blob(kModel, fake_gguf(3, 3, 32));
+
+    // A decoy manifest outside the store, placed where the drive-relative path "<d>:5000\ns\m\t"
+    // lands when the working directory is `outside` (Windows: operator/ drops the store root
+    // for a right-hand side that has a different root-name).
+    TempDir outside;
+    std::string drive = outside.path.root_name().string();
+    drive = drive.empty() ? std::string("c")
+                          : std::string(1, static_cast<char>(std::tolower(static_cast<unsigned char>(drive[0]))));
+    const std::string hostile = drive + ":5000/ns/m:t";
+    write_file(outside.path / "5000" / "ns" / "m" / "t", s.manifest(cfg, {model}));
+    CwdGuard cwd(outside.path);
+
+#if defined(_WIN32)
+    // The decoy really is reachable through the naive legacy path, so the checks below are not vacuous.
+    CHECK(fs::is_regular_file(s.tmp.path / "manifests" / (drive + ":5000") / "ns" / "m" / "t"));
+#endif
+
+    auto store = m::OllamaStore::open(s.tmp.path);
+    REQUIRE(store.ok());
+    auto r = store.value().resolve(hostile);
+    CHECK_FALSE(r.ok());
+    CHECK(r.status().code() == si::ErrorCode::not_found);
+
+    m::ModelRegistry reg;
+    REQUIRE(reg.add_ollama_dir(s.tmp.path).ok());
+    CHECK(reg.resolve(hostile).status().code() == si::ErrorCode::not_found);
+
+    // Same through the CLI that takes request-style names; nothing is printed as a record.
+    std::ostringstream out, err;
+    CHECK(m::models_main({"import-ollama", s.tmp.path.string(), "--name", hostile, "--json"}, out, err) == 1);
+    CHECK(out.str().empty());
+    CHECK(err.str().find("not in") != std::string::npos);
+
+    // A host that ends in dots after the port stays inside the store too.
+    CHECK(store.value().resolve(drive + ":5000../ns/m:t").status().code() == si::ErrorCode::not_found);
+
+    // The v2 spelling of a port host still works.
+    s.put_v2(drive + "%3A5000", "ns", "m", "t", s.manifest(cfg, {model}));
+    auto v2 = store.value().resolve(hostile);
+    REQUIRE(v2.ok());
+    CHECK(v2.value().layout == m::ManifestLayout::v2);
+    CHECK(fs::equivalent(v2.value().manifest_path, s.tmp.path / "manifests-v2" / (drive + "%3A5000") / "ns" / "m" / "t"));
+}
+
+TEST_CASE("model store: shards, drafts, messages, legacy prompt and Go-style option conversion") {
+    Store s;
+    const auto cfg = s.config_blob(R"({"model_format":"gguf"})");
+    const auto part1 = s.blob(kModel, fake_gguf(2, 2, 40, '1'));
+    const auto part2 = s.blob(kModel, fake_gguf(2, 2, 41, '2'));
+    const auto draft1 = s.blob("application/vnd.ollama.image.draft", fake_gguf(1, 1, 20, 'd'));
+    const auto draft2 = s.blob("application/vnd.ollama.image.draft", fake_gguf(1, 1, 21, 'e'));
+    const auto prompt = s.blob("application/vnd.ollama.image.prompt", "legacy {{ .Prompt }}");
+    const auto messages = s.blob("application/vnd.ollama.image.messages", R"([{"role":"user","content":"hi"}])");
+    const auto params = s.blob(kParams, R"({"num_ctx":4096.9,"top_k":-3.7,"num_predict":"many"})");
+    // Larger than the 4 MiB text cap: the layer is not read and the field stays unset.
+    const auto big_system = s.blob(kSystem, std::string((4u << 20) + 1, 's'));
+    s.put_v2("ollama.com", "library", "layers", "latest",
+             s.manifest(cfg, {part1, part2, draft1, draft2, prompt, messages, params, big_system}));
+
+    auto store = m::OllamaStore::open(s.tmp.path);
+    REQUIRE(store.ok());
+    auto rec = store.value().resolve("layers");
+    REQUIRE(rec.ok());
+    const m::ModelRecord& r = rec.value();
+    CHECK(r.ready());
+    CHECK(r.model_path == s.blob_file(part1));
+    REQUIRE(r.shard_paths.size() == 1);
+    CHECK(r.shard_paths[0] == s.blob_file(part2));
+    REQUIRE(r.draft_paths.size() == 2);  // first is the draft model, the second its shard
+    CHECK(r.draft_paths[0] == s.blob_file(draft1));
+    CHECK(r.draft_paths[1] == s.blob_file(draft2));
+    REQUIRE(r.template_text.has_value());
+    CHECK(*r.template_text == "legacy {{ .Prompt }}");
+    REQUIRE(r.messages_json.has_value());
+    CHECK(r.messages_json->find("\"hi\"") != std::string::npos);
+    CHECK(r.params.num_ctx == 4096);  // float64 -> int truncates, like Ollama
+    CHECK(r.params.top_k == -3);
+    CHECK_FALSE(r.params.num_predict.has_value());  // a string is still rejected
+    CHECK_FALSE(r.system_prompt.has_value());       // over the cap: unset, not an empty string
+    bool capped = false;
+    for (const auto& w : r.warnings) capped = capped || w.find("system layer unreadable") != std::string::npos;
+    CHECK(capped);
+}
+
+TEST_CASE("model store: manifest list falls back past a reference whose blob is absent") {
+    Store s;
+    const auto cfg = s.config_blob(R"({"model_format":"gguf"})");
+    const auto model = s.blob(kModel, fake_gguf(7, 7, 60));
+    const std::string ggml_child = std::string("{\"mediaType\":\"") + kManifestType +
+                                   "\",\"runner\":\"ggml\",\"format\":\"gguf\",\"config\":" + layer_json(cfg) +
+                                   ",\"layers\":[" + layer_json(model) + "]}";
+    const std::string missing_ref = std::string("{\"mediaType\":\"") + kManifestType + "\",\"digest\":\"sha256:" +
+                                    std::string(64, 'c') + "\",\"runner\":\"llamacpp\",\"format\":\"gguf\",\"layers\":null}";
+    const std::string list = std::string("{\"schemaVersion\":2,\"mediaType\":\"") + kListType + "\",\"manifests\":[" +
+                             missing_ref + "," + ggml_child + "]}";
+    s.put_v2("ollama.com", "library", "fallback", "latest", list);
+    const std::string only_missing = std::string("{\"schemaVersion\":2,\"mediaType\":\"") + kListType + "\",\"manifests\":[" +
+                                     missing_ref + "]}";
+    s.put_v2("ollama.com", "library", "onlymissing", "latest", only_missing);
+
+    auto store = m::OllamaStore::open(s.tmp.path);
+    REQUIRE(store.ok());
+    auto fb = store.value().resolve("fallback");
+    REQUIRE(fb.ok());
+    CHECK(fb.value().ready());
+    CHECK(fb.value().runner == "ggml");
+    CHECK(fb.value().gguf->tensor_count == 7);
+    auto om = store.value().resolve("onlymissing");
+    REQUIRE(om.ok());
+    CHECK(om.value().reason == m::UnsupportedReason::missing_blob);
+
+    // A reference that carries "layers":null is still a reference (Ollama isReference), not an
+    // inline child with no model layer.
+    const std::string child = s.manifest(cfg, {model});
+    const std::string child_hex = si::detail::sha256_hex(child);
+    write_file(s.tmp.path / "blobs" / ("sha256-" + child_hex), child);
+    const std::string null_ref = std::string("{\"mediaType\":\"") + kManifestType + "\",\"digest\":\"sha256:" + child_hex +
+                                 "\",\"runner\":\"llamacpp\",\"format\":\"gguf\",\"layers\":null}";
+    s.put_v2("ollama.com", "library", "nullref", "latest",
+             std::string("{\"schemaVersion\":2,\"mediaType\":\"") + kListType + "\",\"manifests\":[" + null_ref + "]}");
+    auto nr = store.value().resolve("nullref");
+    REQUIRE(nr.ok());
+    CHECK(nr.value().ready());
+    CHECK(nr.value().runner == "llamacpp");
+}
+
+TEST_CASE("model store: the CLI counts a weights file shared by two entries once") {
+    Store s;
+    const auto cfg = s.config_blob(R"({"model_format":"gguf"})");
+    const auto model = s.blob(kModel, fake_gguf(1, 1, 1000));
+    s.put_v2("ollama.com", "library", "alpha", "latest", s.manifest(cfg, {model}));
+    s.put_legacy("registry.ollama.ai", "library", "beta", "latest", s.manifest(cfg, {model}));
+    std::ostringstream out, err;
+    REQUIRE(m::models_main({"import-ollama", s.tmp.path.string()}, out, err) == 0);
+    const std::string text = out.str();
+    CAPTURE(text);
+    CHECK(text.find("2 entries: 2 ready (1.0 KiB of distinct weight files") != std::string::npos);
+    CHECK(text.find("same weights file as alpha:latest") != std::string::npos);
+    CHECK(text.find("1 entries share a weights file") != std::string::npos);
 }
 
 TEST_CASE("model store: digest verification is opt-in and catches corruption") {

@@ -19,6 +19,7 @@
 #include <cctype>
 #include <cstdlib>
 #include <fstream>
+#include <functional>
 #include <iterator>
 #include <map>
 #include <set>
@@ -279,11 +280,10 @@ bool as_int_option(const json::Value& v, std::int64_t& out) {
         out = *i;
         return true;
     }
+    // Ollama decodes options as float64 and converts with int(f), which truncates toward zero.
     const double d = v.as_double(0.0);
     if (d != d || d < -9.0e18 || d > 9.0e18) return false;
-    const auto i = static_cast<std::int64_t>(d);
-    if (static_cast<double>(i) != d) return false;
-    out = i;
+    out = static_cast<std::int64_t>(d);
     return true;
 }
 
@@ -387,16 +387,19 @@ void parse_config(const json::Value& doc, ModelConfig& c) {
     if (const auto* v = doc.find("embedding_length")) c.embedding_length = v->as_int(0);
 }
 
-void read_text_layer(const BlobRef& blob, std::string& out, ModelRecord& r, const char* what) {
+// True when the layer text was read into `out`; false (with a reason recorded on `r`) otherwise.
+bool read_text_layer(const BlobRef& blob, std::string& out, ModelRecord& r, const char* what) {
     std::string err;
     if (!blob.disk_size) {
         mark(r, UnsupportedReason::missing_blob, std::string(what) + " blob " + blob.digest + " is not in blobs/");
-        return;
+        return false;
     }
     if (!read_file_capped(blob.path, kMaxTextLayerBytes, out, err)) {
         r.warnings.push_back(std::string(what) + " layer unreadable: " + err);
         out.clear();
+        return false;
     }
+    return true;
 }
 
 // Selects the manifest-list child this engine can use: llamacpp first, then ggml (the same
@@ -411,6 +414,10 @@ bool select_child(const json::Value& list, const fs::path& root, json::Value& ch
         return false;
     }
     bool saw_mlx = false;
+    // A reference whose blob is not local is skipped like Ollama does (ok=false, next child);
+    // the first such failure is reported only if no later child fits.
+    UnsupportedReason skipped_reason = UnsupportedReason::none;
+    std::string skipped_detail;
     for (const char* runner : {"llamacpp", "ggml"}) {
         for (const auto& c : children->as_array()) {
             if (!c.is_object()) continue;
@@ -419,7 +426,14 @@ bool select_child(const json::Value& list, const fs::path& root, json::Value& ch
             if (lower(str_field(c, "runner")) != runner) continue;
             const std::string fmt = lower(str_field(c, "format"));
             if (!fmt.empty() && fmt != "gguf") continue;
-            if (c.find("layers") != nullptr) {  // inline child
+            // manifest.go isReference: digest set, no config digest, no layers. Anything else
+            // with a config or layers is an inline child.
+            const auto* cfg = c.find("config");
+            const bool has_config_digest = cfg != nullptr && cfg->is_object() && !str_field(*cfg, "digest").empty();
+            const auto* inline_layers = c.find("layers");
+            const bool has_layers = inline_layers != nullptr && inline_layers->is_array() && !inline_layers->as_array().empty();
+            const bool is_reference = !str_field(c, "digest").empty() && !has_config_digest && !has_layers;
+            if (!is_reference && (inline_layers != nullptr || has_config_digest)) {  // inline child
                 child_doc = c;
                 return true;
             }
@@ -432,9 +446,11 @@ bool select_child(const json::Value& list, const fs::path& root, json::Value& ch
             const fs::path p = blob_path(root, *hex);
             std::string text, err;
             if (!read_file_capped(p, kMaxManifestBytes, text, err)) {
-                reason = UnsupportedReason::missing_blob;
-                detail = "manifest list child " + short_digest(*hex) + " is not readable: " + err;
-                return false;
+                if (skipped_reason == UnsupportedReason::none) {
+                    skipped_reason = UnsupportedReason::missing_blob;
+                    skipped_detail = "manifest list child " + short_digest(*hex) + " is not readable: " + err;
+                }
+                continue;
             }
             if (detail::sha256_hex(text) != *hex) {
                 reason = UnsupportedReason::manifest_invalid;
@@ -454,6 +470,11 @@ bool select_child(const json::Value& list, const fs::path& root, json::Value& ch
             }
             return true;
         }
+    }
+    if (skipped_reason != UnsupportedReason::none) {
+        reason = skipped_reason;
+        detail = std::move(skipped_detail);
+        return false;
     }
     for (const auto& c : children->as_array()) {
         if (c.is_object() && (lower(str_field(c, "runner")) == "mlx" || lower(str_field(c, "format")) == "safetensors")) {
@@ -581,20 +602,17 @@ ModelRecord load_record(const fs::path& root, const OllamaName& name, const fs::
                 break;
             case BlobRole::tmpl: {
                 std::string body;
-                read_text_layer(blob, body, r, "template");
-                if (blob.disk_size) r.template_text = std::move(body);
+                if (read_text_layer(blob, body, r, "template")) r.template_text = std::move(body);
                 break;
             }
             case BlobRole::system: {
                 std::string body;
-                read_text_layer(blob, body, r, "system");
-                if (blob.disk_size) r.system_prompt = std::move(body);
+                if (read_text_layer(blob, body, r, "system")) r.system_prompt = std::move(body);
                 break;
             }
             case BlobRole::params: {
                 std::string body;
-                read_text_layer(blob, body, r, "params");
-                if (blob.disk_size && !body.empty()) {
+                if (read_text_layer(blob, body, r, "params") && !body.empty()) {
                     auto pj = json::parse(body, json::ParseLimits{64, 100000});
                     if (pj.ok()) {
                         parse_params(pj.value(), r.params, r.warnings);
@@ -606,8 +624,7 @@ ModelRecord load_record(const fs::path& root, const OllamaName& name, const fs::
             }
             case BlobRole::messages: {
                 std::string body;
-                read_text_layer(blob, body, r, "messages");
-                if (blob.disk_size && !body.empty()) {
+                if (read_text_layer(blob, body, r, "messages") && !body.empty()) {
                     if (json::parse(body, json::ParseLimits{64, 100000}).ok()) {
                         r.messages_json = std::move(body);
                     } else {
@@ -699,7 +716,7 @@ void walk_tree(const fs::path& root, ManifestLayout layout, std::map<std::string
     const fs::path tree = root / (layout == ManifestLayout::v2 ? "manifests-v2" : "manifests");
     for (const auto& host_e : list_dir(tree)) {
         if (!is_dir(host_e)) continue;
-        std::string host = host_e.path().filename().string();
+        std::string host = path_utf8(host_e.path().filename());
         if (layout == ManifestLayout::v2) host = decode_v2_host(host);
         for (const auto& ns_e : list_dir(host_e.path())) {
             if (!is_dir(ns_e)) continue;
@@ -707,8 +724,8 @@ void walk_tree(const fs::path& root, ManifestLayout layout, std::map<std::string
                 if (!is_dir(model_e)) continue;
                 for (const auto& tag_e : list_dir(model_e.path())) {
                     if (!is_file(tag_e)) continue;
-                    OllamaName n{host, ns_e.path().filename().string(), model_e.path().filename().string(),
-                                 tag_e.path().filename().string()};
+                    OllamaName n{host, path_utf8(ns_e.path().filename()), path_utf8(model_e.path().filename()),
+                                 path_utf8(tag_e.path().filename())};
                     if (!valid_part(Part::host, n.host) || !valid_part(Part::ns, n.ns) ||
                         !valid_part(Part::model, n.model) || !valid_part(Part::tag, n.tag)) {
                         notes.push_back("skipped " + path_utf8(tag_e.path()) + ": not a valid model name");
@@ -722,6 +739,58 @@ void walk_tree(const fs::path& root, ManifestLayout layout, std::map<std::string
             }
         }
     }
+}
+
+// True when `candidate` lies lexically below `root`. A candidate with a different root-name
+// (the drive-relative "c:5000\ns\m\t" that operator/ produces on Windows for a host "c:5000")
+// or one that climbs out through ".." makes lexically_relative return an empty path or one
+// that starts with "..".
+bool under_root(const fs::path& root, const fs::path& candidate) {
+    const fs::path rel = candidate.lexically_normal().lexically_relative(root.lexically_normal());
+    if (rel.empty() || rel == ".") return false;
+    return *rel.begin() != "..";
+}
+
+struct Located {
+    OllamaName name;
+    fs::path manifest;
+    ManifestLayout layout = ManifestLayout::v2;
+};
+
+// Case-insensitive lookup of one name by listing only the directories on its path (hosts,
+// then the matching namespace/model/tag). It reads nothing besides directory entries, so a
+// miss costs a handful of listings instead of a full scan. Layout order and the first-match
+// rule are the same as scan(), so both pick the same entry.
+std::optional<Located> locate_ci(const fs::path& root, const OllamaName& want) {
+    const std::string want_host = canonical_host(want.host);
+    const std::string want_ns = lower(want.ns), want_model = lower(want.model), want_tag = lower(want.tag);
+    for (const ManifestLayout layout : {ManifestLayout::v2, ManifestLayout::legacy}) {
+        const fs::path tree = root / (layout == ManifestLayout::v2 ? "manifests-v2" : "manifests");
+        for (const auto& host_e : list_dir(tree)) {
+            if (!is_dir(host_e)) continue;
+            std::string host = path_utf8(host_e.path().filename());
+            if (layout == ManifestLayout::v2) host = decode_v2_host(host);
+            if (canonical_host(host) != want_host) continue;
+            for (const auto& ns_e : list_dir(host_e.path())) {
+                if (!is_dir(ns_e) || lower(path_utf8(ns_e.path().filename())) != want_ns) continue;
+                for (const auto& model_e : list_dir(ns_e.path())) {
+                    if (!is_dir(model_e) || lower(path_utf8(model_e.path().filename())) != want_model) continue;
+                    for (const auto& tag_e : list_dir(model_e.path())) {
+                        if (!is_file(tag_e) || lower(path_utf8(tag_e.path().filename())) != want_tag) continue;
+                        OllamaName n{host, path_utf8(ns_e.path().filename()), path_utf8(model_e.path().filename()),
+                                     path_utf8(tag_e.path().filename())};
+                        if (!valid_part(Part::host, n.host) || !valid_part(Part::ns, n.ns) ||
+                            !valid_part(Part::model, n.model) || !valid_part(Part::tag, n.tag)) {
+                            continue;
+                        }
+                        if (is_default_host(n.host)) n.host = kOllamaDefaultHost;
+                        return Located{std::move(n), tag_e.path(), layout};
+                    }
+                }
+            }
+        }
+    }
+    return std::nullopt;
 }
 
 }  // namespace
@@ -915,18 +984,22 @@ Result<ModelRecord> OllamaStore::resolve(std::string_view name) const {
         candidates.emplace_back(root_ / "manifests" / "ollama.com" / n.ns / n.model / n.tag, ManifestLayout::legacy);
     } else {
         candidates.emplace_back(root_ / "manifests-v2" / encode_v2_host(n.host) / n.ns / n.model / n.tag, ManifestLayout::v2);
-        candidates.emplace_back(root_ / "manifests" / n.host / n.ns / n.model / n.tag, ManifestLayout::legacy);
+        // A host with a port has no legacy directory form (':' is not a path character on
+        // Windows, where "c:5000" would also be read as a drive-relative path). Such names are
+        // served only through the v2 tree (%3A); a legacy directory that exists on another OS
+        // is still found by the directory lookup below.
+        if (n.host.find(':') == std::string::npos) {
+            candidates.emplace_back(root_ / "manifests" / n.host / n.ns / n.model / n.tag, ManifestLayout::legacy);
+        }
     }
     for (const auto& [path, layout] : candidates) {
+        if (!under_root(root_, path)) continue;
         std::error_code ec;
         if (fs::is_regular_file(path, ec) && !ec) return load_record(root_, n, path, layout);
     }
-    // Case-insensitive fallback on case-sensitive file systems: match through a scan.
-    const std::string want = n.key();
-    ScanResult scanned = scan();
-    for (auto& rec : scanned.records) {
-        if (rec.name.key() == want) return std::move(rec);
-    }
+    // Case-insensitive fallback on case-sensitive file systems: list the matching directories
+    // only (no manifest, config or GGUF reads except for the one entry that matches).
+    if (auto found = locate_ci(root_, n)) return load_record(root_, found->name, found->manifest, found->layout);
     return Status(ErrorCode::not_found, "model '" + n.display() + "' is not in '" + path_utf8(root_) + "'");
 }
 
@@ -1087,13 +1160,16 @@ json::Value to_json(const ScanResult& scan, const fs::path& store_root) {
 }
 
 fs::path default_ollama_models_dir() {
-    if (const char* env = std::getenv("OLLAMA_MODELS"); env != nullptr && *env != '\0') return fs::path(env);
 #if defined(_WIN32)
-    const char* home = std::getenv("USERPROFILE");
+    // _wgetenv: getenv returns the ANSI code page form, which mangles non-ASCII paths.
+    if (const wchar_t* env = _wgetenv(L"OLLAMA_MODELS"); env != nullptr && *env != L'\0') return fs::path(env);
+    const wchar_t* home = _wgetenv(L"USERPROFILE");
+    if (home == nullptr || *home == L'\0') return {};
 #else
+    if (const char* env = std::getenv("OLLAMA_MODELS"); env != nullptr && *env != '\0') return fs::path(env);
     const char* home = std::getenv("HOME");
-#endif
     if (home == nullptr || *home == '\0') return {};
+#endif
     return fs::path(home) / ".ollama" / "models";
 }
 
@@ -1103,13 +1179,23 @@ fs::path default_ollama_models_dir() {
 Status ModelRegistry::add_ollama_dir(fs::path models_dir) {
     auto store = OllamaStore::open(std::move(models_dir));
     if (!store.ok()) return store.status();
-    std::lock_guard<std::mutex> lock(mutex_);
-    for (const auto& s : stores_) {
-        std::error_code ec;
-        if (fs::equivalent(s.root(), store.value().root(), ec) && !ec) return Status::success();
+    auto registered = [&] {
+        for (const auto& s : stores_) {
+            std::error_code ec;
+            if (fs::equivalent(s.root(), store.value().root(), ec) && !ec) return true;
+        }
+        return false;
+    };
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (registered()) return Status::success();
     }
-    stores_.push_back(store.value());
+    // The scan (directory walk, config/params reads, GGUF headers) runs without the lock so
+    // concurrent resolve()/list() calls are not stalled behind it.
     auto scanned = store.value().scan();
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (registered()) return Status::success();  // another thread added the same directory meanwhile
+    stores_.push_back(store.value());
     for (auto& rec : scanned.records) {
         const std::string key = rec.name.key();
         const bool dup = std::any_of(records_.begin(), records_.end(),
@@ -1120,15 +1206,20 @@ Status ModelRegistry::add_ollama_dir(fs::path models_dir) {
 }
 
 void ModelRegistry::refresh() {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::vector<OllamaStore> stores;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        stores = stores_;
+    }
     std::vector<ModelRecord> fresh;
     std::set<std::string> seen;
-    for (const auto& store : stores_) {
-        ScanResult scanned = store.scan();
+    for (const auto& store : stores) {
+        ScanResult scanned = store.scan();  // no lock held: this reads the disk
         for (auto& rec : scanned.records) {
             if (seen.insert(rec.name.key()).second) fresh.push_back(std::move(rec));
         }
     }
+    std::lock_guard<std::mutex> lock(mutex_);
     records_ = std::move(fresh);
 }
 
@@ -1141,17 +1232,22 @@ Result<ModelRecord> ModelRegistry::resolve(std::string_view name) const {
     auto parsed = parse_ollama_name(name);
     if (!parsed.ok()) return parsed.status();
     const std::string key = parsed.value().key();
-    std::lock_guard<std::mutex> lock(mutex_);
     auto check = [&](const ModelRecord& rec) -> Result<ModelRecord> {
         if (rec.ready()) return rec;
         return Status(ErrorCode::unsupported,
                       "model '" + rec.name.display() + "' cannot be served from the store (" + to_string(rec.reason) +
                           "): " + rec.detail);
     };
-    for (const auto& rec : records_) {
-        if (rec.name.key() == key) return check(rec);
+    std::vector<OllamaStore> stores;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (const auto& rec : records_) {
+            if (rec.name.key() == key) return check(rec);
+        }
+        stores = stores_;
     }
-    for (const auto& store : stores_) {
+    // Live lookup without the lock: it reads the disk (manifest and blob headers).
+    for (const auto& store : stores) {
         auto live = store.resolve(name);
         if (live.ok()) return check(live.value());
     }

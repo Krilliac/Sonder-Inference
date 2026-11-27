@@ -82,8 +82,9 @@ Scanning reads small files and 24 bytes of each GGUF-class blob. It never hashes
 `verify_blobs(record, options)` streams every blob through SHA-256 (64 KiB buffer) and
 compares with the blob's digest; `weights_only` skips the small layers; a `CancellationToken`
 stops it and `on_blob_start` lets a caller show progress. Verdicts: `ok`, `mismatch`,
-`missing`, `io_error`, `cancelled`. Ollama itself only verifies manifest files, so a silently
-corrupted model blob is possible in a store and this is the way to find it. Cost: a full read of
+`missing`, `io_error`, `cancelled`. Ollama checks a blob's digest when it pulls it but does not
+re-check it when it loads a model, so a blob that was corrupted after the pull goes unnoticed and
+this is the way to find it. Cost: a full read of
 every byte (the real store holds about 145 GiB of weights).
 
 ## CLI
@@ -137,7 +138,14 @@ backend can choose; it does not reimplement Ollama's Go-template or renderers.
 - Manifest files are not themselves verified against their digest (v2 manifests on POSIX are
   symlinks to blobs named by the manifest's SHA-256); list-child blobs are.
 - Windows host:port registries in the legacy tree are skipped by Ollama itself; this reader accepts
-  them only through the v2 tree (`%3A`).
+  them only through the v2 tree (`%3A`). A name whose host contains `:` therefore never builds a
+  legacy path (on Windows `c:5000` would read as a drive-relative path outside the store), and every
+  candidate path is also checked to stay lexically under the store root before it is opened.
+- Draft layers: Ollama keeps the first `image.draft` layer as the draft model and the later ones as
+  its shards; `draft_paths` lists all of them in manifest order, first = draft model.
+- Weights that several entries reference (a manifest-list child and the legacy manifest that points
+  at the same file) are counted once in the CLI total, and the later entry is noted as sharing them.
 - Only a synthetic tree is exercised in CI. The real main-PC store (`D:\ollama\models`, which is also
-  `OLLAMA_MODELS`) was scanned read-only by hand: 26 entries, 20 ready (145.3 GiB of weights referenced
-  in place), 6 unsupported, all Ollama Cloud stubs (two of them with `"layers":null`); no safetensors entry.
+  `OLLAMA_MODELS`) was scanned read-only by hand: 26 entries, 20 ready (145.3 GiB, summed per entry by
+  the earlier CLI total, which counted a blob shared by two entries twice; the CLI now counts it once
+  and that scan was not repeated), 6 unsupported, all Ollama Cloud stubs (two of them with `"layers":null`); no safetensors entry.
