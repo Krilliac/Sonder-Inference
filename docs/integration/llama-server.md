@@ -132,6 +132,15 @@ request/decode summaries; prefill events also include backend cached tokens.
 These observations are distinct from the scheduler's logical
 `reused_prompt_tokens`. They do not establish a performance or quality gain.
 
+When `standard` token telemetry is recorded, native-mode requests whose caller
+did not ask for logprobs also carry `"n_probs": K` and
+`"post_sampling_probs": true` (K = `TelemetryOptions::token_probability_top_k`,
+default 5, at most 10; 0 turns this off). The returned probabilities feed
+`inference.token.generated` (`unit: "token"`) and
+`inference.sampling.candidates` only; the caller's response is unchanged.
+Chat with tools and generic OpenAI upstreams get no probe. Details, volume
+bounds and cost: [TELEMETRY.md](../TELEMETRY.md#backend-sampled-token-probabilities).
+
 ## Prompt cache and slot affinity
 
 llama-server keeps one KV cache per slot and reuses a prompt prefix only in

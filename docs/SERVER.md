@@ -113,7 +113,7 @@ itself.
 | `--cors-origin ORIGIN` (repeatable) | none | Exact-match browser origin, allowed on every route. Must be a serialized origin as browsers send it: lowercase `scheme://host[:port]`, no path, trailing slash, query or wildcard (exit 2 otherwise). |
 | `--no-default-cors` | off | Drops the default origin list. |
 | `--telemetry-level off\|metrics\|standard\|deep` | `standard` | |
-| `--telemetry-buffer N` | `8192` | Retained events for resume (1 to 1048576). |
+| `--telemetry-buffer N` | `8192` | Retained events for resume, per sequence stream (1 to 1048576): the main stream and the periodic `*.sample` stream each keep this many, so samples never evict lifecycle events and the reverse. Each retained window is contiguous. The default per-subscriber queue holds a whole replay (`2 x N`). |
 | `--telemetry PATH` | none | Also write JSONL to `PATH` (`-` for stderr). |
 | `--capture-text` | off | Include generated text in token events. Requires `--token-file`. |
 | `--max-connections N` | `64` | A warning is printed when it plus 32 exceeds the open-file limit (`ulimit -n`). |
@@ -652,7 +652,16 @@ reasoning-only chunk has `reasoning_content` and no `content`, and deltas keep
 the order the backend produced them.
 
 `content` holds no reasoning only when the backend separates it. The in-process
-llamacpp backend leaves inline `<think>` text in `content`. llama-server with
+llamacpp backend separates `<think>...</think>` text into `reasoning_content`;
+the server always asks it to separate reasoning (the C API field is
+`separate_reasoning`, set by the server on every request). This includes the
+case where a trusted rendered generation prompt itself ends inside an open
+`<think>` (for example the bailing-think template). The legacy in-process
+renderer does not write `<think>` for Qwen3.5 (ChatML) or R1-Distill
+(DeepSeek-3) prompts, so for those models a bare leading `</think>` can still
+leak into `content` until Jinja/common_chat rendering lands. Other reasoning
+formats (gpt-oss channels, `[THINK]`, `seed:think`) are not handled yet and
+stay in `content`. llama-server with
 `--reasoning-format none` leaves the thoughts unparsed in `content`, and with
 `--reasoning-format deepseek-legacy` it keeps the `<think>` tags in `content`
 while also filling `reasoning_content`, so the client receives the reasoning
@@ -1053,7 +1062,8 @@ advertising `embeddings` (such as `llamacpp` and `llamaserver`), or 501
              "role":"inference","synthetic":true},
  "event_schema":"sonder.observatory.event/1",
  "streams":[{"transport":"sse","url":"/v1/telemetry/sse"},{"transport":"ndjson","url":"/v1/telemetry/ndjson"}],
- "resume":{"header":"Last-Event-ID","query":"last_event_id","retained_events":42,"oldest_sequence":0,"next_sequence":42},
+ "resume":{"header":"Last-Event-ID","query":"last_event_id","retained_events":42,"oldest_sequence":0,"next_sequence":42,
+             "streams":{"samples":{"retained_events":7,"oldest_sequence":0,"next_sequence":7}}},
  "auth":{"required":false,"schemes":["bearer"]},"clock":{"mono_ns":"host-monotonic"},
  "sampling_level":"standard","text_capture":"off",
  "links":{"health":"/v1/sonder/health","identity":"/v1/sonder/identity","models":"/v1/models",
@@ -1075,11 +1085,16 @@ equals the envelopes' `producer.instance_id` and the `event_id` prefix.
   No `event:` field. `: keepalive` every 15 s when idle.
 - NDJSON (`application/x-ndjson`): one envelope per line; a blank line every
   15 s when idle.
-- Resume: `Last-Event-ID` wins over `?last_event_id=`. Same instance and
-  retained: replay after it. Same instance but older than the window:
-  `: resume-gap <from>-<to>` (SSE), then the whole window. Unknown instance
-  (producer restarted), malformed or no id: the whole window. `?since=now`:
-  live only.
+- Resume: `Last-Event-ID` wins over `?last_event_id=`. The cursor is one event
+  id or several separated by `,` (at most one per sequence stream: the main
+  stream `<instance>-<n>` and the samples stream `<instance>-s<n>`). Per
+  stream: same instance and retained: replay after it. Same instance but
+  older than that stream's window: `: resume-gap <from>-<to>` (main) or
+  `: resume-gap s<from>-s<to>` (samples) on SSE, directly before the first
+  replayed event of that stream, then that stream's whole window. Unknown
+  instance (producer restarted), malformed or no member for a stream: that
+  stream's whole window. `?since=now`: live only. The two streams are
+  replayed interleaved in emission order.
 - At most 8 concurrent streams; the ninth gets 429 `overloaded` with
   `Retry-After: 1`.
 - A slow subscriber loses its oldest undelivered events: the loss shows as a
