@@ -24,6 +24,7 @@ sonder_add_module_tests(core
     test_cli_repl.cpp
     test_priority_runtime.cpp
     test_device_memory.cpp
+    test_device_diagnostics.cpp
     test_http_client.cpp
     test_recurrent_checkpoints.cpp
     test_speculative_verifier.cpp

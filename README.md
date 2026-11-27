@@ -137,6 +137,7 @@ powershell -NoProfile -File scripts\build.ps1 -Preset msvc-debug -Test
 | `SONDER_BUILD_CLI` | ON when top-level | Build `sonder-infer` |
 | `SONDER_WARNINGS_AS_ERRORS` | OFF | Warnings as errors (ON in `ci-*` presets) |
 | `SONDER_WITH_LLAMA_CPP` | OFF | Fetch llama.cpp at pinned tag `v1.0.0` and build the `llamacpp` backend; accelerators through `GGML_*` options |
+| `SONDER_BUILD_LLAMASERVER` | ON | Build the external llama-server backend and its tests; shared GPU counters and log diagnostics remain available when OFF |
 | `SONDER_WITH_TLS` | OFF | Enable `https://` in the internal HTTP client |
 | `SONDER_TLS_BACKEND` | `auto` | `auto` (Schannel on Windows, OpenSSL elsewhere), `openssl` or `schannel` |
 | `SONDER_BUILD_FUZZERS` | OFF | Build the libFuzzer targets in `fuzz/` (Clang) |

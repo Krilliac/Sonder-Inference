@@ -194,6 +194,26 @@ jobs:
       - name: Test
         run: ctest --preset ci-windows
 
+  # SONDER_BUILD_LLAMASERVER=OFF: RET-07 depends on the build staying
+  # compilable without the llamaserver backend (docs/ROADMAP_SI_ONLY.md).
+  no-llamaserver-linux:
+    name: ubuntu-latest (no llamaserver)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install Ninja
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+
+      - name: Configure
+        run: cmake --preset ci-linux -DSONDER_BUILD_LLAMASERVER=OFF
+
+      - name: Build
+        run: cmake --build --preset ci-linux
+
+      - name: Test
+        run: ctest --preset ci-linux
+
   # TLS ON (SONDER_WITH_TLS=ON) with the system OpenSSL; runs tests/tls
   # (loopback server, test-time PKI). See docs/integration/tls.md.
   tls-linux:
