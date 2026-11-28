@@ -942,13 +942,13 @@ TEST_CASE("NAT-08: Vulkan heap ReBAR, memory budget, PCIe speed, ASPM, and drive
         {"/sys/class/drm/card0/device/max_link_width", "16\n"},
         {"/sys/class/drm/card0/device/link/l0s_aspm", "0\n"},
         {"/sys/class/drm/card0/device/link/l1_aspm", "1\n"},
-        {"/sys/module/amdgpu/version", "6.12.12\n"},
+        {"/sys/module/amdgpu/version", "6.10.5.60204-2057491\n"},
     });
     const auto parsed = parse_amdgpu_sysfs_device("card0", sysfs);
     REQUIRE(parsed.has_value());
     CHECK(parsed->pci_bus_id == "0000:03:00.0");
     CHECK(parsed->driver_name == "amdgpu");
-    CHECK(parsed->driver_build == "6.12.12");
+    CHECK(parsed->driver_build == "6.10.5.60204-2057491");
     CHECK(parsed->pcie.current_gen == std::optional<std::uint32_t>(5u));
     CHECK(parsed->pcie.current_width == std::optional<std::uint32_t>(16u));
     CHECK(parsed->pcie.max_gen == std::optional<std::uint32_t>(5u));
@@ -956,7 +956,8 @@ TEST_CASE("NAT-08: Vulkan heap ReBAR, memory budget, PCIe speed, ASPM, and drive
     CHECK(parsed->pcie.aspm_state == "l1");
     CHECK(parsed->pcie.aspm_source == "linux_sysfs_link");
 
-    // Fallback to global /sys/module/pcie_aspm/parameters/policy when per-link files are absent.
+    // In-tree mainline amdgpu (no /sys/module/amdgpu/version) leaves driver_build empty
+    // so Vulkan driverInfo can populate it; global pcie_aspm policy is used as fallback.
     const auto sysfs_global_aspm = fake_files({
         {"/sys/class/drm/card0/device/vendor", "0x1002\n"},
         {"/sys/class/drm/card0/device/mem_info_vram_total", std::to_string(16ull * kGiB) + "\n"},
@@ -964,6 +965,7 @@ TEST_CASE("NAT-08: Vulkan heap ReBAR, memory budget, PCIe speed, ASPM, and drive
     });
     const auto parsed_global = parse_amdgpu_sysfs_device("card0", sysfs_global_aspm);
     REQUIRE(parsed_global.has_value());
+    CHECK(parsed_global->driver_build.empty());
     CHECK(parsed_global->pcie.aspm_state == "performance");
     CHECK(parsed_global->pcie.aspm_source == "linux_pcie_aspm_policy");
 

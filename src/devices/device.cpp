@@ -1,6 +1,7 @@
 #include "sonder/inference/device.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstring>
 #include <limits>
@@ -442,6 +443,7 @@ struct VkPhysicalDeviceProbe {
     std::optional<std::uint64_t> shared_memory_bytes;
     std::optional<std::uint32_t> warp_size;
     std::string matrix_cores;
+    std::optional<bool> ggml_coopmat_eligible;
     std::vector<VulkanMemoryHeapInfo> heaps;
     std::optional<bool> rebar;
 };
@@ -524,9 +526,14 @@ std::vector<VkPhysicalDeviceProbe> probe_vulkan_physical_devices() {
     constexpr VkStructureType kStMemProps2 = 1000059006;
     constexpr VkStructureType kStIdProps = 1000071004;
     constexpr VkStructureType kStSubgroupProps = 1000094000;
+    constexpr VkStructureType kStAmdShaderCoreProps = 1000185000;
     constexpr VkStructureType kStDriverProps = 1000196000;
     constexpr VkStructureType kStPciBusInfo = 1000212000;
+    constexpr VkStructureType kStSubgroupSizeCtrlProps = 1000225000;
     constexpr VkStructureType kStMemBudget = 1000237000;
+    constexpr VkStructureType kStIntDotProps = 1000280001;
+    constexpr std::int32_t kVkDriverAmdProprietary = 1;
+    constexpr std::int32_t kVkDriverAmdOpenSource = 2;
     constexpr std::uint32_t kVkApi11 = (1u << 22) | (1u << 12);
     constexpr std::uint32_t kVkApi12 = (1u << 22) | (2u << 12);
     constexpr std::uint32_t kMaxHeaps = 16u;
@@ -619,6 +626,29 @@ std::vector<VkPhysicalDeviceProbe> probe_vulkan_physical_devices() {
         std::uint32_t pciBus;
         std::uint32_t pciDevice;
         std::uint32_t pciFunction;
+    };
+    struct VkPhysicalDeviceShaderCorePropertiesAMDRaw {
+        VkStructureType sType;
+        void* pNext;
+        std::uint32_t shaderEngineCount;
+        std::uint32_t shaderArraysPerEngineCount;
+        std::uint32_t computeUnitsPerShaderArray;
+        std::uint32_t simdPerComputeUnit;
+        std::uint32_t wavefrontsPerSimd;
+        std::uint32_t trailing[9];
+    };
+    struct VkPhysicalDeviceShaderIntegerDotProductPropertiesRaw {
+        VkStructureType sType;
+        void* pNext;
+        VkBool32 flags[30];  // [5] == integerDotProduct4x8BitPackedMixedSignednessAccelerated
+    };
+    struct VkPhysicalDeviceSubgroupSizeControlPropertiesRaw {
+        VkStructureType sType;
+        void* pNext;
+        std::uint32_t minSubgroupSize;
+        std::uint32_t maxSubgroupSize;
+        std::uint32_t maxComputeWorkgroupSubgroups;
+        VkFlags requiredSubgroupSizeStages;
     };
     struct VkMemoryTypeRaw {
         VkFlags propertyFlags;
@@ -743,6 +773,10 @@ std::vector<VkPhysicalDeviceProbe> probe_vulkan_physical_devices() {
         bool has_driver_props_ext = false;
         bool has_coopmat = false;
         bool has_coopmat2 = false;
+        bool has_amd_shader_core = false;
+        bool has_int_dot_product = false;
+        bool has_subgroup_size_control = false;
+        bool has_shader_float8 = false;
 
         std::uint32_t ext_count = 0;
         if (enum_exts(pd, nullptr, &ext_count, nullptr) == kVkSuccess && ext_count > 0) {
@@ -758,6 +792,10 @@ std::vector<VkPhysicalDeviceProbe> probe_vulkan_physical_devices() {
                     else if (ename == "VK_KHR_driver_properties") has_driver_props_ext = true;
                     else if (ename == "VK_KHR_cooperative_matrix") has_coopmat = true;
                     else if (ename == "VK_NV_cooperative_matrix2") has_coopmat2 = true;
+                    else if (ename == "VK_AMD_shader_core_properties") has_amd_shader_core = true;
+                    else if (ename == "VK_KHR_shader_integer_dot_product") has_int_dot_product = true;
+                    else if (ename == "VK_EXT_subgroup_size_control") has_subgroup_size_control = true;
+                    else if (ename == "VK_EXT_shader_float8") has_shader_float8 = true;
                 }
             }
         }
@@ -769,6 +807,7 @@ std::vector<VkPhysicalDeviceProbe> probe_vulkan_physical_devices() {
             dev_api_ver = base_props.apiVersion;
         }
         const bool chain_driver_props = has_driver_props_ext || (inst_ver >= kVkApi12 && dev_api_ver >= kVkApi12);
+        const bool chain_amd_arch_props = has_amd_shader_core && has_int_dot_product && has_subgroup_size_control;
 
         VkPhysicalDeviceProperties2Raw props2{};
         props2.sType = kStProps2;
@@ -780,6 +819,12 @@ std::vector<VkPhysicalDeviceProbe> probe_vulkan_physical_devices() {
         drv_props.sType = kStDriverProps;
         VkPhysicalDevicePCIBusInfoPropertiesEXTRaw pci_props{};
         pci_props.sType = kStPciBusInfo;
+        VkPhysicalDeviceShaderCorePropertiesAMDRaw amd_core_props{};
+        amd_core_props.sType = kStAmdShaderCoreProps;
+        VkPhysicalDeviceShaderIntegerDotProductPropertiesRaw int_dot_props{};
+        int_dot_props.sType = kStIntDotProps;
+        VkPhysicalDeviceSubgroupSizeControlPropertiesRaw subgroup_ctrl_props{};
+        subgroup_ctrl_props.sType = kStSubgroupSizeCtrlProps;
 
         void* pnext = nullptr;
         id_props.pNext = pnext;
@@ -793,6 +838,14 @@ std::vector<VkPhysicalDeviceProbe> probe_vulkan_physical_devices() {
         if (has_pci_bus_info) {
             pci_props.pNext = pnext;
             pnext = &pci_props;
+        }
+        if (chain_amd_arch_props) {
+            amd_core_props.pNext = pnext;
+            pnext = &amd_core_props;
+            int_dot_props.pNext = pnext;
+            pnext = &int_dot_props;
+            subgroup_ctrl_props.pNext = pnext;
+            pnext = &subgroup_ctrl_props;
         }
         props2.pNext = pnext;
         get_props2(pd, &props2);
@@ -838,6 +891,25 @@ std::vector<VkPhysicalDeviceProbe> probe_vulkan_physical_devices() {
             p.matrix_cores = "KHR_coopmat";
         } else {
             p.matrix_cores = "none";
+        }
+        // Mirror ggml_vk_khr_cooperative_matrix_support (ggml-vulkan.cpp:3-56, 16858-16863):
+        // on AMD proprietary/open-source drivers, ggml enables KHR coopmat only on RDNA3/RDNA4.
+        if (p.vendor_id == 0x1002u) {
+            if (!has_coopmat) {
+                p.ggml_coopmat_eligible = false;
+            } else if (chain_driver_props &&
+                       (drv_props.driverID == kVkDriverAmdProprietary || drv_props.driverID == kVkDriverAmdOpenSource)) {
+                bool rdna3_or_4 = false;
+                if (chain_amd_arch_props && subgroup_ctrl_props.maxSubgroupSize == 64u &&
+                    subgroup_ctrl_props.minSubgroupSize == 32u && amd_core_props.wavefrontsPerSimd != 20u) {
+                    const bool is_rdna4 = has_shader_float8;
+                    const bool is_rdna3 = (int_dot_props.flags[5] != 0u);
+                    rdna3_or_4 = is_rdna3 || is_rdna4;
+                }
+                p.ggml_coopmat_eligible = rdna3_or_4;
+            } else if (chain_driver_props) {
+                p.ggml_coopmat_eligible = true;
+            }
         }
 
         VkPhysicalDeviceMemoryProperties2Raw mem2{};
@@ -893,7 +965,20 @@ void enrich_gpus_with_vulkan(std::vector<GpuDeviceInfo>& gpus, const std::vector
     if (gpus.empty()) {
         return;
     }
-    const auto vk_devs = probe_vulkan_physical_devices();
+    // Cache the Vulkan physical-device probe for 30 s so 2 s health refreshes
+    // and 10 s engine samples do not create/destroy a VkInstance on every call
+    // (and no persistent VkInstance handle is kept alive across DLL unload).
+    constexpr auto kVulkanProbeTtl = std::chrono::seconds(30);
+    static bool vk_cache_valid = false;
+    static std::chrono::steady_clock::time_point vk_cache_time{};
+    static std::vector<VkPhysicalDeviceProbe> vk_cache_devs;
+    const auto now = std::chrono::steady_clock::now();
+    if (!vk_cache_valid || (now - vk_cache_time) >= kVulkanProbeTtl) {
+        vk_cache_devs = probe_vulkan_physical_devices();
+        vk_cache_time = now;
+        vk_cache_valid = true;
+    }
+    const auto& vk_devs = vk_cache_devs;
     if (vk_devs.empty()) {
         return;
     }
@@ -919,6 +1004,9 @@ void enrich_gpus_with_vulkan(std::vector<GpuDeviceInfo>& gpus, const std::vector
         }
         if (gpu.matrix_cores.empty() && !vk.matrix_cores.empty()) {
             gpu.matrix_cores = vk.matrix_cores;
+        }
+        if (!gpu.ggml_coopmat_eligible.has_value() && vk.ggml_coopmat_eligible.has_value()) {
+            gpu.ggml_coopmat_eligible = vk.ggml_coopmat_eligible;
         }
         if (gpu.vulkan_heaps.empty() && !vk.heaps.empty()) {
             gpu.vulkan_heaps = vk.heaps;
@@ -1621,9 +1709,88 @@ std::vector<GpuDeviceInfo> live_gpu_devices() {
     const auto nvml_gpus = enumerate_win32_nvml_devices();
     merge_win32_nvml_devices(gpus, nvml_gpus);
     adapter_luids.resize(gpus.size());
-    enrich_win32_registry_drivers(gpus);
-    enrich_gpus_with_vulkan(gpus, adapter_luids);
-    enrich_win32_pcie_and_aspm(gpus);
+    // Cache the static Windows display-registry, Vulkan, cfgmgr32 PCIe, and
+    // powrprof ASPM enrichment for 30 s keyed on adapter identity so 2 s / 10 s
+    // polling refreshes live DXGI/NVML memory without repeating expensive probes.
+    struct Win32AdapterKey {
+        std::uint32_t vendor_id = 0;
+        std::uint32_t device_id = 0;
+        bool luid_valid = false;
+        std::uint8_t luid[8] = {};
+        bool operator==(const Win32AdapterKey& o) const noexcept {
+            return vendor_id == o.vendor_id && device_id == o.device_id && luid_valid == o.luid_valid &&
+                   std::memcmp(luid, o.luid, sizeof(luid)) == 0;
+        }
+    };
+    struct Win32StaticTelemetryEntry {
+        std::string pci_bus_id;
+        std::string driver_name;
+        std::string driver_build;
+        std::optional<bool> rebar;
+        std::optional<std::uint64_t> shared_memory_bytes;
+        std::optional<std::uint32_t> warp_size;
+        std::string matrix_cores;
+        std::optional<bool> ggml_coopmat_eligible;
+        PcieLinkTelemetry pcie;
+        std::vector<VulkanMemoryHeapInfo> vulkan_heaps;
+    };
+    static bool win32_cache_valid = false;
+    static std::chrono::steady_clock::time_point win32_cache_time{};
+    static std::vector<Win32AdapterKey> win32_cache_keys;
+    static std::vector<Win32StaticTelemetryEntry> win32_cache_entries;
+
+    std::vector<Win32AdapterKey> cur_keys;
+    cur_keys.reserve(gpus.size());
+    for (std::size_t i = 0; i < gpus.size(); ++i) {
+        Win32AdapterKey k;
+        k.vendor_id = gpus[i].vendor_id;
+        k.device_id = gpus[i].device_id;
+        k.luid_valid = adapter_luids[i].valid;
+        if (k.luid_valid) {
+            std::memcpy(k.luid, adapter_luids[i].bytes, sizeof(k.luid));
+        }
+        cur_keys.push_back(k);
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    constexpr auto kWin32StaticTtl = std::chrono::seconds(30);
+    if (win32_cache_valid && (now - win32_cache_time) < kWin32StaticTtl && win32_cache_keys == cur_keys &&
+        win32_cache_entries.size() == gpus.size()) {
+        for (std::size_t i = 0; i < gpus.size(); ++i) {
+            const auto& c = win32_cache_entries[i];
+            if (gpus[i].pci_bus_id.empty()) gpus[i].pci_bus_id = c.pci_bus_id;
+            if (gpus[i].driver_name.empty()) gpus[i].driver_name = c.driver_name;
+            if (gpus[i].driver_build.empty()) gpus[i].driver_build = c.driver_build;
+            if (!gpus[i].rebar.has_value()) gpus[i].rebar = c.rebar;
+            if (!gpus[i].shared_memory_bytes.has_value()) gpus[i].shared_memory_bytes = c.shared_memory_bytes;
+            if (!gpus[i].warp_size.has_value()) gpus[i].warp_size = c.warp_size;
+            if (gpus[i].matrix_cores.empty()) gpus[i].matrix_cores = c.matrix_cores;
+            if (!gpus[i].ggml_coopmat_eligible.has_value()) gpus[i].ggml_coopmat_eligible = c.ggml_coopmat_eligible;
+            if (!gpus[i].pcie.current_gen.has_value()) gpus[i].pcie.current_gen = c.pcie.current_gen;
+            if (!gpus[i].pcie.current_width.has_value()) gpus[i].pcie.current_width = c.pcie.current_width;
+            if (!gpus[i].pcie.max_gen.has_value()) gpus[i].pcie.max_gen = c.pcie.max_gen;
+            if (!gpus[i].pcie.max_width.has_value()) gpus[i].pcie.max_width = c.pcie.max_width;
+            if (gpus[i].pcie.aspm_state.empty()) {
+                gpus[i].pcie.aspm_state = c.pcie.aspm_state;
+                gpus[i].pcie.aspm_source = c.pcie.aspm_source;
+            }
+            if (gpus[i].vulkan_heaps.empty()) gpus[i].vulkan_heaps = c.vulkan_heaps;
+        }
+    } else {
+        enrich_win32_registry_drivers(gpus);
+        enrich_gpus_with_vulkan(gpus, adapter_luids);
+        enrich_win32_pcie_and_aspm(gpus);
+        win32_cache_keys = std::move(cur_keys);
+        win32_cache_entries.clear();
+        win32_cache_entries.reserve(gpus.size());
+        for (const auto& g : gpus) {
+            win32_cache_entries.push_back(Win32StaticTelemetryEntry{
+                g.pci_bus_id, g.driver_name, g.driver_build, g.rebar, g.shared_memory_bytes, g.warp_size,
+                g.matrix_cores, g.ggml_coopmat_eligible, g.pcie, g.vulkan_heaps});
+        }
+        win32_cache_time = now;
+        win32_cache_valid = true;
+    }
     for (std::size_t i = 0; i < gpus.size(); ++i) {
         gpus[i].id = "gpu:" + std::to_string(i);
     }
@@ -2378,6 +2545,9 @@ std::optional<GpuDeviceInfo> parse_amdgpu_sysfs_device(std::string_view card_id,
         info.pci_bus_id = std::move(uevent_pci_slot);
     }
     info.driver_name = "amdgpu";
+    // /sys/module/amdgpu/version is populated by DKMS amdgpu builds; in-tree
+    // mainline kernels omit it, leaving driver_build empty so Vulkan driverInfo
+    // fills it via enrich_gpus_with_vulkan().
     if (const auto drv_ver = read_file("/sys/module/amdgpu/version")) {
         info.driver_build = sanitize_driver_build_string(*drv_ver);
     }

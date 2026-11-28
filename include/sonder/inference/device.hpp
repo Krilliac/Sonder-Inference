@@ -194,6 +194,7 @@ struct GpuDeviceInfo {
     std::optional<std::uint64_t> shared_memory_bytes; // workgroup compute shared memory (bytes)
     std::optional<std::uint32_t> warp_size;           // subgroup / warp size
     std::string matrix_cores;                         // "KHR_coopmat", "NV_coopmat2", "NV_coopmat2v", "none", or ""
+    std::optional<bool> ggml_coopmat_eligible;        // ggml-vulkan KHR coopmat arch gate (e.g. AMD RDNA3/4 only on amdvlk)
     PcieLinkTelemetry pcie;                           // PCIe link gen/width and ASPM state
     std::vector<VulkanMemoryHeapInfo> vulkan_heaps;   // per-heap Vulkan memory + VK_EXT_memory_budget
     std::optional<GgmlDeviceTelemetry> ggml_device;   // parsed ggml device line when captured/merged
