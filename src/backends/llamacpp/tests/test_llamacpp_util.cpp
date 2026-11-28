@@ -12,6 +12,7 @@
 
 #include "ggml.h"
 #include "gguf.h"
+#include "device_health.hpp"
 #include "sonder/backends/llamacpp/llamacpp_backend.h"
 #include <doctest/doctest.h>
 
@@ -1362,6 +1363,38 @@ TEST_CASE("llamacpp wrapper: startup smoke test defaults off and executes end-to
         CHECK(gen.status.ok());
         CHECK(generated.size() == 3u);
         be.Unload();
+        std::error_code ec;
+        std::filesystem::remove(path, ec);
+    }
+
+    // 7. The smoke-test decode goes through the bound device-fault guard. A device
+    //    already marked unhealthy must fail the load fast with the guard's sentinel;
+    //    a raw llama_decode would run on the CPU and let the load succeed.
+    {
+        const std::string path = WriteSyntheticSmokeLlamaGguf("smoke_guard.gguf", SyntheticSmokeWeights::kVariedCycle);
+        auto tracker = std::make_shared<DeviceHealthTracker>("llamacpp");
+        LlamaCppBackend be;
+        BindBackendDeviceHealth(&be, tracker, {"CUDA0"});
+        REQUIRE(tracker->MarkDeviceUnhealthy("CUDA0", DeviceFaultReason::kDeviceLost));
+        LoadOptions opts;
+        opts.model_path = path;
+        opts.n_ctx = 64;
+        opts.n_batch = 32;
+        opts.startup_smoke_test = true;
+        const Status s = be.Load(opts);
+        INFO("load error: " << s.message);
+        CHECK_FALSE(s.ok());
+        CHECK(s.code == ErrorCode::kLoadFailed);
+        CHECK(s.message.find("rc=" + std::to_string(kDeviceUnhealthyDecodeSentinel)) != std::string::npos);
+        CHECK_FALSE(be.IsLoaded());
+
+        // After recovery the same guarded path lets the load through.
+        REQUIRE(tracker->RecoverDevice("CUDA0").ok());
+        const Status s2 = be.Load(opts);
+        INFO("load error after recovery: " << s2.message);
+        CHECK(s2.ok());
+        be.Unload();
+        UnbindBackendDeviceHealth(&be);
         std::error_code ec;
         std::filesystem::remove(path, ec);
     }
