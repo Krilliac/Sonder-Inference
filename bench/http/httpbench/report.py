@@ -148,6 +148,51 @@ def render_markdown(res: dict) -> str:
         L.append("")
     L.append("## Results")
     L.append("")
+    agentx_scens = [s for s in (res.get("scenarios") or []) if isinstance(s.get("agentx_summary"), dict)]
+    if agentx_scens:
+        L.append("## AgentX Trace-Replay Summary")
+        L.append("")
+        L.append("Headline metric: **P90 interactivity tok/s** (`p90_interactivity_tps = 1000 / itl_ms.p90`, slow tail "
+                 "pooled per concurrency level). Secondary per-request decode p50/p90 (`output_tps_per_user`, fast tail "
+                 "at p90) is shown separately. Realized prefix hit is token-weighted `sum(cached_tokens) / sum(prompt_tokens)`.")
+        L.append("")
+        for s in agentx_scens:
+            ax = s["agentx_summary"]
+            scaled_list = ax.get("scaled_traces") or []
+            clamped_n = ax.get("clamped_output_requests") or 0
+            L.append(f"- `{s['name']}`: trace_fit=`{ax.get('trace_fit')}`, "
+                     f"max_context_length={ax.get('max_context_length')} "
+                     f"(effective {ax.get('effective_max_context_length')}), "
+                     f"traces kept={ax.get('traces_kept')}/{ax.get('traces_loaded')}, "
+                     f"scaled={len(scaled_list)}, skipped={ax.get('skipped_traces')}, "
+                     f"out=0 clamped={clamped_n}")
+            for st in scaled_list[:10]:
+                L.append(f"  - scaled `{st['trace_id']}`: peak {st['original_peak_tokens']} -> "
+                         f"{st['scaled_peak_tokens']} tokens (scale_factor={st['scale_factor']:.4f})")
+        L.append("")
+        L.append("| scenario | level | ok/n | sessions | P90 interactivity tok/s | P50 interactivity tok/s | "
+                 "req decode p50/p90 (fast tail) | realized prefix hit | TTFT p50/p90 ms | ITL p50/p90 ms | "
+                 "agg output tok/s | makespan (s) |")
+        L.append("|---|---|---|---|---|---|---|---|---|---|---|---|")
+        for s in agentx_scens:
+            ax = s["agentx_summary"]
+            for g, lv in (ax.get("levels") or {}).items():
+                rh = "unknown" if lv.get("realized_prefix_hit_rate") is None else f"{lv['realized_prefix_hit_rate']:.3f}"
+                L.append("| " + " | ".join([
+                    s["name"],
+                    g,
+                    f"{lv.get('ok')}/{lv.get('requests')}",
+                    _f(lv.get("sessions"), digits=0),
+                    _f(lv.get("p90_interactivity_tps")),
+                    _f(lv.get("p50_interactivity_tps")),
+                    f"{_f(lv.get('req_decode_tps_p50'))} / {_f(lv.get('req_decode_tps_p90_fast_tail'))}",
+                    rh,
+                    f"{_f(lv.get('ttft_p50_ms'))} / {_f(lv.get('ttft_p90_ms'))}",
+                    f"{_f(lv.get('itl_p50_ms'), digits=2)} / {_f(lv.get('itl_p90_ms'), digits=2)}",
+                    _f(lv.get("aggregate_output_tps")),
+                    _f(lv.get("makespan_s"), digits=2),
+                ]) + " |")
+        L.append("")
     L.append("Times in ms unless marked. ITL is per token (chunk gap / tokens in chunk). "
              "Prefix hit is cached / prompt tokens; `unknown` means the server did not report cached tokens.")
     L.append("")
@@ -159,6 +204,10 @@ def render_markdown(res: dict) -> str:
             extra = []
             if "aggregate_decode_tps" in gs:
                 extra.append(f"agg {_f(gs['aggregate_decode_tps'])} tok/s, makespan {_f(gs.get('makespan_s'), digits=2)} s")
+            if gs.get("p90_interactivity_tps") is not None:
+                extra.append(f"p90-interactivity {_f(gs['p90_interactivity_tps'])} tok/s")
+            if gs.get("realized_prefix_hit_rate") is not None:
+                extra.append(f"realized hit {gs['realized_prefix_hit_rate']:.3f}")
             if gs.get("proposed_draft_tokens_total") is not None:
                 extra.append(f"proposed {_f(gs['proposed_draft_tokens_total'], digits=0)} draft tok")
             be = (gs.get("backend_compute_ms") or {}).get("total_ms")
@@ -212,11 +261,14 @@ def render_markdown(res: dict) -> str:
 # (label, path into a group summary, scale, lower_is_better)
 COMPARE_METRICS = [
     ("TTFT p50 ms", ("ttft_s", "p50"), 1000, True),
+    ("TTFT p90 ms", ("ttft_s", "p90"), 1000, True),
     ("TTFT p95 ms", ("ttft_s", "p95"), 1000, True),
     ("ITL p50 ms", ("itl_s", "p50"), 1000, True),
+    ("ITL p90 ms", ("itl_s", "p90"), 1000, True),
     ("ITL p95 ms", ("itl_s", "p95"), 1000, True),
     ("ITL p99 ms", ("itl_s", "p99"), 1000, True),
     ("e2e p50 s", ("e2e_s", "p50"), 1, True),
+    ("e2e p90 s", ("e2e_s", "p90"), 1, True),
     ("backend compute p50 ms", ("backend_compute_ms", "total_ms", "p50"), 1, True),
     ("backend compute p95 ms", ("backend_compute_ms", "total_ms", "p95"), 1, True),
     ("backend prefill p50 ms", ("backend_compute_ms", "prefill_ms", "p50"), 1, True),
@@ -227,7 +279,12 @@ COMPARE_METRICS = [
     ("prefill tok/s (server)", ("prefill_tps_server", "mean"), 1, False),
     ("decode tok/s (client)", ("decode_tps_client", "mean"), 1, False),
     ("decode tok/s (server)", ("decode_tps_server", "mean"), 1, False),
+    ("P90 interactivity tok/s", ("p90_interactivity_tps",), 1, False),
+    ("P50 interactivity tok/s", ("p50_interactivity_tps",), 1, False),
+    ("per-user decode tok/s p50", ("output_tps_per_user", "p50"), 1, False),
+    ("per-user decode tok/s p90 (fast tail)", ("output_tps_per_user", "p90"), 1, False),
     ("prefix hit", ("prefix_hit", "mean"), 1, False),
+    ("realized prefix hit", ("realized_prefix_hit_rate",), 1, False),
     ("recall", ("recall",), 1, False),
     ("aggregate tok/s", ("aggregate_decode_tps",), 1, False),
     ("makespan s", ("makespan_s",), 1, True),

@@ -146,6 +146,16 @@ struct LlamaCppBackendOptions {
     std::uint32_t embed_batch_tokens = 2048;
     // Maximum sequences packed per embedding/rerank forward pass (0 = auto, max 64).
     std::uint32_t embed_max_sequences = 16;
+    // In-process workload role ("main_decode" or "auxiliary"), CUDA stream priorities
+    // ("high", "default", "low"), and decode-aware auxiliary gate settings (NAT-12).
+    std::string workload_role = "main_decode";
+    std::string main_stream_priority = "high";
+    std::string aux_stream_priority = "low";
+    bool aux_gate_enabled = true;
+    double max_aux_duty_cycle = 0.05;
+    std::uint32_t aux_active_slice_tokens = 512;
+    std::uint32_t aux_active_max_sequences = 4;
+    std::uint32_t aux_max_decode_hold_ms = 25;
     // Optional root directories constraining allowed LoRA adapter files (defaults to model_dirs when empty).
     std::vector<std::string> lora_roots{};
     // Named LoRA aliases mapping alias -> base model + one or more (adapter, scale) pairs.
