@@ -426,10 +426,7 @@ std::string normalize_pci_bus_id(std::string_view raw) {
 #    define SONDER_VKAPI_CALL
 #  endif
 
-struct VkProbeAdapterLuid {
-    bool valid = false;
-    std::uint8_t bytes[8] = {};
-};
+using VkProbeAdapterLuid = GpuAdapterLuid;
 
 struct VkPhysicalDeviceProbe {
     std::uint32_t vendor_id = 0;
@@ -532,8 +529,6 @@ std::vector<VkPhysicalDeviceProbe> probe_vulkan_physical_devices() {
     constexpr VkStructureType kStSubgroupSizeCtrlProps = 1000225000;
     constexpr VkStructureType kStMemBudget = 1000237000;
     constexpr VkStructureType kStIntDotProps = 1000280001;
-    constexpr std::int32_t kVkDriverAmdProprietary = 1;
-    constexpr std::int32_t kVkDriverAmdOpenSource = 2;
     constexpr std::uint32_t kVkApi11 = (1u << 22) | (1u << 12);
     constexpr std::uint32_t kVkApi12 = (1u << 22) | (2u << 12);
     constexpr std::uint32_t kMaxHeaps = 16u;
@@ -892,25 +887,18 @@ std::vector<VkPhysicalDeviceProbe> probe_vulkan_physical_devices() {
         } else {
             p.matrix_cores = "none";
         }
-        // Mirror ggml_vk_khr_cooperative_matrix_support (ggml-vulkan.cpp:3-56, 16858-16863):
-        // on AMD proprietary/open-source drivers, ggml enables KHR coopmat only on RDNA3/RDNA4.
-        if (p.vendor_id == 0x1002u) {
-            if (!has_coopmat) {
-                p.ggml_coopmat_eligible = false;
-            } else if (chain_driver_props &&
-                       (drv_props.driverID == kVkDriverAmdProprietary || drv_props.driverID == kVkDriverAmdOpenSource)) {
-                bool rdna3_or_4 = false;
-                if (chain_amd_arch_props && subgroup_ctrl_props.maxSubgroupSize == 64u &&
-                    subgroup_ctrl_props.minSubgroupSize == 32u && amd_core_props.wavefrontsPerSimd != 20u) {
-                    const bool is_rdna4 = has_shader_float8;
-                    const bool is_rdna3 = (int_dot_props.flags[5] != 0u);
-                    rdna3_or_4 = is_rdna3 || is_rdna4;
-                }
-                p.ggml_coopmat_eligible = rdna3_or_4;
-            } else if (chain_driver_props) {
-                p.ggml_coopmat_eligible = true;
-            }
-        }
+        VulkanCoopmatArchProbe arch_probe;
+        arch_probe.vendor_id = p.vendor_id;
+        arch_probe.has_coopmat_ext = has_coopmat;
+        arch_probe.has_driver_props = chain_driver_props;
+        arch_probe.driver_id = drv_props.driverID;
+        arch_probe.has_amd_arch_props = chain_amd_arch_props;
+        arch_probe.min_subgroup_size = subgroup_ctrl_props.minSubgroupSize;
+        arch_probe.max_subgroup_size = subgroup_ctrl_props.maxSubgroupSize;
+        arch_probe.wavefronts_per_simd = amd_core_props.wavefrontsPerSimd;
+        arch_probe.has_shader_float8 = has_shader_float8;
+        arch_probe.int_dot_4x8_mixed_accelerated = (int_dot_props.flags[5] != 0u);
+        p.ggml_coopmat_eligible = classify_ggml_vulkan_coopmat_eligible(arch_probe);
 
         VkPhysicalDeviceMemoryProperties2Raw mem2{};
         mem2.sType = kStMemProps2;
@@ -965,20 +953,9 @@ void enrich_gpus_with_vulkan(std::vector<GpuDeviceInfo>& gpus, const std::vector
     if (gpus.empty()) {
         return;
     }
-    // Cache the Vulkan physical-device probe for 30 s so 2 s health refreshes
-    // and 10 s engine samples do not create/destroy a VkInstance on every call
-    // (and no persistent VkInstance handle is kept alive across DLL unload).
-    constexpr auto kVulkanProbeTtl = std::chrono::seconds(30);
-    static bool vk_cache_valid = false;
-    static std::chrono::steady_clock::time_point vk_cache_time{};
-    static std::vector<VkPhysicalDeviceProbe> vk_cache_devs;
-    const auto now = std::chrono::steady_clock::now();
-    if (!vk_cache_valid || (now - vk_cache_time) >= kVulkanProbeTtl) {
-        vk_cache_devs = probe_vulkan_physical_devices();
-        vk_cache_time = now;
-        vk_cache_valid = true;
-    }
-    const auto& vk_devs = vk_cache_devs;
+    // Always query Vulkan fresh so live VK_EXT_memory_budget per-heap
+    // budget_bytes/usage_bytes and hot-plugged adapters are never stale.
+    const auto vk_devs = probe_vulkan_physical_devices();
     if (vk_devs.empty()) {
         return;
     }
@@ -1709,88 +1686,42 @@ std::vector<GpuDeviceInfo> live_gpu_devices() {
     const auto nvml_gpus = enumerate_win32_nvml_devices();
     merge_win32_nvml_devices(gpus, nvml_gpus);
     adapter_luids.resize(gpus.size());
-    // Cache the static Windows display-registry, Vulkan, cfgmgr32 PCIe, and
-    // powrprof ASPM enrichment for 30 s keyed on adapter identity so 2 s / 10 s
-    // polling refreshes live DXGI/NVML memory without repeating expensive probes.
-    struct Win32AdapterKey {
-        std::uint32_t vendor_id = 0;
-        std::uint32_t device_id = 0;
-        bool luid_valid = false;
-        std::uint8_t luid[8] = {};
-        bool operator==(const Win32AdapterKey& o) const noexcept {
-            return vendor_id == o.vendor_id && device_id == o.device_id && luid_valid == o.luid_valid &&
-                   std::memcmp(luid, o.luid, sizeof(luid)) == 0;
-        }
-    };
-    struct Win32StaticTelemetryEntry {
-        std::string pci_bus_id;
-        std::string driver_name;
-        std::string driver_build;
-        std::optional<bool> rebar;
-        std::optional<std::uint64_t> shared_memory_bytes;
-        std::optional<std::uint32_t> warp_size;
-        std::string matrix_cores;
-        std::optional<bool> ggml_coopmat_eligible;
-        PcieLinkTelemetry pcie;
-        std::vector<VulkanMemoryHeapInfo> vulkan_heaps;
-    };
-    static bool win32_cache_valid = false;
-    static std::chrono::steady_clock::time_point win32_cache_time{};
-    static std::vector<Win32AdapterKey> win32_cache_keys;
-    static std::vector<Win32StaticTelemetryEntry> win32_cache_entries;
-
-    std::vector<Win32AdapterKey> cur_keys;
-    cur_keys.reserve(gpus.size());
-    for (std::size_t i = 0; i < gpus.size(); ++i) {
-        Win32AdapterKey k;
-        k.vendor_id = gpus[i].vendor_id;
-        k.device_id = gpus[i].device_id;
-        k.luid_valid = adapter_luids[i].valid;
-        if (k.luid_valid) {
-            std::memcpy(k.luid, adapter_luids[i].bytes, sizeof(k.luid));
-        }
-        cur_keys.push_back(k);
-    }
-
+    // Cache ONLY truly static Windows display-class registry metadata
+    // (driver_name, driver_build, pci_bus_id) for 30 s, keyed in-place on
+    // adapter (vendor_id, device_id, luid) with zero heap allocation on hit.
+    // Live Vulkan VK_EXT_memory_budget heaps and live PCIe/ASPM link state
+    // are always re-queried fresh on every call.
+    static bool win32_reg_cache_valid = false;
+    static std::chrono::steady_clock::time_point win32_reg_cache_time{};
+    static std::vector<StaticGpuDriverCacheEntry> win32_reg_cache;
     const auto now = std::chrono::steady_clock::now();
-    constexpr auto kWin32StaticTtl = std::chrono::seconds(30);
-    if (win32_cache_valid && (now - win32_cache_time) < kWin32StaticTtl && win32_cache_keys == cur_keys &&
-        win32_cache_entries.size() == gpus.size()) {
-        for (std::size_t i = 0; i < gpus.size(); ++i) {
-            const auto& c = win32_cache_entries[i];
-            if (gpus[i].pci_bus_id.empty()) gpus[i].pci_bus_id = c.pci_bus_id;
-            if (gpus[i].driver_name.empty()) gpus[i].driver_name = c.driver_name;
-            if (gpus[i].driver_build.empty()) gpus[i].driver_build = c.driver_build;
-            if (!gpus[i].rebar.has_value()) gpus[i].rebar = c.rebar;
-            if (!gpus[i].shared_memory_bytes.has_value()) gpus[i].shared_memory_bytes = c.shared_memory_bytes;
-            if (!gpus[i].warp_size.has_value()) gpus[i].warp_size = c.warp_size;
-            if (gpus[i].matrix_cores.empty()) gpus[i].matrix_cores = c.matrix_cores;
-            if (!gpus[i].ggml_coopmat_eligible.has_value()) gpus[i].ggml_coopmat_eligible = c.ggml_coopmat_eligible;
-            if (!gpus[i].pcie.current_gen.has_value()) gpus[i].pcie.current_gen = c.pcie.current_gen;
-            if (!gpus[i].pcie.current_width.has_value()) gpus[i].pcie.current_width = c.pcie.current_width;
-            if (!gpus[i].pcie.max_gen.has_value()) gpus[i].pcie.max_gen = c.pcie.max_gen;
-            if (!gpus[i].pcie.max_width.has_value()) gpus[i].pcie.max_width = c.pcie.max_width;
-            if (gpus[i].pcie.aspm_state.empty()) {
-                gpus[i].pcie.aspm_state = c.pcie.aspm_state;
-                gpus[i].pcie.aspm_source = c.pcie.aspm_source;
-            }
-            if (gpus[i].vulkan_heaps.empty()) gpus[i].vulkan_heaps = c.vulkan_heaps;
-        }
-    } else {
+    constexpr auto kWin32RegistryTtl = std::chrono::seconds(30);
+
+    const bool reg_cache_fresh =
+        win32_reg_cache_valid && (now - win32_reg_cache_time) < kWin32RegistryTtl &&
+        apply_static_gpu_driver_cache(gpus, adapter_luids, win32_reg_cache);
+    if (!reg_cache_fresh) {
         enrich_win32_registry_drivers(gpus);
-        enrich_gpus_with_vulkan(gpus, adapter_luids);
-        enrich_win32_pcie_and_aspm(gpus);
-        win32_cache_keys = std::move(cur_keys);
-        win32_cache_entries.clear();
-        win32_cache_entries.reserve(gpus.size());
-        for (const auto& g : gpus) {
-            win32_cache_entries.push_back(Win32StaticTelemetryEntry{
-                g.pci_bus_id, g.driver_name, g.driver_build, g.rebar, g.shared_memory_bytes, g.warp_size,
-                g.matrix_cores, g.ggml_coopmat_eligible, g.pcie, g.vulkan_heaps});
+        win32_reg_cache.clear();
+        win32_reg_cache.reserve(gpus.size());
+        for (std::size_t i = 0; i < gpus.size(); ++i) {
+            StaticGpuDriverCacheEntry entry;
+            entry.vendor_id = gpus[i].vendor_id;
+            entry.device_id = gpus[i].device_id;
+            entry.luid = adapter_luids[i];
+            entry.pci_bus_id = gpus[i].pci_bus_id;
+            entry.driver_name = gpus[i].driver_name;
+            entry.driver_build = gpus[i].driver_build;
+            win32_reg_cache.push_back(std::move(entry));
         }
-        win32_cache_time = now;
-        win32_cache_valid = true;
+        win32_reg_cache_time = now;
+        win32_reg_cache_valid = true;
     }
+
+    // Re-query live Vulkan heap budgets/usage and live PCIe link / ASPM state
+    // on every call so 2 s health refreshes and 10 s telemetry samples stay fresh.
+    enrich_gpus_with_vulkan(gpus, adapter_luids);
+    enrich_win32_pcie_and_aspm(gpus);
     for (std::size_t i = 0; i < gpus.size(); ++i) {
         gpus[i].id = "gpu:" + std::to_string(i);
     }
@@ -3251,6 +3182,58 @@ std::optional<bool> classify_vulkan_rebar(const std::vector<VulkanMemoryHeapInfo
         }
     }
     return classify_vulkan_rebar(heaps);
+}
+
+std::optional<bool> classify_ggml_vulkan_coopmat_eligible(const VulkanCoopmatArchProbe& probe) noexcept {
+    constexpr std::uint32_t kVendorAmd = 0x1002u;
+    constexpr std::int32_t kDriverAmdProprietary = 1;
+    constexpr std::int32_t kDriverAmdOpenSource = 2;
+
+    if (probe.vendor_id != kVendorAmd) {
+        return std::nullopt;
+    }
+    if (!probe.has_coopmat_ext) {
+        return false;
+    }
+    if (!probe.has_driver_props) {
+        return std::nullopt;
+    }
+    if (probe.driver_id == kDriverAmdProprietary || probe.driver_id == kDriverAmdOpenSource) {
+        if (!probe.has_amd_arch_props) {
+            return false;
+        }
+        // GCN: min=64, max=64; RDNA1: min=32, max=64, wavefrontsPerSimd=20.
+        if (probe.max_subgroup_size != 64u || probe.min_subgroup_size != 32u || probe.wavefronts_per_simd == 20u) {
+            return false;
+        }
+        // RDNA4: VK_EXT_shader_float8; RDNA3/3.5: 4x8 mixed-signedness int dot.
+        return probe.has_shader_float8 || probe.int_dot_4x8_mixed_accelerated;
+    }
+    // Other AMD Vulkan drivers (e.g. RADV): ggml allows KHR coopmat when advertised.
+    return true;
+}
+
+bool apply_static_gpu_driver_cache(std::vector<GpuDeviceInfo>& gpus,
+                                   const std::vector<GpuAdapterLuid>& adapter_luids,
+                                   const std::vector<StaticGpuDriverCacheEntry>& cached) {
+    if (gpus.size() != cached.size() || adapter_luids.size() != gpus.size()) {
+        return false;
+    }
+    for (std::size_t i = 0; i < gpus.size(); ++i) {
+        const auto& c = cached[i];
+        if (c.vendor_id != gpus[i].vendor_id || c.device_id != gpus[i].device_id ||
+            c.luid.valid != adapter_luids[i].valid ||
+            (c.luid.valid && std::memcmp(c.luid.bytes, adapter_luids[i].bytes, sizeof(c.luid.bytes)) != 0)) {
+            return false;
+        }
+    }
+    for (std::size_t i = 0; i < gpus.size(); ++i) {
+        const auto& c = cached[i];
+        if (gpus[i].pci_bus_id.empty()) gpus[i].pci_bus_id = c.pci_bus_id;
+        if (gpus[i].driver_name.empty()) gpus[i].driver_name = c.driver_name;
+        if (gpus[i].driver_build.empty()) gpus[i].driver_build = c.driver_build;
+    }
+    return true;
 }
 
 MemoryReading vulkan_device_local_budget_bytes(const std::vector<VulkanMemoryHeapInfo>& heaps) noexcept {

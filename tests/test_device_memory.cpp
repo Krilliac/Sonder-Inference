@@ -1065,3 +1065,147 @@ TEST_CASE("NAT-08: classify_vulkan_rebar mirrors ggml_vk_has_rebar first DEVICE_
     // Out-of-range hint falls back cleanly to first DEVICE_LOCAL heap.
     CHECK(classify_vulkan_rebar(heaps, std::optional<std::uint32_t>(99u)) == std::optional<bool>(false));
 }
+
+TEST_CASE("NAT-08: classify_ggml_vulkan_coopmat_eligible covers GCN, RDNA 1-4, non-AMD, and missing props") {
+    // Non-AMD adapters return nullopt (not AMD-gated here).
+    {
+        VulkanCoopmatArchProbe nv;
+        nv.vendor_id = 0x10DEu;
+        nv.has_coopmat_ext = true;
+        nv.has_driver_props = true;
+        nv.driver_id = 4;
+        CHECK_FALSE(classify_ggml_vulkan_coopmat_eligible(nv).has_value());
+
+        VulkanCoopmatArchProbe intel;
+        intel.vendor_id = 0x8086u;
+        intel.has_coopmat_ext = true;
+        CHECK_FALSE(classify_ggml_vulkan_coopmat_eligible(intel).has_value());
+    }
+
+    // AMD without VK_KHR_cooperative_matrix -> false.
+    {
+        VulkanCoopmatArchProbe no_ext;
+        no_ext.vendor_id = 0x1002u;
+        no_ext.has_coopmat_ext = false;
+        CHECK(classify_ggml_vulkan_coopmat_eligible(no_ext) == std::optional<bool>(false));
+    }
+
+    // AMD without driver properties -> nullopt (unknown).
+    {
+        VulkanCoopmatArchProbe no_drv;
+        no_drv.vendor_id = 0x1002u;
+        no_drv.has_coopmat_ext = true;
+        no_drv.has_driver_props = false;
+        CHECK_FALSE(classify_ggml_vulkan_coopmat_eligible(no_drv).has_value());
+    }
+
+    // AMD on RADV (driver_id != 1,2) -> true.
+    {
+        VulkanCoopmatArchProbe radv;
+        radv.vendor_id = 0x1002u;
+        radv.has_coopmat_ext = true;
+        radv.has_driver_props = true;
+        radv.driver_id = 3;  // VK_DRIVER_ID_MESA_RADV
+        CHECK(classify_ggml_vulkan_coopmat_eligible(radv) == std::optional<bool>(true));
+    }
+
+    // AMD proprietary (1) and open-source (2): GCN, RDNA1, RDNA2, missing arch props -> false; RDNA3, RDNA4 -> true.
+    for (const std::int32_t drv_id : {1, 2}) {
+        VulkanCoopmatArchProbe base;
+        base.vendor_id = 0x1002u;
+        base.has_coopmat_ext = true;
+        base.has_driver_props = true;
+        base.driver_id = drv_id;
+        base.has_amd_arch_props = true;
+
+        // Missing arch props -> false (matches ggml OTHER).
+        VulkanCoopmatArchProbe missing_arch = base;
+        missing_arch.has_amd_arch_props = false;
+        CHECK(classify_ggml_vulkan_coopmat_eligible(missing_arch) == std::optional<bool>(false));
+
+        // GCN (min=64, max=64) -> false.
+        VulkanCoopmatArchProbe gcn = base;
+        gcn.min_subgroup_size = 64u;
+        gcn.max_subgroup_size = 64u;
+        gcn.wavefronts_per_simd = 10u;
+        CHECK(classify_ggml_vulkan_coopmat_eligible(gcn) == std::optional<bool>(false));
+
+        // RDNA 1 (min=32, max=64, wavefrontsPerSimd=20) -> false.
+        VulkanCoopmatArchProbe rdna1 = base;
+        rdna1.min_subgroup_size = 32u;
+        rdna1.max_subgroup_size = 64u;
+        rdna1.wavefronts_per_simd = 20u;
+        rdna1.int_dot_4x8_mixed_accelerated = true;
+        CHECK(classify_ggml_vulkan_coopmat_eligible(rdna1) == std::optional<bool>(false));
+
+        // RDNA 2 (e.g. Raphael 0x13C0: min=32, max=64, wf=16, no float8, no 4x8 mixed int dot) -> false.
+        VulkanCoopmatArchProbe rdna2 = base;
+        rdna2.min_subgroup_size = 32u;
+        rdna2.max_subgroup_size = 64u;
+        rdna2.wavefronts_per_simd = 16u;
+        CHECK(classify_ggml_vulkan_coopmat_eligible(rdna2) == std::optional<bool>(false));
+
+        // RDNA 3 / 3.5 (e.g. 780M / 860M / RX 7900 XT: 4x8 mixed int dot accelerated) -> true.
+        VulkanCoopmatArchProbe rdna3 = rdna2;
+        rdna3.int_dot_4x8_mixed_accelerated = true;
+        CHECK(classify_ggml_vulkan_coopmat_eligible(rdna3) == std::optional<bool>(true));
+
+        // RDNA 4 (e.g. RX 9060 XT / 9070 XT: VK_EXT_shader_float8) -> true.
+        VulkanCoopmatArchProbe rdna4 = rdna2;
+        rdna4.has_shader_float8 = true;
+        CHECK(classify_ggml_vulkan_coopmat_eligible(rdna4) == std::optional<bool>(true));
+    }
+}
+
+TEST_CASE("NAT-08: apply_static_gpu_driver_cache preserves live telemetry and invalidates on hot-plug") {
+    auto make_luid = [](std::uint64_t val) {
+        GpuAdapterLuid l;
+        l.valid = true;
+        std::memcpy(l.bytes, &val, sizeof(val));
+        return l;
+    };
+
+    const GpuAdapterLuid luid0 = make_luid(0x1122334455667788ull);
+    const GpuAdapterLuid luid1 = make_luid(0x99ull);
+
+    StaticGpuDriverCacheEntry c0;
+    c0.vendor_id = 0x10DEu;
+    c0.device_id = 0x2C05u;
+    c0.luid = luid0;
+    c0.pci_bus_id = "0000:01:00.0";
+    c0.driver_name = "NVIDIA";
+    c0.driver_build = "610.88";
+
+    GpuDeviceInfo live_gpu;
+    live_gpu.vendor_id = 0x10DEu;
+    live_gpu.device_id = 0x2C05u;
+    live_gpu.pcie.current_gen = 5u;
+    live_gpu.pcie.current_width = 16u;
+    live_gpu.pcie.aspm_state = "off";
+    VulkanMemoryHeapInfo heap;
+    heap.heap_index = 0u;
+    heap.budget_bytes = MemoryReading::known(12ull * 1024ull * 1024ull * 1024ull);
+    heap.usage_bytes = MemoryReading::known(4ull * 1024ull * 1024ull * 1024ull);
+    live_gpu.vulkan_heaps = {heap};
+
+    std::vector<GpuDeviceInfo> gpus{live_gpu};
+    const std::vector<GpuAdapterLuid> luids{luid0};
+    REQUIRE(apply_static_gpu_driver_cache(gpus, luids, {c0}));
+    CHECK(gpus[0].pci_bus_id == "0000:01:00.0");
+    CHECK(gpus[0].driver_name == "NVIDIA");
+    CHECK(gpus[0].driver_build == "610.88");
+    // Live fields stay untouched.
+    CHECK(gpus[0].pcie.current_gen == std::optional<std::uint32_t>(5u));
+    CHECK(gpus[0].pcie.aspm_state == "off");
+    REQUIRE(gpus[0].vulkan_heaps.size() == 1u);
+    CHECK(gpus[0].vulkan_heaps[0].usage_bytes == MemoryReading::known(4ull * 1024ull * 1024ull * 1024ull));
+
+    // Hot-plugged OCuLink eGPU (extra adapter or changed LUID) misses cache cleanly.
+    std::vector<GpuDeviceInfo> hotplug{live_gpu, live_gpu};
+    const std::vector<GpuAdapterLuid> hotplug_luids{luid0, luid1};
+    CHECK_FALSE(apply_static_gpu_driver_cache(hotplug, hotplug_luids, {c0}));
+
+    std::vector<GpuDeviceInfo> swapped{live_gpu};
+    const std::vector<GpuAdapterLuid> swapped_luids{luid1};
+    CHECK_FALSE(apply_static_gpu_driver_cache(swapped, swapped_luids, {c0}));
+}

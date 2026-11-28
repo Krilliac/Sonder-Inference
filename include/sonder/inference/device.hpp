@@ -215,6 +215,45 @@ void merge_ggml_device_telemetry(std::vector<GpuDeviceInfo>& gpus,
 std::optional<bool> classify_vulkan_rebar(const std::vector<VulkanMemoryHeapInfo>& heaps) noexcept;
 std::optional<bool> classify_vulkan_rebar(const std::vector<VulkanMemoryHeapInfo>& heaps,
                                           std::optional<std::uint32_t> first_device_local_heap_index) noexcept;
+
+// Pure ggml-vulkan KHR cooperative-matrix architecture eligibility classifier
+// mirroring ggml-vulkan.cpp:3-56, 16858-16863.
+struct VulkanCoopmatArchProbe {
+    std::uint32_t vendor_id = 0;
+    bool has_coopmat_ext = false;
+    bool has_driver_props = false;
+    std::int32_t driver_id = 0;  // 1 = AMD proprietary, 2 = AMD open-source
+    bool has_amd_arch_props = false;
+    std::uint32_t min_subgroup_size = 0;
+    std::uint32_t max_subgroup_size = 0;
+    std::uint32_t wavefronts_per_simd = 0;
+    bool has_shader_float8 = false;
+    bool int_dot_4x8_mixed_accelerated = false;
+};
+std::optional<bool> classify_ggml_vulkan_coopmat_eligible(const VulkanCoopmatArchProbe& probe) noexcept;
+
+// Adapter LUID key used for static display-driver cache matching and Vulkan matching.
+struct GpuAdapterLuid {
+    bool valid = false;
+    std::uint8_t bytes[8] = {};
+};
+
+// Pure static display-driver cache entry (never holds live VRAM, Vulkan heap
+// budgets/usage, PCIe current link gen/width, or ASPM state).
+struct StaticGpuDriverCacheEntry {
+    std::uint32_t vendor_id = 0;
+    std::uint32_t device_id = 0;
+    GpuAdapterLuid luid;
+    std::string pci_bus_id;
+    std::string driver_name;
+    std::string driver_build;
+};
+// Applies cached static driver metadata onto `gpus` only when every adapter's
+// (vendor_id, device_id, luid) matches `cached` in order (zero allocation on
+// hit; hot-plugging any adapter returns false to force a fresh probe).
+bool apply_static_gpu_driver_cache(std::vector<GpuDeviceInfo>& gpus,
+                                   const std::vector<GpuAdapterLuid>& adapter_luids,
+                                   const std::vector<StaticGpuDriverCacheEntry>& cached);
 MemoryReading vulkan_device_local_budget_bytes(const std::vector<VulkanMemoryHeapInfo>& heaps) noexcept;
 MemoryReading vulkan_device_local_usage_bytes(const std::vector<VulkanMemoryHeapInfo>& heaps) noexcept;
 std::optional<std::uint32_t> parse_pcie_link_speed_gen(std::string_view speed_text) noexcept;
