@@ -310,7 +310,7 @@ optional.
 | Event | Level | Attributes |
 | --- | --- | --- |
 | `inference.decode.started` | metrics | `ttft_ms` num (at the first streamed chunk) |
-| `inference.token.generated` | standard | one per delivered chunk: `index` int, `bytes` int, `elapsed_ms` num, `unit` str. `unit: "token"` means one sampled token and adds `count` int (= 1), `token_id` int, `probability` num, `probability_basis` str (`post_sampling` / `pre_sampling`): always for Sonder's sampler (`post_sampling`), and for a backend-sampled token whose probability the backend reported (native `llamacpp` and deprecated `llamaserver`, see [Token probabilities and top alternatives](#token-probabilities-and-top-alternatives)). `unit: "chunk"` (other backend-sampled streams) means the token count per chunk is unknown; use `request.completed.completion_tokens`. Optional `text` str (only when the [text capture policy](#text-capture-policy) is `on` or `full` for the request) |
+| `inference.token.generated` | standard | one per delivered chunk: `index` int, `bytes` int, `elapsed_ms` num, `unit` str. `unit: "token"` means one sampled token and adds `count` int (= 1), `token_id` int (only when the [text capture policy](#text-capture-policy) is `on` or `full` for the request: token ids are output text), `probability` num, `probability_basis` str (`post_sampling` / `pre_sampling`): always for Sonder's sampler (`post_sampling`), and for a backend-sampled token whose probability the backend reported (native `llamacpp` and deprecated `llamaserver`, see [Token probabilities and top alternatives](#token-probabilities-and-top-alternatives)). `unit: "chunk"` (other backend-sampled streams) means the token count per chunk is unknown; use `request.completed.completion_tokens`. Optional `text` str (only when the [text capture policy](#text-capture-policy) is `on` or `full` for the request) |
 | `inference.prefill.completed` | metrics | once per completed request, emitted at request end: `prompt_tokens` int, `token_counts_from_backend` bool, `ttft_ms` num; optional `backend_prompt_eval_ms` num (backend-reported), `reused_prompt_tokens` int (scheduled requests) |
 | `inference.decode.completed` | metrics | once per completed request: `completion_tokens` int, `chunks` int, `decode_wall_ms` num; optional `backend_eval_ms`, `backend_tokens_per_sec`, `backend_prompt_eval_ms` num |
 
@@ -324,8 +324,9 @@ and `TelemetryOptions::token_probability_top_k` (default 5, clamped to 10) is
 not 0:
 
 - **Sonder's sampler (`token_logits` backends).** `Session` emits
-  `inference.token.generated` with `unit: "token"`, `token_id`, `probability`,
-  and `probability_basis: "post_sampling"`, and emits
+  `inference.token.generated` with `unit: "token"`, `token_id` (only when the
+  text capture policy captures output text), `probability`, and
+  `probability_basis: "post_sampling"`, and emits
   `inference.sampling.candidates` from `SamplerChain::top_candidates()`
   (bounded by `token_probability_top_k`, `token_candidates_stride`, and
   `token_candidates_max_events`). Setting `token_probability_top_k` to 0
@@ -366,8 +367,8 @@ not 0:
   those requests keep `unit: "chunk"` events unless the caller's own logprobs
   carry token ids.
 - **Events.** Each delivered chunk carrying a sampled probability emits
-  `inference.token.generated` with `unit: "token"`, `count` 1, `token_id`,
-  `probability` and `probability_basis` (`post_sampling` after the sampler
+  `inference.token.generated` with `unit: "token"`, `count` 1, `token_id`
+  (only when the text capture policy captures output text), `probability` and `probability_basis` (`post_sampling` after the sampler
   chain, or `pre_sampling` from raw logits). Frames without one stay
   `unit: "chunk"`. Hidden reasoning tokens produce no visible text chunk, so
   authoritative counts still come from `request.completed`.
@@ -381,7 +382,7 @@ not 0:
 
 | Event | Level | Attributes |
 | --- | --- | --- |
-| `inference.sampling.candidates` | standard | per sampled token (Sonder's sampler, native `llamacpp`, or `llamaserver`) with a reported probability and at least one candidate, bounded per request (below): `index` int (the `inference.token.generated` `index` of the same token), `sampled_token_id` int, `probability_basis` str (`post_sampling` / `pre_sampling`), `candidates` arr of `{token_id` int, `probability` num, optional `text` str (only when the [text capture policy](#text-capture-policy) is `on` or `full` for the request)`}`, most probable first, at most `token_probability_top_k` entries. Alternatives without a token id are left out |
+| `inference.sampling.candidates` | standard | per sampled token (Sonder's sampler, native `llamacpp`, or `llamaserver`) with a reported probability and at least one candidate, bounded per request (below): `index` int (the `inference.token.generated` `index` of the same token), `sampled_token_id` int (only when the [text capture policy](#text-capture-policy) is `on` or `full` for the request), `probability_basis` str (`post_sampling` / `pre_sampling`), `candidates` arr of `{token_id` int (same condition as `sampled_token_id`), `probability` num, optional `text` str (only when the [text capture policy](#text-capture-policy) is `on` or `full` for the request)`}`, most probable first, at most `token_probability_top_k` entries. Alternatives without a token id are left out |
 
 Volume bounds (`TelemetryOptions`): `token_candidates_stride` (default 1;
 emit for every n-th probability-bearing token of the request, counting from
@@ -552,7 +553,7 @@ advertises this vocabulary as `vocabularies: {"sonder.inference.events": 1}`.
 Telemetry never carries prompt or generated text unless the operator opts in.
 The declared policy has three values:
 
-| Policy | Output text (`inference.token.generated.text`) | Prompt text (`request.started.prompt`) |
+| Policy | Output text (`inference.token.generated.text`, and the generated token ids) | Prompt text (`request.started.prompt`) |
 | --- | --- | --- |
 | `off` (default) | no | no |
 | `on` | yes | no |
@@ -586,6 +587,14 @@ The declared policy has three values:
 - **Candidates**: the optional `text` of each `inference.sampling.candidates`
   entry follows the same policy as `inference.token.generated` (`on` or `full`,
   and never for a request that sent `X-Sonder-No-Capture`).
+- **Token ids are output text.** `POST /v1/detokenize` maps a token id back to
+  its text, so `inference.token.generated.token_id`,
+  `inference.sampling.candidates.sampled_token_id` and each candidate's
+  `token_id` follow the same policy as the output text. With `off`, or for a
+  request that sent `X-Sonder-No-Capture`, those fields are absent; `index`,
+  `bytes`, `count`, `probability`, `probability_basis` and the candidates'
+  `probability` stay, so per-token confidence is still observable. Consumers
+  must treat the id fields as optional.
 - **Not in this tree yet**: `src/sessions` has no local-only or sensitive
   request flag today. If one is added later, it must force `off` for that
   request.

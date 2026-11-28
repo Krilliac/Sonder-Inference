@@ -2401,6 +2401,9 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
     const TextCapturePolicy text_policy =
         apply_request_opt_out(configured_text_policy, request_options.no_text_capture);
     const bool capture_text = captures_output_text(text_policy);
+    // Token ids are output text (POST /v1/detokenize maps them 1:1), so every
+    // generated-token id in telemetry follows the same policy as the text.
+    const bool capture_token_ids = capture_text;
     // Token-probability / candidates bounds. Sonder's own sampler (`token_logits`)
     // and remote backends (`llamaserver`) use `telemetry_top_k` whenever
     // standard token telemetry is enabled. Native in-process backends
@@ -2707,13 +2710,17 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
                 // Sonder-sampled: exactly one token per event.
                 attrs.set("unit", "token");
                 attrs.set("count", 1);
-                attrs.set("token_id", *token_id);
+                if (capture_token_ids) {
+                    attrs.set("token_id", *token_id);
+                }
                 attrs.set("probability", probability);
                 attrs.set("probability_basis", "post_sampling");
             } else if (backend_token != nullptr) {
                 attrs.set("unit", "token");
                 attrs.set("count", 1);
-                attrs.set("token_id", backend_token->token_id);
+                if (capture_token_ids) {
+                    attrs.set("token_id", backend_token->token_id);
+                }
                 attrs.set("probability", backend_token->probability);
                 attrs.set("probability_basis", basis);
             } else {
@@ -2737,17 +2744,23 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
                                 json::Array candidates;
                                 candidates.reserve(top.size());
                                 for (const auto& c : top) {
-                                    json::Object entry{{"token_id", c.token_id}, {"probability", c.probability}};
+                                    json::Object entry;
+                                    if (capture_token_ids) {
+                                        entry.set("token_id", c.token_id);
+                                    }
+                                    entry.set("probability", c.probability);
                                     if (capture_text && c.text.has_value()) {
                                         entry.set("text", *c.text);
                                     }
                                     candidates.emplace_back(std::move(entry));
                                 }
-                                bus.emit("inference.sampling.candidates", ctx,
-                                         json::Object{{"index", chunk.index},
-                                                      {"sampled_token_id", *token_id},
-                                                      {"probability_basis", "post_sampling"},
-                                                      {"candidates", std::move(candidates)}},
+                                json::Object cand_attrs{{"index", chunk.index}};
+                                if (capture_token_ids) {
+                                    cand_attrs.set("sampled_token_id", *token_id);
+                                }
+                                cand_attrs.set("probability_basis", "post_sampling");
+                                cand_attrs.set("candidates", std::move(candidates));
+                                bus.emit("inference.sampling.candidates", ctx, std::move(cand_attrs),
                                          TelemetryLevel::standard);
                             }
                         }
@@ -2761,17 +2774,23 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
                     json::Array candidates;
                     candidates.reserve(backend_token->candidates.size());
                     for (const auto& c : backend_token->candidates) {
-                        json::Object entry{{"token_id", c.token_id}, {"probability", c.probability}};
+                        json::Object entry;
+                        if (capture_token_ids) {
+                            entry.set("token_id", c.token_id);
+                        }
+                        entry.set("probability", c.probability);
                         if (capture_text) {
                             entry.set("text", c.token);
                         }
                         candidates.emplace_back(std::move(entry));
                     }
-                    bus.emit("inference.sampling.candidates", ctx,
-                             json::Object{{"index", chunk.index},
-                                          {"sampled_token_id", backend_token->token_id},
-                                          {"probability_basis", basis},
-                                          {"candidates", std::move(candidates)}},
+                    json::Object cand_attrs{{"index", chunk.index}};
+                    if (capture_token_ids) {
+                        cand_attrs.set("sampled_token_id", backend_token->token_id);
+                    }
+                    cand_attrs.set("probability_basis", basis);
+                    cand_attrs.set("candidates", std::move(candidates));
+                    bus.emit("inference.sampling.candidates", ctx, std::move(cand_attrs),
                              TelemetryLevel::standard);
                 }
             }

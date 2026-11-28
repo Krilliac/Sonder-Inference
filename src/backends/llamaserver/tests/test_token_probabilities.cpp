@@ -12,6 +12,7 @@
 #include "fake_server.hpp"
 #include "sonder/inference/backends/llamaserver.hpp"
 #include "sonder/inference/engine.hpp"
+#include "sonder/inference/text_capture.hpp"
 
 using namespace sonder::inference;
 
@@ -107,7 +108,10 @@ TEST_SUITE("llamaserver_token_probabilities") {
     TEST_CASE("telemetry probe asks llama-server for post-sampling probabilities and keeps them from the caller") {
         sonder_test::FakeLlamaServer server;
         server.set_body(kNativePostSamplingBody);
-        Harness h(server);
+        // Token ids are output text: capture must be on for them to be exported.
+        TelemetryOptions t;
+        t.text_capture = TextCapturePolicy::on;
+        Harness h(server, t);
         unsigned chunks_with_logprobs = 0;
         auto result = h.session->generate("x", [&](const TokenChunk &chunk) {
             if (chunk.logprob.has_value() || !chunk.top_logprobs.empty())
@@ -131,16 +135,19 @@ TEST_SUITE("llamaserver_token_probabilities") {
         REQUIRE(tokens.size() == 2);
         const TokenId expected_ids[] = {13, 21};
         const double expected_p[] = {0.75, 0.5};
+        const char *expected_text[] = {"Hi", " there"};
         for (std::size_t i = 0; i < tokens.size(); ++i) {
             const auto &a = tokens[i].attributes;
             CHECK(tokens[i].level == "standard");
             CHECK(a.find("unit")->as_string() == "token");
             CHECK(a.find("count")->as_int() == 1);
             CHECK(a.find("index")->as_int() == static_cast<std::int64_t>(i));
+            REQUIRE(a.find("token_id") != nullptr);
             CHECK(a.find("token_id")->as_int() == expected_ids[i]);
             CHECK(a.find("probability")->as_double() == doctest::Approx(expected_p[i]));
             CHECK(a.find("probability_basis")->as_string() == "post_sampling");
-            CHECK(a.find("text") == nullptr);
+            REQUIRE(a.find("text") != nullptr);
+            CHECK(a.find("text")->as_string() == expected_text[i]);
         }
 
         const auto candidates = read_events(*h.sink, "inference.sampling.candidates");
@@ -149,14 +156,17 @@ TEST_SUITE("llamaserver_token_probabilities") {
             const auto &a = candidates[i].attributes;
             CHECK(candidates[i].level == "standard");
             CHECK(a.find("index")->as_int() == static_cast<std::int64_t>(i));
+            REQUIRE(a.find("sampled_token_id") != nullptr);
             CHECK(a.find("sampled_token_id")->as_int() == expected_ids[i]);
             CHECK(a.find("probability_basis")->as_string() == "post_sampling");
             const auto &list = a.find("candidates")->as_array();
             REQUIRE(list.size() == 3);
             for (std::size_t j = 1; j < list.size(); ++j)
                 CHECK(list[j - 1].find("probability")->as_double() >= list[j].find("probability")->as_double());
-            for (const auto &c : list)
-                CHECK(c.find("text") == nullptr);
+            for (const auto &c : list) {
+                REQUIRE(c.find("token_id") != nullptr);
+                CHECK(c.find("text") != nullptr);
+            }
         }
         // The second token's unsorted alternatives arrive most probable first.
         const auto &second = candidates[1].attributes.find("candidates")->as_array();
@@ -259,7 +269,9 @@ TEST_SUITE("llamaserver_token_probabilities") {
             "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"
             "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":1}}\n\n"
             "data: [DONE]\n\n");
-        Harness h(server);
+        TelemetryOptions t;
+        t.text_capture = TextCapturePolicy::on;  // token ids are output text
+        Harness h(server, t);
         SamplingConfig sampling;
         sampling.logprobs = true;
         sampling.top_logprobs = 2;
@@ -281,6 +293,7 @@ TEST_SUITE("llamaserver_token_probabilities") {
         REQUIRE(tokens.size() == 1);
         const auto &a = tokens[0].attributes;
         CHECK(a.find("unit")->as_string() == "token");
+        REQUIRE(a.find("token_id") != nullptr);
         CHECK(a.find("token_id")->as_int() == 42);
         CHECK(a.find("probability")->as_double() == doctest::Approx(0.9).epsilon(1e-5));
         CHECK(a.find("probability_basis")->as_string() == "pre_sampling");
@@ -288,6 +301,7 @@ TEST_SUITE("llamaserver_token_probabilities") {
         REQUIRE(candidates.size() == 1);
         const auto &list = candidates[0].attributes.find("candidates")->as_array();
         REQUIRE(list.size() == 2);
+        REQUIRE(list[1].find("token_id") != nullptr);
         CHECK(list[1].find("token_id")->as_int() == 8);
         CHECK(list[1].find("probability")->as_double() == doctest::Approx(0.1).epsilon(1e-5));
     }
@@ -300,7 +314,9 @@ TEST_SUITE("llamaserver_token_probabilities") {
             "\"bytes\":[],\"prob\":0.6},{\"id\":6,\"token\":\"no\",\"bytes\":[],\"prob\":0.4}]}]}}]}\n\n"
             "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"
             "data: [DONE]\n\n");
-        Harness h(server);
+        TelemetryOptions t;
+        t.text_capture = TextCapturePolicy::on;  // token ids are output text
+        Harness h(server, t);
         unsigned chunks_with_logprobs = 0;
         auto result = h.session->chat({{"user", "hi"}}, [&](const TokenChunk &chunk) {
             if (chunk.logprob.has_value() || !chunk.top_logprobs.empty())
@@ -317,6 +333,7 @@ TEST_SUITE("llamaserver_token_probabilities") {
         h.flush();
         const auto tokens = read_events(*h.sink, "inference.token.generated");
         REQUIRE(tokens.size() == 1);
+        REQUIRE(tokens[0].attributes.find("token_id") != nullptr);
         CHECK(tokens[0].attributes.find("token_id")->as_int() == 5);
         CHECK(tokens[0].attributes.find("probability")->as_double() == doctest::Approx(0.6));
         CHECK(read_events(*h.sink, "inference.sampling.candidates").size() == 1);
@@ -402,5 +419,76 @@ TEST_SUITE("llamaserver_token_probabilities") {
         CHECK(has_sampled[2]);
         CHECK(candidate_counts[2] == 1);
         CHECK(last_id == 4);
+    }
+
+    // Token ids map 1:1 to text (POST /v1/detokenize), so they follow the
+    // output-text capture policy like the "text" fields do.
+    TEST_CASE("backend-probed token ids are output text: policy off and the request opt-out export none") {
+        sonder_test::FakeLlamaServer server;
+        server.set_body(kNativePostSamplingBody);
+        const auto assert_no_ids = [](Harness &h, std::size_t expected_tokens) {
+            h.flush();
+            const auto tokens = read_events(*h.sink, "inference.token.generated");
+            REQUIRE(tokens.size() == expected_tokens);
+            for (const auto &e : tokens) {
+                const auto &a = e.attributes;
+                CHECK(a.find("token_id") == nullptr);
+                CHECK(a.find("text") == nullptr);
+                // The non-identifying measurements stay.
+                CHECK(a.find("index") != nullptr);
+                CHECK(a.find("probability") != nullptr);
+                CHECK(a.find("probability_basis") != nullptr);
+            }
+            const auto candidates = read_events(*h.sink, "inference.sampling.candidates");
+            REQUIRE(candidates.size() == expected_tokens);
+            for (const auto &e : candidates) {
+                const auto &a = e.attributes;
+                CHECK(a.find("sampled_token_id") == nullptr);
+                CHECK(a.find("probability_basis") != nullptr);
+                for (const auto &c : a.find("candidates")->as_array()) {
+                    CHECK(c.find("token_id") == nullptr);
+                    CHECK(c.find("text") == nullptr);
+                    CHECK(c.find("probability") != nullptr);
+                }
+            }
+        };
+        SUBCASE("operator policy off") {
+            TelemetryOptions t;
+            t.text_capture = TextCapturePolicy::off;
+            Harness h(server, t);
+            REQUIRE(h.session->generate("x").ok());
+            assert_no_ids(h, 2);
+        }
+        SUBCASE("operator policy full, request sets no_text_capture") {
+            TelemetryOptions t;
+            t.text_capture = TextCapturePolicy::full;
+            Harness h(server, t);
+            RequestOptions quiet;
+            quiet.no_text_capture = true;
+            REQUIRE(h.session->generate("x", {}, std::nullopt, quiet).ok());
+            assert_no_ids(h, 2);
+        }
+    }
+
+    TEST_CASE("backend-probed token ids are still exported when the policy captures output text") {
+        sonder_test::FakeLlamaServer server;
+        server.set_body(kNativePostSamplingBody);
+        TelemetryOptions t;
+        t.text_capture = TextCapturePolicy::on;
+        Harness h(server, t);
+        REQUIRE(h.session->generate("x").ok());
+        h.flush();
+        const auto tokens = read_events(*h.sink, "inference.token.generated");
+        REQUIRE(tokens.size() == 2);
+        CHECK(tokens[0].attributes.find("token_id")->as_int() == 13);
+        CHECK(tokens[1].attributes.find("token_id")->as_int() == 21);
+        const auto candidates = read_events(*h.sink, "inference.sampling.candidates");
+        REQUIRE(candidates.size() == 2);
+        CHECK(candidates[0].attributes.find("sampled_token_id")->as_int() == 13);
+        CHECK(candidates[1].attributes.find("sampled_token_id")->as_int() == 21);
+        for (const auto &e : candidates) {
+            for (const auto &c : e.attributes.find("candidates")->as_array())
+                CHECK(c.find("token_id") != nullptr);
+        }
     }
 }
