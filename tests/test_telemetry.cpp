@@ -2020,9 +2020,10 @@ TEST_CASE("VIS-03: Sonder sampler emits inference.sampling.candidates with bound
             if (on_chunk) on_chunk(c);
             return true;
         };
-        Result<GenerationResult> res =
-            use_chat ? sess.value()->chat({{"user", "candidates probe"}}, cb, sampling)
-                     : sess.value()->generate("candidates probe", cb, sampling);
+        // Named, not a braced temporary inside the ternary: GCC's -Wdangling-pointer flags the latter.
+        const std::vector<ChatMessage> messages{{"user", "candidates probe"}};
+        Result<GenerationResult> res = use_chat ? sess.value()->chat(messages, cb, sampling)
+                                                : sess.value()->generate("candidates probe", cb, sampling);
         REQUIRE_MESSAGE(res.ok(), res.status().to_string());
         engine.telemetry().flush();
         std::vector<json::Value> events;
