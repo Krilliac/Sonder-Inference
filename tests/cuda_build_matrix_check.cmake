@@ -526,7 +526,7 @@ if(NOT sr_on_rc EQUAL 0)
     message(FATAL_ERROR "sass_reg_mini (120a) configure failed:\n${sr_on_out}\n${sr_on_err}")
 endif()
 execute_process(
-    COMMAND "${CMAKE_CTEST_COMMAND}" --test-dir "${WORK_DIR}/b_sass_reg_on" -R "^sonder\\.llamacpp\\.cuda_blackwell_sass$" -V
+    COMMAND "${CMAKE_CTEST_COMMAND}" --test-dir "${WORK_DIR}/b_sass_reg_on" -C Debug -R "^sonder\\.llamacpp\\.cuda_blackwell_sass$" -V
     RESULT_VARIABLE sr_run_rc OUTPUT_VARIABLE sr_run_out ERROR_VARIABLE sr_run_err TIMEOUT 60)
 if(NOT sr_run_rc EQUAL 0 OR NOT "${sr_run_out}" MATCHES "native Blackwell SASS verified")
     message(FATAL_ERROR "registered sonder.llamacpp.cuda_blackwell_sass test did not run/pass:\n${sr_run_out}\n${sr_run_err}")
@@ -540,7 +540,7 @@ if(NOT sr_off_rc EQUAL 0)
     message(FATAL_ERROR "sass_reg_mini (86;89) configure failed:\n${sr_off_out}\n${sr_off_err}")
 endif()
 execute_process(
-    COMMAND "${CMAKE_CTEST_COMMAND}" --test-dir "${WORK_DIR}/b_sass_reg_off" -N
+    COMMAND "${CMAKE_CTEST_COMMAND}" --test-dir "${WORK_DIR}/b_sass_reg_off" -C Debug -N
     RESULT_VARIABLE sr_list_rc OUTPUT_VARIABLE sr_list_out ERROR_VARIABLE sr_list_err TIMEOUT 60)
 if("${sr_list_out}" MATCHES "cuda_blackwell_sass")
     message(FATAL_ERROR "sonder.llamacpp.cuda_blackwell_sass should not register without a real Blackwell target:\n${sr_list_out}")
