@@ -14,6 +14,7 @@
 #include <cstring>
 #include <deque>
 #include <filesystem>
+#include <functional>
 #include <exception>
 #include <limits>
 #include <memory>
@@ -3031,9 +3032,14 @@ bool EffectivePrismHadamardSupport() noexcept {
 // Greedy decode of a short fixed prompt on a freshly created context; each
 // step's logits go through EvaluateSmokeLogits and the continuation goes
 // through EvaluateSmokeTokens. Always leaves the KV cache empty.
-Status RunStartupSmokeTest(llama_context* ctx, const llama_vocab* vocab, std::uint32_t n_batch) {
-    if (ctx == nullptr || vocab == nullptr) {
-        return Status::Error(ErrorCode::kLoadFailed, "startup smoke test: context or vocab is null");
+// `decode` runs one batch. Load passes Impl::RunDecode so the smoke test goes
+// through the same device-fault guard (RunBoundBackendDecode) as generation:
+// a fault here marks the bound device unhealthy instead of going unrecorded.
+using SmokeDecodeFn = std::function<int32_t(llama_batch, Status*)>;
+Status RunStartupSmokeTest(llama_context* ctx, const llama_vocab* vocab, std::uint32_t n_batch,
+                           const SmokeDecodeFn& decode) {
+    if (ctx == nullptr || vocab == nullptr || !decode) {
+        return Status::Error(ErrorCode::kLoadFailed, "startup smoke test: context, vocab or decode is null");
     }
     const int32_t n_vocab = llama_vocab_n_tokens(vocab);
     if (n_vocab <= 0) {
@@ -3076,9 +3082,12 @@ Status RunStartupSmokeTest(llama_context* ctx, const llama_vocab* vocab, std::ui
         while (off < pending.size()) {
             const std::size_t len = std::min(chunk, pending.size() - off);
             llama_batch b = llama_batch_get_one(pending.data() + off, static_cast<int32_t>(len));
-            if (llama_decode(ctx, b) != 0) {
+            Status decode_err;
+            if (const int32_t rc = decode(b, &decode_err); rc != 0) {
                 clear_mem();
-                return Status::Error(ErrorCode::kLoadFailed, "startup smoke test: llama_decode failed");
+                std::string msg = "startup smoke test: llama_decode failed (rc=" + std::to_string(rc) + ")";
+                if (!decode_err.ok()) msg += ": " + decode_err.message;
+                return Status::Error(ErrorCode::kLoadFailed, std::move(msg));
             }
             off += len;
         }
@@ -3312,7 +3321,10 @@ Status LlamaCppBackend::Load(const LoadOptions& options) {
             llama_pooling_type(impl_->ctx) == LLAMA_POOLING_TYPE_NONE;
         if (options.startup_smoke_test && smoke_applicable) {
             if (Status s = RunGuarded(ErrorCode::kLoadFailed, "RunStartupSmokeTest", [&] {
-                    return RunStartupSmokeTest(impl_->ctx, impl_->vocab, options.n_batch);
+                    return RunStartupSmokeTest(impl_->ctx, impl_->vocab, options.n_batch,
+                                               [this](llama_batch b, Status* err) {
+                                                   return impl_->RunDecode(impl_->ctx, b, err);
+                                               });
                 });
                 !s.ok()) {
                 impl_->Release();
