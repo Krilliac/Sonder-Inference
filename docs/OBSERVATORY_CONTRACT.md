@@ -97,10 +97,12 @@ Emitted today:
   `scheduler.prefill.chunk/completed`, `scheduler.batch.formed/completed`,
   and `scheduler.configured`.
 - Sampling: `sampling.configured`, `sampling.failed`, and
-  `inference.sampling.candidates` (llamaserver backend-sampled tokens).
-  `inference.token.generated` carries `unit: "token"` with `probability` for
-  Sonder-sampled tokens and for llamaserver tokens whose probability
-  llama-server reported.
+  `inference.sampling.candidates` (Sonder's sampler chain, native `llamacpp`
+  when opted in via `native_token_probabilities` / `TelemetryLevel::deep` or
+  caller `logprobs`, and legacy `llamaserver`).
+  `inference.token.generated` carries `unit: "token"` with `probability` and
+  `probability_basis` for Sonder-sampled tokens and for native `llamacpp` /
+  `llamaserver` tokens whose probability was reported.
 - Device: `device.memory.sample` (CPU/RAM at engine start and every
   `device_sample_interval`, default 10 s).
 - Other (ADR-012): `engine.started/stopped`, `backend.registered`,
