@@ -106,15 +106,18 @@ No license conclusions from the initial broad web sweep are considered authorita
   closed (update hash after verifying the tag commit)
 - approved: yes, approved by Nate on 2026-09-26 (MIT, compatible with the project's Apache-2.0
   license; notice kept in `NOTICE`)
-- vendored tree and SI patches (planned, RET-09 in [ROADMAP_SI_ONLY.md](ROADMAP_SI_ONLY.md)):
+- vendored tree and SI patches (in progress, RET-09 in [ROADMAP_SI_ONLY.md](ROADMAP_SI_ONLY.md)):
   vendoring the `ggml`/`llama.cpp` tree and choosing the license of SI's patch
   series need a new review and an owner approval recorded here before RET-09
-  lands. Upstream code stays MIT, with its copyright and permission notice kept
-  in `NOTICE` and binary distributions. This file does not currently carry a
-  verified license record for the PrismML fork; if stock `Q2_0` does not reach
-  parity and any `PQ2_0` kernel code is ported from the PrismML fork rather
-  than written independently, its exact repository, revision, and license must
-  be verified and recorded here before adoption.
+  lands (`third_party/ggml-patches/` stays empty until that review and owner
+  approval are recorded here; `PQ2_0 -> Q2_0` re-blocking in
+  `sonder-infer reblock-pq2` is SI's own Apache-2.0 code and copies no fork
+  source). Upstream code stays MIT, with its copyright and permission notice
+  kept in `NOTICE` and binary distributions. This file does not currently carry
+  a verified license record for the PrismML fork; if stock `Q2_0` does not
+  reach parity and any `PQ2_0` kernel code is ported from the PrismML fork
+  rather than written independently, its exact repository, revision, and
+  license must be verified and recorded here before adoption.
 
 ### llguidance (optional, `SONDER_WITH_LLGUIDANCE=ON`)
 - repository: https://github.com/guidance-ai/llguidance

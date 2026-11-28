@@ -100,15 +100,16 @@ Known noise: when a request is cancelled mid-`llama_decode`, llama.cpp logs
 `llama_decode: failed to decode, ret = 2` at error level. That is the expected
 abort path. Set `SONDER_LLAMACPP_VERBOSE=1` to see llama.cpp's info logs.
 
-Offline builds: `-DFETCHCONTENT_SOURCE_DIR_LLAMACPP=/path/to/llama.cpp-v1.0.0` (any checkout of
-the pinned commit).
+Offline builds: `-DSONDER_LLAMACPP_URL=/path/to/llama.cpp-v1.0.0.tar.gz` (a local copy of the
+pinned archive; FetchContent still verifies the manifest SHA-256 and applies all SI patches).
 
-The pin lives in `cmake/llamacpp-pin.json` (one entry per track; select with
-`-DSONDER_LLAMACPP_TRACK=mainline`). `SONDER_LLAMACPP_TAG`, `_URL` and `_SHA256` are
-override-only (empty by default): a tag override needs a different SHA-256 or configure
-fails, and a cached SHA-256 that equals the last applied or a legacy default moves to the
-manifest value with a STATUS line. `python -I scripts/llamacpp_pin.py verify --tarball T
---git-dir G --commit C` compares every tarball file against the git tree.
+The single engine pin lives in `cmake/llamacpp-pin.json` (`mainline` track only; separate forks
+and local checkout overrides are retired and refused at configure time), paired with SI's own
+hash-manifested patch series in `third_party/ggml-patches/` (verified and applied at configure
+time by `cmake/ApplyGgmlPatches.cmake`). `python -I scripts/llamacpp_pin.py check` validates
+the manifest, patch hashes, and documentation consistency, and `python -I scripts/llamacpp_pin.py
+verify --tarball T --git-dir G --commit C` compares every tarball file against the git tree and
+verifies clean patch application.
 
 ## 4. Entry for docs/LICENSE_REVIEW.md
 

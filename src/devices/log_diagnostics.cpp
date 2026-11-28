@@ -536,8 +536,9 @@ void LogDiagnostics::line(std::string_view text) {
         bump("ternary_runtime_incompatible", "", [&] {
             return BackendWarning{
                 "ternary_runtime_incompatible", "warning", "log",
-                "model requires tensor types or PrismML Hadamard support unavailable in this llama-server build; "
-                "use a PrismML-capable binary or llama.cpp >= b11556",
+                "model requires private tensor types or Hadamard support unavailable in this runtime; "
+                "re-block PQ2_0 to stock Q2_0 with 'sonder-infer reblock-pq2' or serve on Sonder Inference's "
+                "pinned v1.0.0 llamacpp engine",
                 {}, 1};
         });
     }

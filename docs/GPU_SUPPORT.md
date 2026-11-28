@@ -19,9 +19,9 @@ Sonder's header-only GGUF reader (`src/server/src/gguf_header.cpp`) recognizes t
 | `41` | `Q1_0` | 128 | 18 | 1.125 | `has_one_bit_tensors` | Mainline `ggml-org/llama.cpp >= b11556` (1-bit Bonsai-1) |
 | `42` | `Q2_0` | 64 | 18 | 2.25 | `has_ternary_tensors` | Mainline `ggml-org/llama.cpp >= b11556` (2-bit ternary) |
 | `43` | `F8_E4M3` | 1 | 1 | 8.00 | `has_fp8_tensors`, `has_fp4_or_fp8_tensors` | Mainline `ggml-org/llama.cpp >= b11556` (Ada/Blackwell/RDNA 4 FP8) |
-| `142` | `PQ2_0` | 128 | 34 | 2.125 | `has_ternary_tensors`, `has_prism_private_tensors` | `PrismML-Eng/llama.cpp` (`prism` branch; Bonsai-2) |
-| `143` | `PTQ1_0` | 128 | 28 | 1.75 | `has_ternary_tensors`, `has_prism_private_tensors` | `PrismML-Eng/llama.cpp` (`prism` branch; dense ternary) |
-| `145` | `PQ2_0M` | 128 | 36 | 2.25 | `has_ternary_tensors`, `has_prism_private_tensors` | `PrismML-Eng/llama.cpp` (`prism` branch; KV-only) |
+| `142` | `PQ2_0` | 128 | 34 | 2.125 | `has_ternary_tensors`, `has_prism_private_tensors` | Losslessly re-block to stock `Q2_0` (type `42`, `pq2_reblock`) for native `llamacpp` (`v1.0.0`); separate forks retired |
+| `143` | `PTQ1_0` | 128 | 28 | 1.75 | `has_ternary_tensors`, `has_prism_private_tensors` | Private ternary layout (requires an SI `third_party/ggml-patches/` kernel patch; separate forks retired) |
+| `145` | `PQ2_0M` | 128 | 36 | 2.25 | `has_ternary_tensors`, `has_prism_private_tensors` | Private KV-only layout (retired with external fork binaries; use `q8_0` or `q4_0` KV on native `llamacpp`) |
 
 ### Quantized KV Cache Types
 
@@ -38,30 +38,28 @@ Sonder's header-only GGUF reader (`src/server/src/gguf_header.cpp`) recognizes t
 | `q4_1` | 0.6250 (20/32) | 0.31x | `llamacpp`, `llamaserver` |
 | `q4_0`, `iq4_nl` | 0.5625 (18/32) | 0.28x | `llamacpp`, `llamaserver` |
 | `q2_0` | 0.28125 (18/64) | 0.14x | `llamaserver` (upstream `>= b11556`) |
-| `pq2_0m` | 0.28125 (36/128) | 0.14x | `llamaserver` (PrismML `prism` branch) |
+| `pq2_0m` | 0.28125 (36/128) | 0.14x | Deprecated `llamaserver` profile parsing only (rejected on native `llamacpp`; removal in `RET-07`) |
 
 Rules enforced at startup before any model file is loaded:
 
 - Any quantized V cache (`is_quantized_kv_cache_type()` — everything except `f32`, `f16`, `bf16`) requires `flash_attn` `on` or `auto`. Pairing a quantized V cache with `flash_attn: "off"` fails fast with `invalid_argument`.
-- Direct `llamacpp` profiles and `serve` CLI flags reject `f8_e4m3`, `q2_0`, and `pq2_0m` as KV cache types (`is_llamacpp_kv_cache_type()` in `launch_profile.cpp`); use `llamaserver` with a matching `llama-server` binary. The default `v1.0.0` pin does define `GGML_TYPE_F8_E4M3`, and direct `LoadOptions` accept `f8_e4m3` there, but the profile and CLI paths still reject it.
+- Direct `llamacpp` profiles and `serve` CLI flags reject `f8_e4m3`, `q2_0`, and `pq2_0m` as KV cache types (`is_llamacpp_kv_cache_type()` in `launch_profile.cpp`); legacy `llamaserver` profiles still parse those names until external backend removal in `RET-07` (`pq2_0m` is a retired private KV format). The default `v1.0.0` pin defines `GGML_TYPE_F8_E4M3` and `GGML_TYPE_Q2_0`, and direct `LoadOptions` accept `f8_e4m3`.
 - Compact ternary/1-bit weights reduce weight VRAM sharply, making KV cache dtype, context length, FlashAttention kernel pairing, and concurrent slot count the primary VRAM levers on 16 GiB cards.
 
-### PrismML Hadamard Metadata (`prism.hadamard.*`) and Runtime Overrides
+### Hadamard Metadata (`prism.hadamard.*`), Stock `Q2_0` Re-blocking, and SI Patches
 
-When a GGUF header contains any `prism.hadamard.*` metadata key (such as `prism.hadamard.transform`, `prism.hadamard.block_size`, or `prism.hadamard.sign_values`) or any PrismML private tensor (`PQ2_0`, `PTQ1_0`, `PQ2_0M`):
+Sonder Inference builds a single SHA-pinned `llama.cpp` `v1.0.0` engine (`cmake/llamacpp-pin.json`) with SI's own configure-time patch series (`third_party/ggml-patches/`). Separate `llama.cpp` forks, the Prism router, `local-fast`, and external local-checkout overrides (`-LlamaCppSourceDir`, `--llamacpp-src`, `FETCHCONTENT_SOURCE_DIR_LLAMACPP`) are retired.
 
 - `gguf_header.cpp` records `prism_hadamard = true`, captures `prism_hadamard_transform` and `prism_hadamard_block_size`, and streams past large sign arrays without bloating `GgufModelInfo::metadata`.
-- `VramEstimate`, `PlacementPlan`, and `/v1/models` (`sonder.profile`) set `"prism_hadamard": true` and `"requires_prism_runtime": true`.
-- `plan_model_placement()` adds an explicit warning that stock `llama-server` cannot load the file and requires PrismML's Hadamard-capable runtime.
-- If a spawned `llama-server` fails to load unknown tensor types or reports a `prism.hadamard` error in its log file, `LogDiagnostics` emits warning code `ternary_runtime_incompatible`.
+- Pinned `llama.cpp` `v1.0.0` natively executes `prism.hadamard.*` (v1 and v2, including `tied_output`) and FWHT on CPU, CUDA, and Vulkan for stock `Q2_0` (type `42`, group 64) and `Q1_0` (type `41`) GGUFs. For those stock files, `prism_hadamard` is `true` and `requires_prism_runtime` is `false`.
+- When a GGUF contains private tensor IDs (`PQ2_0` `142`, `PTQ1_0` `143`, `PQ2_0M` `145`, i.e. `has_prism_private_tensors == true`), `VramEstimate`, `PlacementPlan`, and `/v1/models` (`sonder.profile`) set `"requires_prism_runtime": true` and advise re-blocking `PQ2_0` losslessly to stock `Q2_0` with `sonder-infer reblock-pq2 --input <in.gguf> --output <out.gguf>` (`include/sonder/inference/pq2_reblock.hpp`) or applying a verified SI patch under `third_party/ggml-patches/`.
 
-To build the direct `llamacpp` backend against a newer mainline or PrismML `llama.cpp` tree without editing the default pin in `cmake/llamacpp-pin.json` (see also [BACKENDS.md](BACKENDS.md#upstream-llamacpp-pin-and-ternary--prismml-overrides)):
+Build the native `llamacpp` GPU presets directly against the pinned archive (or pass a local mirror tarball via `-DSONDER_LLAMACPP_URL` for offline builds):
 
 ```powershell
-# Windows one-liner (normalizes path, enters VS x64 DevShell, builds & tests):
+# Windows one-liner (enters VS x64 DevShell, builds & tests pinned v1.0.0 + ggml-patches):
 powershell -NoProfile -File scripts\build.ps1 `
   -Preset windows-cuda-blackwell `
-  -LlamaCppSourceDir D:\ollama\runtimes\PrismML-Eng\llama.cpp `
   -Jobs 8 -Test
 ```
 
@@ -69,29 +67,25 @@ powershell -NoProfile -File scripts\build.ps1 `
 # Linux / WSL2 one-liner (probes GPU toolchains, builds & tests):
 ./scripts/build.sh \
   --preset linux-cuda-blackwell \
-  --llamacpp-src /path/to/PrismML-Eng/llama.cpp \
   --jobs 8 --test
 
-# Direct CMake invocation or explicit upstream tag + SHA-256 (fails closed on mismatch):
+# Offline build using a local copy of the SHA-pinned v1.0.0 archive:
 cmake --preset linux-cuda-rtx \
-  -DSONDER_LLAMACPP_TAG=b11556 \
-  -DSONDER_LLAMACPP_SHA256=<sha256-of-tarball>
+  -DSONDER_LLAMACPP_URL=/path/to/llama.cpp-v1.0.0.tar.gz
 ```
 
-Both wrapper scripts also forward arbitrary CMake cache flags (`-ExtraCMakeArgs @('-DSONDER_WARNINGS_AS_ERRORS=ON')` in `scripts/build.ps1`; `-- -DSONDER_WARNINGS_AS_ERRORS=ON` or `-D...` in `scripts/build.sh`). For WSL/Linux CI or CPU-only direct verification without GPU toolchains, use `--preset linux-llamacpp` (`SONDER_WITH_LLAMA_CPP=ON`, `RelWithDebInfo`).
+Both wrapper scripts also forward CMake cache flags (`-ExtraCMakeArgs @('-DSONDER_WARNINGS_AS_ERRORS=ON')` in `scripts/build.ps1`; `-- -DSONDER_WARNINGS_AS_ERRORS=ON` or `-D...` in `scripts/build.sh`). For WSL/Linux CI or CPU-only direct verification without GPU toolchains, use `--preset linux-llamacpp` (`SONDER_WITH_LLAMA_CPP=ON`, `RelWithDebInfo`).
 
-The `llamaserver` backend requires no `llama.cpp` compile-time linkage: point `--llamaserver-executable` (or `executable` in JSON config) at a mainline `>= b11556` or PrismML `llama-server` binary.
-
-### PrismML Bonsai GPU Acceleration Matrix
+### Bonsai GPU Acceleration Matrix (Single SI Engine)
 
 | Host OS | Accelerator | Preset (`CMakePresets.json`) | Runtime / Toolchain | Supported Bonsai GGUF Families |
 | --- | --- | --- | --- | --- |
-| Windows 11 | NVIDIA Blackwell (`sm_120a` / `sm_120f`, RTX 50-series) | `windows-cuda-blackwell` / `windows-cuda-blackwell-120f` | CUDA `>= 13.4` (`13.5` preferred) + MSVC (`GGML_CUDA_GRAPHS=ON`, `GGML_CUDA_FA_ALL_QUANTS=ON`) | Bonsai-1 (`Q1_0`), Bonsai (`Q2_0`), Bonsai-2 (`PQ2_0`, `PTQ1_0`, `draft-mtp` via PrismML tree) |
-| Windows 11 | NVIDIA RTX (`sm_86;89;120a`, RTX 30/40/50) | `windows-cuda-rtx` | CUDA `>= 13.4` (`13.5` preferred) + MSVC (`GGML_CUDA_GRAPHS=ON`, `GGML_CUDA_FA_ALL_QUANTS=ON`) | Bonsai-1 (`Q1_0`), Bonsai (`Q2_0`), Bonsai-2 (`PQ2_0`, `PTQ1_0`, `draft-mtp`) |
-| Linux / WSL2 | NVIDIA Blackwell (`sm_120a` / `sm_120f`, RTX 50-series) | `linux-cuda-blackwell` / `linux-cuda-blackwell-120f` | CUDA `>= 13.4` (`13.5` preferred) + GCC/Clang (`GGML_CUDA_GRAPHS=ON`, `GGML_CUDA_FA_ALL_QUANTS=ON`) | Bonsai-1 (`Q1_0`), Bonsai (`Q2_0`), Bonsai-2 (`PQ2_0`, `PTQ1_0`, `draft-mtp`) |
-| Linux / WSL2 | NVIDIA RTX (`sm_86;89;120a`, RTX 30/40/50) | `linux-cuda-rtx` | CUDA `>= 13.4` (`13.5` preferred) + GCC/Clang (`GGML_CUDA_GRAPHS=ON`, `GGML_CUDA_FA_ALL_QUANTS=ON`) | Bonsai-1 (`Q1_0`), Bonsai (`Q2_0`), Bonsai-2 (`PQ2_0`, `PTQ1_0`, `draft-mtp`) |
-| Windows 11 | AMD Radeon RX XT (RDNA 2/3/4) & Ryzen APU | `windows-rocm-xt` | AMD HIP SDK (`HIP_PATH`, `GGML_HIP=ON`, `GGML_HIP_GRAPHS=ON`, `GGML_HIP_ROCWMMA_FATTN=ON`) | Bonsai-1 (`Q1_0`), Bonsai (`Q2_0`), Bonsai-2 (with matching `llama.cpp` tree) |
-| Linux | AMD Radeon RX XT (RDNA 2/3/4) & Ryzen APU | `linux-rocm-xt` | ROCm 6.x+ (`/dev/kfd`, `GGML_HIP=ON`, `GGML_HIP_GRAPHS=ON`, `GGML_HIP_ROCWMMA_FATTN=ON`) | Bonsai-1 (`Q1_0`), Bonsai (`Q2_0`), Bonsai-2 (with matching `llama.cpp` tree) |
+| Windows 11 | NVIDIA Blackwell (`sm_120a` / `sm_120f`, RTX 50-series) | `windows-cuda-blackwell` / `windows-cuda-blackwell-120f` | CUDA `>= 13.4` (`13.5` preferred) + MSVC (`GGML_CUDA_GRAPHS=ON`, `GGML_CUDA_FA_ALL_QUANTS=ON`) | Bonsai-1 (`Q1_0`), Bonsai / Bonsai-2 (`Q2_0`, re-blocked `PQ2_0 -> Q2_0`, `draft-mtp`) |
+| Windows 11 | NVIDIA RTX (`sm_86;89;120a`, RTX 30/40/50) | `windows-cuda-rtx` | CUDA `>= 13.4` (`13.5` preferred) + MSVC (`GGML_CUDA_GRAPHS=ON`, `GGML_CUDA_FA_ALL_QUANTS=ON`) | Bonsai-1 (`Q1_0`), Bonsai / Bonsai-2 (`Q2_0`, re-blocked `PQ2_0 -> Q2_0`, `draft-mtp`) |
+| Linux / WSL2 | NVIDIA Blackwell (`sm_120a` / `sm_120f`, RTX 50-series) | `linux-cuda-blackwell` / `linux-cuda-blackwell-120f` | CUDA `>= 13.4` (`13.5` preferred) + GCC/Clang (`GGML_CUDA_GRAPHS=ON`, `GGML_CUDA_FA_ALL_QUANTS=ON`) | Bonsai-1 (`Q1_0`), Bonsai / Bonsai-2 (`Q2_0`, re-blocked `PQ2_0 -> Q2_0`, `draft-mtp`) |
+| Linux / WSL2 | NVIDIA RTX (`sm_86;89;120a`, RTX 30/40/50) | `linux-cuda-rtx` | CUDA `>= 13.4` (`13.5` preferred) + GCC/Clang (`GGML_CUDA_GRAPHS=ON`, `GGML_CUDA_FA_ALL_QUANTS=ON`) | Bonsai-1 (`Q1_0`), Bonsai / Bonsai-2 (`Q2_0`, re-blocked `PQ2_0 -> Q2_0`, `draft-mtp`) |
+| Windows 11 | AMD Radeon RX XT (RDNA 2/3/4) & Ryzen APU | `windows-rocm-xt` | AMD HIP SDK (`HIP_PATH`, `GGML_HIP=ON`, `GGML_HIP_GRAPHS=ON`, `GGML_HIP_ROCWMMA_FATTN=ON`) | Bonsai-1 (`Q1_0`), Bonsai / Bonsai-2 (`Q2_0`, re-blocked `PQ2_0 -> Q2_0`, `draft-mtp`) |
+| Linux | AMD Radeon RX XT (RDNA 2/3/4) & Ryzen APU | `linux-rocm-xt` | ROCm 6.x+ (`/dev/kfd`, `GGML_HIP=ON`, `GGML_HIP_GRAPHS=ON`, `GGML_HIP_ROCWMMA_FATTN=ON`) | Bonsai-1 (`Q1_0`), Bonsai / Bonsai-2 (`Q2_0`, re-blocked `PQ2_0 -> Q2_0`, `draft-mtp`) |
 | Windows / Linux | AMD RX XT, Ryzen APU UMA, Intel, Cross-Vendor | `windows-vulkan-xt` / `linux-vulkan-xt` | Vulkan SDK (`GGML_VULKAN=ON`) | Cross-vendor Vulkan compute (including systems without `/dev/kfd` or HIP SDK) |
 | Linux / WSL2 | CPU (x86_64 / ARM64) | `linux-llamacpp` | GCC/Clang + Ninja (`SONDER_WITH_LLAMA_CPP=ON`) | Direct CPU execution and CI compile/test verification |
 
@@ -157,7 +151,7 @@ When `SONDER_WITH_LLAMA_CPP=ON` and `GGML_CUDA=ON`, `src/backends/llamacpp/CMake
 For discrete NVIDIA RTX adapters, `plan_model_placement()` selects:
 
 - `flash_attn: "on"`, `kv_unified: true`, and `load_mode: "none"` for fully VRAM-resident models (automatically relaxed to `load_mode: "auto"` when `--n-cpu-moe`, `no_repack`, or partial `n_gpu_layers` is applied).
-- Initial KV cache `q8_0/q8_0` (or `f8_e4m3/f8_e4m3` when `PlacementPlanRequest::prefer_fp8_kv` is enabled on discrete NVIDIA RTX GPUs with upstream `llama-server >= b11556`), stepping down through the 3-step ladder **`q8_0/q8_0` -> asymmetric `q8_0/q4_0` -> `q4_0/q4_0`** before shrinking context so keys retain 8-bit precision whenever the ~24% value-only savings are enough to fit VRAM (unless `--no-quantized-kv` is set).
+- Initial KV cache `q8_0/q8_0` (or `f8_e4m3/f8_e4m3` when `PlacementPlanRequest::prefer_fp8_kv` is enabled on discrete NVIDIA RTX GPUs), stepping down through the 3-step ladder **`q8_0/q8_0` -> asymmetric `q8_0/q4_0` -> `q4_0/q4_0`** before shrinking context so keys retain 8-bit precision whenever the ~24% value-only savings are enough to fit VRAM (unless `--no-quantized-kv` is set).
 - **Blackwell (`sm_120`) FP4/FP8 sizing**: `gguf_header.cpp` and `vram_estimate.cpp` identify `MXFP4` (`4.25 bpw`, 17 B / 32 elems), `NVFP4` (`4.50 bpw`, 36 B / 64 elems), and `F8_E4M3` (`8.00 bpw` weights / `1.0 byte/elem` KV). On Blackwell GPUs (`sm_120`, RTX 50-series), `plan_model_placement()` notes native FP4 tensor-core acceleration for `NVFP4`; on older or non-NVIDIA GPUs it emits a software-dequantization warning.
 - **Dynamic SLRU MoE Expert Cache (`--moe-cache-mib` + `--moe-cache-cpu-share`) & Selective CPU Repacking**: when a MoE model fits 100% in VRAM, `--moe-cache-mib` is **never** enabled (avoiding ~10% graph-splitting overhead). When a MoE overflows VRAM via `--n-cpu-moe`, the planner computes remaining spare VRAM headroom after pinned GPU layers + KV + compute buffers and enables `--moe-cache-mib` + `--moe-cache-cpu-share` (`0.25–0.50` when host DDR5 RAM is ample) **only** when spare VRAM >= 512 MiB and covers the active CPU-offloaded expert working set (avoiding <75% hit-rate PCIe thrash). Global `--repack` is never emitted while GPU layers remain active (`repack_policy: "cpu_only_selective"`), and CPU-offloaded MoE decode recommends physical core count (`recommended_threads`, e.g. `logical_cores / 2` clamped >= 4) rather than oversubscribing SMT threads on DDR5 bandwidth.
 - Speculative decoding: `draft-mtp` (`draft_n_max: 3`) when GGUF `<arch>.nextn_predict_layers > 0` (such as `Ternary-Bonsai-2-4B-PQ2_0-MTP-Q8_0.gguf` and `Ternary-Bonsai-2-9B-PQ2_0-MTP-Q8_0.gguf`), or lightweight `ngram-mod` for ternary/1-bit models without MTP layers (unless `--no-speculative` is set); launch profiles and `serve --spec-type` also support `suffix` (Arctic Suffix-Tree speculation). Tied LM-head embeddings (`prism.hadamard.tied_output = 1` / `token_embd.weight` without `output.weight`) and trailing dense-attention MTP blocks are sized accurately in `estimate_vram()`.
@@ -204,7 +198,7 @@ When `log_file` (or `--log-file` in `args`) is enabled on a spawned `llamaserver
 | `rocm_runtime_error` | `HSA_STATUS_ERROR`, `hipError` (non-OOM) | `backend: "rocm"` |
 | `vulkan_runtime_error` | `failed to initialize Vulkan` (`reason: "init_failed"`), `ggml_vulkan: device lost on <device>` (`reason: "device_lost"`), and `VK_ERROR_DEVICE_LOST` (warning only, no unhealthy marking) | `backend: "vulkan"` |
 | `device_fault` | `ggml_vulkan: device fault on <device>: <text>` (VK_EXT_device_fault, `reason: "device_fault"`), fatal CUDA/HIP errors (`CUDA error: ` / `ROCm error: ` lines) such as `unspecified launch failure` or `illegal memory access` (`reason: "fatal_error"`) | `backend`: `"vulkan"`, `"cuda"`, or `"rocm"`. Together with `ggml_vulkan: device lost on` this marks the device unhealthy once the child has exited or fails `/health`: the supervisor stops, does not relaunch, and reports `diagnostics.device`. See `docs/runbooks/node1-oculink-gpu-hang.md` |
-| `ternary_runtime_incompatible` | `unknown tensor type`, `unsupported ggml type`, `unsupported tensor type`, or error-qualified `prism.hadamard` | Recommends PrismML binary or `llama.cpp >= b11556` |
+| `ternary_runtime_incompatible` | `unknown tensor type`, `unsupported ggml type`, `unsupported tensor type`, or error-qualified `prism.hadamard` | Advises re-blocking `PQ2_0` to stock `Q2_0` with `sonder-infer reblock-pq2` or serving on SI's pinned `v1.0.0` `llamacpp` engine |
 | `kv_type_mismatch`, `kv_type_no_vector_kernel`, `kv_type_kernel_unknown` | Up-front KV cache pairing check (`check_kv_cache_pairing`) | Backend-aware messaging for `cuda`, `rocm`, and `vulkan` |
 
 ---

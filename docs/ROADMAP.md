@@ -15,7 +15,7 @@
 ## Phase 1 — direct native inference path
 
 - [x] Engine / Device / Model / Session abstractions (CPU + cross-platform GPU discovery via DXGI/NVML/ROCm/DRM/sysfs with UMA detection, `Engine::gpu_devices()`, live GPU `device.memory.sample` telemetry, surfaced on `sonder-infer devices`, `sonder-infer node`, `/v1/sonder/health`, and `/v1/sonder/node`)
-- [x] llama.cpp/GGML backend (optional build, `SONDER_WITH_LLAMA_CPP=ON`, GPU presets `windows-cuda-rtx` / `linux-cuda-rtx` / `linux-rocm-xt` / `windows-vulkan-xt` / `linux-vulkan-xt`, multi-GPU placement and `FETCHCONTENT_SOURCE_DIR_LLAMACPP` override; license approved 2026-09-26; see `docs/GPU_SUPPORT.md`)
+- [x] llama.cpp/GGML backend (optional build, `SONDER_WITH_LLAMA_CPP=ON`, GPU presets `windows-cuda-rtx` / `linux-cuda-rtx` / `linux-rocm-xt` / `windows-vulkan-xt` / `linux-vulkan-xt`, multi-GPU placement, single pinned archive in `cmake/llamacpp-pin.json` + `third_party/ggml-patches/`, and offline `SONDER_LLAMACPP_URL` mirror support; license approved 2026-09-26; see `docs/GPU_SUPPORT.md`)
 - [ ] tokenizer + prompt processing
 - [x] streaming decode (session API; via mock and Ollama backends; native backend pending)
 - [ ] sampling parity (sampling config + validation done; Sonder sampler applied for `token_logits` backends; new fields in `feat/sampling-config`; parity checks need a native backend)
@@ -45,7 +45,7 @@ Gate: correctness + reliability parity for selected models.
 - [x] prefix reuse (logical, fingerprinted: `src/cache`; shared across concurrent requests by the engine; backend KV reuse pending)
 - [x] architecture-aware logical prefix policy: attention-only, hybrid, and recurrent descriptors; hybrid/recurrent reuse requires a saved state checkpoint (`docs/KV_CACHE.md`)
 - [x] backend recurrent-state capture/restore and engine checkpoint registration (`Capability::recurrent_checkpoint`, `BackendModel::capture_recurrent_state`/`restore_recurrent_state`, `llama.cpp` `llama_state_seq_get_size`/`get_data`/`set_data` with 512 MiB cap, opt-in deterministic mock hybrid support, bounded `SchedulingRuntime` checkpoint blob store wired to `KvCacheManager::save_checkpoint()` and `Session` with `kv.checkpoint.saved`/`restored` telemetry; live real-model hybrid quality and speedup benchmarking pending)
-- [x] upgrade the optional llama.cpp pin beyond b11195: default pin is `v1.0.0` in `cmake/llamacpp-pin.json` (configure-time overrides `FETCHCONTENT_SOURCE_DIR_LLAMACPP` and `SONDER_LLAMACPP_TAG`/`SHA256` remain; configure fails if the pin's `expected_features` are not detected; a GPU run with an `f8_e4m3` KV cache and the stories15M integration cases are still unverified at this pin; see `docs/KV_CACHE.md` and `docs/GPU_SUPPORT.md`)
+- [x] upgrade the optional llama.cpp pin beyond b11195: single pinned archive is `v1.0.0` in `cmake/llamacpp-pin.json` with configure-time `third_party/ggml-patches/` verification and `expected_features` enforcement (external fork/checkout overrides retired; offline builds use `SONDER_LLAMACPP_URL`; a GPU run with an `f8_e4m3` KV cache and the stories15M integration cases are still unverified at this pin; see `docs/KV_CACHE.md` and `docs/GPU_SUPPORT.md`)
 - [x] session fork/share (logical fork + copy-on-write in `src/cache`; session API wiring pending)
 - [x] cache pressure/eviction (watermarks, priority-aware/LRU eviction in `src/cache`)
 - [x] workload priorities (7 classes, aging, starvation guard in `src/scheduler`)

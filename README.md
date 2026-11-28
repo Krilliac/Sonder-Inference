@@ -31,9 +31,10 @@ inference onto the native in-process `llama.cpp` backend is in
     in-process llama.cpp/GGML backend, built with `SONDER_WITH_LLAMA_CPP=ON`
     ([src/backends/llamacpp](src/backends/llamacpp/README.md),
     [docs/GPU_SUPPORT.md](docs/GPU_SUPPORT.md),
-    [docs/integration/llamacpp.md](docs/integration/llamacpp.md)). Planned to
-    move to a single vendored, pinned `ggml`/`llama.cpp` tree with SI's own
-    patch series ([docs/ROADMAP_SI_ONLY.md](docs/ROADMAP_SI_ONLY.md)).
+    [docs/integration/llamacpp.md](docs/integration/llamacpp.md)). Built from a
+    single SHA-pinned `ggml`/`llama.cpp` archive (`cmake/llamacpp-pin.json`)
+    with SI's own configure-time patch series (`third_party/ggml-patches/`,
+    [docs/ROADMAP_SI_ONLY.md](docs/ROADMAP_SI_ONLY.md)).
   - `ollama_cloud`: Ollama's hosted cloud models straight over HTTPS
     (`https://ollama.com`, bearer API key from an env var or token file), no
     local daemon; opt-in per model, refuses `X-Sonder-Local-Only` requests;
@@ -162,8 +163,10 @@ llama.cpp backend on Windows as in CI (the CI job is non-blocking):
 cmake --preset ci-windows -DSONDER_WITH_LLAMA_CPP=ON -DGGML_NATIVE=OFF
 ```
 
-Set `FETCHCONTENT_SOURCE_DIR_LLAMACPP` to a local llama.cpp checkout to build
-offline. The optional modules and how they are wired are described in
+Pass `-DSONDER_LLAMACPP_URL=<path/to/llama.cpp-v1.0.0.tar.gz>` to build offline
+from a cached copy of the pinned archive (verified against
+`cmake/llamacpp-pin.json` with `third_party/ggml-patches/` applied). The
+optional modules and how they are wired are described in
 [docs/MODULES.md](docs/MODULES.md).
 
 GPU builds: see

@@ -3,7 +3,7 @@
 #
 # Examples:
 #   ./scripts/build.sh --preset ci-linux --test
-#   ./scripts/build.sh --preset linux-cuda-blackwell --llamacpp-src /path/to/llama.cpp --jobs 8 --test
+#   ./scripts/build.sh --preset linux-cuda-blackwell --jobs 8 --test
 #   ./scripts/build.sh --preset linux-rocm-xt --clean -- -DSONDER_WARNINGS_AS_ERRORS=ON
 set -euo pipefail
 
@@ -13,7 +13,6 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd -P)"
 PRESET="linux-release"
 RUN_TESTS=0
 CLEAN=0
-LLAMACPP_SRC=""
 JOBS=""
 EXTRA_CMAKE_ARGS=()
 
@@ -25,7 +24,6 @@ Options:
   --preset <name>         CMake preset name (default: linux-release)
   --test                  Run ctest --preset <name> after building
   --clean                 Remove build/<preset> before configuring
-  --llamacpp-src <path>   Local llama.cpp source tree (sets -DFETCHCONTENT_SOURCE_DIR_LLAMACPP=<path>)
   --jobs, -j <N>          Parallel build/test worker count (> 0)
   --help, -h              Show this help message and exit
 EOF
@@ -50,14 +48,9 @@ while [[ $# -gt 0 ]]; do
             CLEAN=1
             shift
             ;;
-        --llamacpp-src)
-            [[ $# -ge 2 ]] || { echo "error: --llamacpp-src requires a directory path" >&2; exit 2; }
-            LLAMACPP_SRC="$2"
-            shift 2
-            ;;
-        --llamacpp-src=*)
-            LLAMACPP_SRC="${1#*=}"
-            shift
+        --llamacpp-src|--llamacpp-src=*)
+            echo "error: --llamacpp-src is retired: Sonder Inference builds only the pinned llama.cpp archive + third_party/ggml-patches/ (use -DSONDER_LLAMACPP_URL=/path/to/archive.tar.gz for offline builds)" >&2
+            exit 2
             ;;
         --jobs|-j)
             [[ $# -ge 2 ]] || { echo "error: $1 requires a positive integer" >&2; exit 2; }
@@ -169,14 +162,6 @@ print_gpu_toolchains() {
 print_gpu_toolchains
 
 CONFIGURE_ARGS=(--preset "${PRESET}")
-if [[ -n "${LLAMACPP_SRC}" ]]; then
-    if [[ ! -d "${LLAMACPP_SRC}" ]]; then
-        echo "error: --llamacpp-src directory does not exist: ${LLAMACPP_SRC}" >&2
-        exit 2
-    fi
-    NORM_LLAMACPP_SRC="$(cd "${LLAMACPP_SRC}" && pwd -P)"
-    CONFIGURE_ARGS+=("-DFETCHCONTENT_SOURCE_DIR_LLAMACPP=${NORM_LLAMACPP_SRC}")
-fi
 if [[ ${#EXTRA_CMAKE_ARGS[@]} -gt 0 ]]; then
     CONFIGURE_ARGS+=("${EXTRA_CMAKE_ARGS[@]}")
 fi

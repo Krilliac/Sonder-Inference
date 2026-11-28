@@ -19,6 +19,7 @@ The HTTP server started by `sonder-infer serve` has its own reference:
 | `bench` | Run the benchmark harness over a corpus and write JSON results (plus markdown with `--markdown`). |
 | `tune` | Calibrate a llama-server spawn profile within a time budget; see [calibration](integration/tune.md). |
 | `weights` | Weight-content digest manifests: `weights manifest DIR -o FILE`, `weights verify DIR MANIFEST`; see [weight manifests](integration/weight-manifest.md). Exit status 0 ok, 1 I/O, 2 mismatch, 3 missing/extra, 4 usage. |
+| `reblock-pq2` | Losslessly re-block a `PQ2_0` (group 128, type 142) GGUF to stock `Q2_0` (group 64, type 42) via an exclusive sibling temp file, atomically replace `--output`, and verify bit-exact float32 parity (`--inspect` inspects header/tensor sizes without writing). |
 | `models` | List the models a backend can serve; `models import-ollama [DIR]` lists what an existing Ollama models directory would serve through the native engine (read-only, in place; see [model store](integration/model-store.md)). |
 | `backends` | Probe the backends compiled into this build. |
 | `devices` | List host devices (CPU, memory and GPU inventory). |
@@ -406,6 +407,22 @@ summary and writes it next to `--out`. `--quiet` suppresses progress lines.
 - Exit codes: 0 ok; 1 a request failed or an output file could not be
   written; 2 usage error (including an unreadable corpus); 3 backend
   unreachable or model load failed; 4 `--require-idle` refused to run.
+
+## reblock-pq2
+
+`sonder-infer reblock-pq2 --input IN.gguf --output OUT.gguf [--json]` streams a
+private `PQ2_0` (group 128, 34 B/block, type 142) GGUF into a stock `Q2_0`
+(group 64, 18 B/block, type 42) GGUF, preserving `prism.hadamard.*` metadata and
+non-`PQ2_0` tensors byte-for-byte, updating `general.file_type` (`141`/`142` →
+`41`), atomically replacing `--output`, and running side-by-side bit-exact
+float32 dequantized parity verification before exiting 0. Pass `--inspect`
+(without `--output`) to inspect tensor counts and byte sizes without writing.
+JSON output uses schema `sonder.inference.pq2_reblock/1`.
+
+```sh
+sonder-infer reblock-pq2 --input Bonsai-2-9B-PQ2_0.gguf --inspect --json
+sonder-infer reblock-pq2 --input Bonsai-2-9B-PQ2_0.gguf --output Bonsai-2-9B-Q2_0.gguf --json
+```
 
 ## Open questions
 

@@ -327,16 +327,20 @@ VramEstimate estimate_vram(const GgufModelInfo& m, const LaunchProfile& p, const
         saturating_add(e.weights_bytes, e.kv_bytes),
         saturating_add(saturating_add(e.recurrent_bytes, e.compute_bytes), e.moe_cache_bytes));
     e.prism_hadamard = m.prism_hadamard;
-    e.requires_prism_runtime = m.has_prism_private_tensors || m.prism_hadamard;
+    // Stock Q2_0/Q1_0 + prism.hadamard.* runs natively on SI's pinned llama.cpp v1.0.0 engine;
+    // only private tensor IDs (PQ2_0=142, PTQ1_0=143, PQ2_0M=145) cannot load un-reblocked.
+    e.requires_prism_runtime = m.has_prism_private_tensors;
     if (e.requires_prism_runtime) {
-        std::string note = "model requires a PrismML Hadamard-capable runtime (PQ2_0/PTQ1_0";
+        std::string note = "model uses private ternary tensors (PQ2_0/PTQ1_0";
         if (!m.prism_hadamard_transform.empty()) {
             note += ", transform=" + m.prism_hadamard_transform;
         }
         if (m.prism_hadamard_block_size > 0) {
             note += ", block_size=" + std::to_string(m.prism_hadamard_block_size);
         }
-        note += ")";
+        note += "); re-block PQ2_0 to stock Q2_0 (group 64) with 'sonder-infer reblock-pq2 --input <in.gguf> "
+                "--output <out.gguf>' for native Sonder Inference llamacpp, or apply a matching "
+                "third_party/ggml-patches kernel patch";
         e.notes.push_back(std::move(note));
     }
     if (!p.tensor_split.empty() && e.total_bytes > 0) {

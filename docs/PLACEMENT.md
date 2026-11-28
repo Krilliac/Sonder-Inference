@@ -99,12 +99,11 @@ the effect on the 384 MiB f16 KV cache measured below (4096 context):
 | `q4_1` | 0.625 | ≈ 0.31 | ≈ 120 MiB |
 | `q4_0`, `iq4_nl` | 0.5625 | ≈ ¼ | ≈ 108 MiB |
 
-`llamaserver` launch profiles additionally support `f8_e4m3` (1.0 B/value, ½ of
+`llamaserver` launch profiles additionally parsed `f8_e4m3` (1.0 B/value, ½ of
 `f16`; selectable in `plan_model_placement()` via `prefer_fp8_kv = true` on
-discrete NVIDIA RTX GPUs), `q2_0` (0.28125 B/value, 18/64), and `pq2_0m`
-(0.28125 B/value, 36/128, PrismML KV-only) when backed by a matching
-`llama-server` build; direct `llamacpp` (`b11195`) keeps the nine types in the
-table above. See [GPU_SUPPORT.md](GPU_SUPPORT.md#quantized-kv-cache-types).
+discrete NVIDIA RTX GPUs), `q2_0` (0.28125 B/value, 18/64), and legacy `pq2_0m`
+(0.28125 B/value, 36/128, retired private PrismML KV type; rejected on native
+`llamacpp`). See [GPU_SUPPORT.md](GPU_SUPPORT.md#quantized-kv-cache-types).
 
 K and V are sized independently, so an **asymmetric `q8_0/q4_0` KV cache**
 (`--cache-type-k q8_0 --cache-type-v q4_0`) saves ~24% KV VRAM relative to
@@ -171,7 +170,7 @@ Rules, checked before any model file is read (`invalid_argument`):
 
 - **NVIDIA RTX (Ampere `sm_86`, Ada `sm_89`, Blackwell `sm_120a` / `sm_120f`)**: build with `windows-cuda-rtx` or `linux-cuda-rtx` (`GGML_CUDA=ON`, `CMAKE_CUDA_ARCHITECTURES=86;89;120a`, `GGML_CUDA_GRAPHS=ON`, `GGML_CUDA_FA_ALL_QUANTS=ON`), or Blackwell-only `windows-cuda-blackwell` / `linux-cuda-blackwell` (`120a`) and `windows-cuda-blackwell-120f` / `linux-cuda-blackwell-120f` (`120f`), with `CUDA >= 13.4` (`13.5` preferred; see [GPU_SUPPORT.md](GPU_SUPPORT.md#2-nvidia-rtx-ampere-ada-blackwell)). `GGML_CUDA_FA_ALL_QUANTS=ON` ensures quantized KV caches (`q8_0`, `q4_0`, etc.) execute with CUDA Flash Attention rather than failing or falling back. On mixed RTX + iGPU workstations, `llama.cpp`'s default selection skips integrated GPUs when a discrete GPU is present; set `devices = {"CUDA0"}` (or `{"CUDA0", "CUDA1"}` with `split_mode` and `tensor_split`) to pin placement explicitly.
 - **AMD Radeon RX XT (RDNA 2/3/4) and Ryzen APU UMA**: build with `windows-rocm-xt` / `linux-rocm-xt` (`GGML_HIP=ON`, `GGML_HIP_GRAPHS=ON`, `GGML_HIP_ROCWMMA_FATTN=ON`, targeting `gfx1030;gfx1100;gfx1101;gfx1102;gfx1103;gfx1150;gfx1200;gfx1201`) for native ROCm (`ROCm0`) with WMMA FlashAttention on RDNA 3/4, or `windows-vulkan-xt` / `linux-vulkan-xt` (`GGML_VULKAN=ON`, `Vulkan0`) on Windows and non-ROCm Linux hosts. On RDNA 4 (`gfx1200`/`gfx1201`, RX 9060 / RX 9070 XT), Vulkan `VK_KHR_cooperative_matrix` is a competitive or preferred fallback alongside ROCm; `plan_model_placement()` surfaces this advisory and `sonder-infer tune` sweeps `flash_attn` (`on`/`auto`) across both hints. Discrete RX XT cards budget against dedicated VRAM, whereas Ryzen APUs (`gfx1103`, e.g. Radeon 780M/890M) expose only a small BIOS carveout as dedicated VRAM and run primarily out of shared UMA/GTT memory; UMA hosts should not treat shared GPU allocations as PCIe spill, and `LLAMA_LOAD_MODE_AUTO` handles devices without `mmap_support` automatically.
-- **Ternary, 1-bit, and FP4/FP8 GGUFs**: compact block formats shrink weight footprints dramatically — `Q1_0` (18 B / 128 elems, ~1.125 bpw), `PTQ1_0` (28 B / 128 elems, ~1.75 bpw), `PQ2_0` (34 B / 128 elems, ~2.125 bpw), `PQ2_0M` (36 B / 128 elems, KV-only), `Q2_0` (18 B / 64 elems, ~2.25 bpw), `MXFP4` (17 B / 32 elems, 4.25 bpw), `NVFP4` (36 B / 64 elems, 4.50 bpw), and `F8_E4M3` (1 B / elem, 8.00 bpw weights / 1.0 B/elem KV). Because weights occupy much less VRAM per parameter, KV cache sizing (`--cache-type-k`/`--cache-type-v`, Flash Attention) and context budget become the dominant VRAM lever on 16 GB cards. Running these files requires a matching runtime build: mainline `llama.cpp >= b11556` for stock `Q2_0`/`Q1_0`/`NVFP4`/`F8_E4M3`, or `PrismML-Eng/llama.cpp` (`prism` branch) for Hadamard-transformed `PQ2_0`/`PTQ1_0`/`PQ2_0M` (`prism.hadamard.*`); see [GPU_SUPPORT.md](GPU_SUPPORT.md) and [BACKENDS.md](BACKENDS.md#upstream-llamacpp-pin-and-ternary--prismml-overrides).
+- **Ternary, 1-bit, and FP4/FP8 GGUFs**: compact block formats shrink weight footprints dramatically — `Q1_0` (18 B / 128 elems, ~1.125 bpw), `PTQ1_0` (28 B / 128 elems, ~1.75 bpw), `PQ2_0` (34 B / 128 elems, ~2.125 bpw), `PQ2_0M` (36 B / 128 elems, KV-only), `Q2_0` (18 B / 64 elems, ~2.25 bpw), `MXFP4` (17 B / 32 elems, 4.25 bpw), `NVFP4` (36 B / 64 elems, 4.50 bpw), and `F8_E4M3` (1 B / elem, 8.00 bpw weights / 1.0 B/elem KV). Because weights occupy much less VRAM per parameter, KV cache sizing (`--cache-type-k`/`--cache-type-v`, Flash Attention) and context budget become the dominant VRAM lever on 16 GB cards. Sonder Inference's single pinned `llama.cpp v1.0.0` engine natively executes stock `Q2_0`/`Q1_0`/`NVFP4`/`F8_E4M3` and `prism.hadamard.*` FWHT; `PQ2_0` checkpoints convert losslessly to stock `Q2_0` via `pq2_reblock` (external forks are retired; see [GPU_SUPPORT.md](GPU_SUPPORT.md) and [BACKENDS.md](BACKENDS.md#single-pinned-llamacpp-engine-and-si-patch-series)).
 
 ## Step 2 — per-model and co-residency placement planner (implemented)
 
@@ -199,7 +198,9 @@ loading model weights:
   XT `flash_attn=auto`, `GPU_MAX_ALLOC_PERCENT=100`; Ryzen APU `uma_mode=true`
   with host-RAM pool cap and bandwidth warning), auto-expands to same-vendor
   multi-GPU `split_mode=layer` + proportional `tensor_split` when a single GPU
-  cannot fit, flags `requires_prism_runtime` on Hadamard/PrismML GGUFs, enables
+  cannot fit, flags `requires_prism_runtime` on private ternary tensor GGUFs
+  (`PQ2_0`/`PTQ1_0`/`PQ2_0M`, while stock `Q2_0` + `prism.hadamard.*` runs
+  natively), enables
   `draft-mtp` (when `nextn_layers > 0`) or `ngram-mod` (on ternary/1-bit
   models), and runs a deterministic iterative fit solver via `estimate_vram()`:
   asymmetric `q8_0/q4_0` KV -> symmetric `q4_0/q4_0` KV -> binary-searched
