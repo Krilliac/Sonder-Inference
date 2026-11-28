@@ -190,6 +190,17 @@ void execute_rerank(ChatExchange& exchange, const RerankJob& job, const Correlat
                     const std::string& model, const std::string& backend,
                     const std::shared_ptr<Session>& session);
 
+// Emits a `TelemetryLevel::metrics` terminal lifecycle event (`request.failed`,
+// or `request.cancelled` when `cancelled` is true) with `backend_started: false`
+// when a hosted HTTP inference request is refused before Session execution starts.
+void emit_pre_execution_failure(TelemetryBus& bus, TelemetryContext ctx, std::string_view kind,
+                                std::string_view error_code, const Correlation& corr,
+                                std::optional<RequestPriority> job_priority = std::nullopt,
+                                std::string_view resolved_model = {},
+                                std::string_view requested_model = {},
+                                bool cancelled = false,
+                                std::optional<double> admission_queue_ms = std::nullopt);
+
 // Synchronous execution for POST /v1/score.
 void execute_score(ChatExchange& exchange, const ScoreJob& job, const Correlation& correlation,
                    const std::string& model, const std::string& backend,

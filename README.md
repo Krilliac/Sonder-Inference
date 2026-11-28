@@ -31,12 +31,15 @@ inference onto the native in-process `llama.cpp` backend is in
     in-process llama.cpp/GGML backend, built with `SONDER_WITH_LLAMA_CPP=ON`
     ([src/backends/llamacpp](src/backends/llamacpp/README.md),
     [docs/GPU_SUPPORT.md](docs/GPU_SUPPORT.md),
-    [docs/integration/llamacpp.md](docs/integration/llamacpp.md)). Planned to
-    move to a single vendored, pinned `ggml`/`llama.cpp` tree with SI's own
-    patch series ([docs/ROADMAP_SI_ONLY.md](docs/ROADMAP_SI_ONLY.md)).
-  - **Ollama Cloud** (**in progress, not yet merged on `main`**): opt-in
-    direct HTTPS provider for Ollama Cloud models with no local Ollama daemon
-    (RET-02 in [docs/ROADMAP_SI_ONLY.md](docs/ROADMAP_SI_ONLY.md)).
+    [docs/integration/llamacpp.md](docs/integration/llamacpp.md)). Built from a
+    single SHA-pinned `ggml`/`llama.cpp` archive (`cmake/llamacpp-pin.json`)
+    with SI's own configure-time patch series (`third_party/ggml-patches/`,
+    [docs/ROADMAP_SI_ONLY.md](docs/ROADMAP_SI_ONLY.md)).
+  - `ollama_cloud`: Ollama's hosted cloud models straight over HTTPS
+    (`https://ollama.com`, bearer API key from an env var or token file), no
+    local daemon; opt-in per model, refuses `X-Sonder-Local-Only` requests;
+    needs a `SONDER_WITH_TLS=ON` build
+    ([docs/integration/ollama-cloud.md](docs/integration/ollama-cloud.md)).
   - `ollama` (**deprecated, scheduled for removal**): HTTP adapter for an
     Ollama server, with streaming and cancellation
     ([src/backends/ollama](src/backends/ollama/README.md)).
@@ -100,8 +103,10 @@ Configure, build and test presets are defined in
 | `ci-windows`, `ci-linux` | as above | RelWithDebInfo, warnings as errors |
 
 Opt-in direct `llamacpp` CPU and GPU presets (`windows-cuda-blackwell`,
-`windows-cuda-rtx`, `windows-rocm-xt`, `windows-vulkan-xt`, `linux-llamacpp`,
-`linux-cuda-blackwell`, `linux-cuda-rtx`, `linux-rocm-xt`, `linux-vulkan-xt`)
+`windows-cuda-blackwell-120f`, `windows-cuda-rtx`, `windows-rocm-xt`,
+`windows-vulkan-xt`, `linux-llamacpp`, `linux-cuda-blackwell`,
+`linux-cuda-blackwell-120f`, `linux-cuda-rtx`, `linux-rocm-xt`,
+`linux-vulkan-xt`)
 are also defined in [CMakePresets.json](CMakePresets.json); see
 [docs/GPU_SUPPORT.md](docs/GPU_SUPPORT.md).
 
@@ -135,6 +140,7 @@ powershell -NoProfile -File scripts\build.ps1 -Preset msvc-debug -Test
 | `SONDER_BUILD_CLI` | ON when top-level | Build `sonder-infer` |
 | `SONDER_WARNINGS_AS_ERRORS` | OFF | Warnings as errors (ON in `ci-*` presets) |
 | `SONDER_WITH_LLAMA_CPP` | OFF | Fetch llama.cpp at pinned tag `v1.0.0` and build the `llamacpp` backend; accelerators through `GGML_*` options |
+| `SONDER_BUILD_LLAMASERVER` | ON | Build the external llama-server backend and its tests; shared GPU counters and log diagnostics remain available when OFF |
 | `SONDER_WITH_TLS` | OFF | Enable `https://` in the internal HTTP client |
 | `SONDER_TLS_BACKEND` | `auto` | `auto` (Schannel on Windows, OpenSSL elsewhere), `openssl` or `schannel` |
 | `SONDER_BUILD_FUZZERS` | OFF | Build the libFuzzer targets in `fuzz/` (Clang) |
@@ -157,8 +163,10 @@ llama.cpp backend on Windows as in CI (the CI job is non-blocking):
 cmake --preset ci-windows -DSONDER_WITH_LLAMA_CPP=ON -DGGML_NATIVE=OFF
 ```
 
-Set `FETCHCONTENT_SOURCE_DIR_LLAMACPP` to a local llama.cpp checkout to build
-offline. The optional modules and how they are wired are described in
+Pass `-DSONDER_LLAMACPP_URL=<path/to/llama.cpp-v1.0.0.tar.gz>` to build offline
+from a cached copy of the pinned archive (verified against
+`cmake/llamacpp-pin.json` with `third_party/ggml-patches/` applied). The
+optional modules and how they are wired are described in
 [docs/MODULES.md](docs/MODULES.md).
 
 GPU builds: see

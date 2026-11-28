@@ -224,7 +224,7 @@ Engine::Engine(EngineOptions options)
                          {"platform", host_platform()},
                          {"device_count", devices_.size()},
                          {"gpu_device_count", initial_gpus.size()},
-                         {"text_capture", options_.telemetry.capture_text ? "on" : "off"}};
+                         {"text_capture", to_string(resolved_text_capture(options_.telemetry))}};
     if (options_.server) {
         started.set("server", json::Object{{"host", options_.server->host},
                                            {"port", options_.server->port},
@@ -243,6 +243,8 @@ Engine::Engine(EngineOptions options)
                          json::Object{{"mode", to_string(so.mode)},
                                       {"kv_block_size_tokens", so.kv_block_size_tokens},
                                       {"kv_num_blocks", so.kv_num_blocks},
+                                      {"kv_capacity_tokens",
+                                       static_cast<std::uint64_t>(so.kv_block_size_tokens) * so.kv_num_blocks},
                                       {"prefix_caching", so.prefix_caching},
                                       {"max_running_sequences", so.max_running_sequences},
                                       {"max_step_sequences", so.max_step_sequences},
@@ -318,7 +320,10 @@ void Engine::sample_backend_runtime() {
         if (status->take_events) {
             for (auto& [type, attrs] : status->take_events()) {
                 attrs.set("backend", name);
-                telemetry_->emit(std::move(type), engine_context(), std::move(attrs), TelemetryLevel::metrics);
+                // Native physical KV events (`kv.*`) are standard-level; the other
+                // backend observations stay at metrics.
+                const TelemetryLevel level = type.rfind("kv.", 0) == 0 ? TelemetryLevel::standard : TelemetryLevel::metrics;
+                telemetry_->emit(std::move(type), engine_context(), std::move(attrs), level);
             }
         }
         if (status->warmup) {

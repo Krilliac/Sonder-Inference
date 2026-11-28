@@ -5,9 +5,11 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <chrono>
 #include <fstream>
 #include <filesystem>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <optional>
@@ -224,7 +226,7 @@ TEST_CASE("cli commands: table integrity and help content") {
         CHECK(help.find("Usage:") != std::string::npos);
     }
     for (const char* expected : {"version", "devices", "node", "plan", "backends", "models", "generate", "chat",
-                                 "bench", "serve", "help"}) {
+                                 "bench", "serve", "reblock-pq2", "help"}) {
         CAPTURE(expected);
         CHECK(cli::find_command(expected) != nullptr);
     }
@@ -567,7 +569,143 @@ TEST_CASE("cli env: color only on a terminal without NO_COLOR") {
     CHECK(cli::color_enabled(true, env_of({})));
     CHECK_FALSE(cli::color_enabled(false, env_of({})));
     CHECK_FALSE(cli::color_enabled(true, env_of({{"NO_COLOR", "1"}})));
-    CHECK(cli::color_enabled(true, env_of({{"NO_COLOR", ""}})));  // empty NO_COLOR is unset
+    CHECK_FALSE(cli::color_enabled(true, env_of({{"NO_COLOR", ""}})) == false);  // empty NO_COLOR is unset
     CHECK_FALSE(cli::color_enabled(true, env_of({{"TERM", "dumb"}})));
     CHECK(cli::color_enabled(true, env_of({{"TERM", "xterm-256color"}})));
+}
+
+TEST_CASE("cli reblock-pq2: command spec and core GGUF re-block + verify on non-ASCII paths and atomic overwrite") {
+    const cli::CommandSpec* spec = cli::find_command("reblock-pq2");
+    REQUIRE(spec != nullptr);
+    CHECK(spec->find("input") != nullptr);
+    CHECK(spec->find("output") != nullptr);
+    CHECK(spec->find("inspect") != nullptr);
+    CHECK(spec->find("json") != nullptr);
+
+    // Build a minimal valid GGUF v3 with 1 PQ2_0 tensor (128 elements = 34 bytes) and 1 F32 tensor.
+    std::vector<std::uint8_t> raw;
+    const auto put_u32 = [&](std::uint32_t v) {
+        for (int s = 0; s < 32; s += 8) raw.push_back(static_cast<std::uint8_t>((v >> s) & 0xFFu));
+    };
+    const auto put_u64 = [&](std::uint64_t v) {
+        for (int s = 0; s < 64; s += 8) raw.push_back(static_cast<std::uint8_t>((v >> s) & 0xFFu));
+    };
+    const auto put_str = [&](std::string_view s) {
+        put_u64(s.size());
+        raw.insert(raw.end(), s.begin(), s.end());
+    };
+    raw.insert(raw.end(), {'G', 'G', 'U', 'F'});
+    put_u32(3);  // version 3
+    put_u64(2);  // 2 tensors
+    put_u64(3);  // 3 kvs
+    put_str("general.architecture");
+    put_u32(8);
+    put_str("llama");
+    put_str("general.file_type");
+    put_u32(4);
+    put_u32(kPrismFtypeMostlyPq2_0);
+    put_str("prism.hadamard.version");
+    put_u32(4);
+    put_u32(1);
+    // Tensor 0: PQ2_0 [128] at offset 0 (34 bytes -> aligned next offset 64)
+    put_str("blk.0.attn_q.weight");
+    put_u32(1);
+    put_u64(128);
+    put_u32(kGgmlTypePq2_0);
+    put_u64(0);
+    // Tensor 1: F32 [4] at offset 64 (16 bytes)
+    put_str("output_norm.weight");
+    put_u32(1);
+    put_u64(4);
+    put_u32(0);
+    put_u64(64);
+    while ((raw.size() % 32u) != 0u) raw.push_back(0u);
+    const std::size_t data_start = raw.size();
+    // PQ2_0 block: FP16 +1.0 (0x3C00) + 32 bytes 0xE4
+    raw.push_back(0x00u);
+    raw.push_back(0x3Cu);
+    for (int i = 0; i < 32; ++i) raw.push_back(0xE4u);
+    while (raw.size() < data_start + 64u) raw.push_back(0u);
+    const float one = 1.0f;
+    for (int i = 0; i < 4; ++i) {
+        const auto* p = reinterpret_cast<const std::uint8_t*>(&one);
+        raw.insert(raw.end(), p, p + 4);
+    }
+
+    const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
+    const std::filesystem::path dir =
+        std::filesystem::temp_directory_path() / ("sonder-cli-reblock-" + std::to_string(stamp));
+    std::filesystem::create_directories(dir);
+    struct DirGuard {
+        std::filesystem::path p;
+        ~DirGuard() {
+            std::error_code ec;
+            std::filesystem::remove_all(p, ec);
+        }
+    } guard{dir};
+
+    // Exercise non-ASCII UTF-8 filenames (MSVC .string() regression check).
+    const std::filesystem::path in_path = dir / pq2_path_from_utf8("bonsai-\xE6\x97\xA5\xE6\x9C\xAC\xE8\xAA\x9E-pq2.gguf");
+    const std::filesystem::path out_path = dir / pq2_path_from_utf8("bonsai-\xE6\x97\xA5\xE6\x9C\xAC\xE8\xAA\x9E-q2.gguf");
+    {
+        std::ofstream f(in_path, std::ios::binary | std::ios::trunc);
+        REQUIRE(f.good());
+        f.write(reinterpret_cast<const char*>(raw.data()), static_cast<std::streamsize>(raw.size()));
+    }
+    // Pre-populate out_path with sentinel bytes to verify atomic overwrite without pre-deletion loss.
+    {
+        std::ofstream f(out_path, std::ios::binary | std::ios::trunc);
+        f << "OLD_SENTINEL";
+    }
+
+    Pq2ReblockReport report;
+    const Status st = reblock_pq2_to_q2_gguf(in_path, out_path, &report);
+    REQUIRE_MESSAGE(st.ok(), st.to_string());
+    CHECK(report.reblocked_tensors == 1u);
+    CHECK(report.copied_tensors == 1u);
+    CHECK(report.inspection.prism_hadamard);
+    CHECK(report.output_sha256.size() == 64u);
+
+    const Status ver = verify_pq2_to_q2_gguf(in_path, out_path);
+    REQUIRE_MESSAGE(ver.ok(), ver.to_string());
+
+    // A failing reblock targeting an existing destination must leave the existing destination intact.
+    const std::filesystem::path bad_in = dir / "missing-input.gguf";
+    const auto good_size = std::filesystem::file_size(out_path);
+    CHECK_FALSE(reblock_pq2_to_q2_gguf(bad_in, out_path).ok());
+    CHECK(std::filesystem::file_size(out_path) == good_size);
+
+#if defined(SONDER_TEST_INFER_EXE)
+    // End-to-end execution of the real `sonder-infer reblock-pq2` subcommand (re-block + automatic verify).
+    const std::filesystem::path cli_in = dir / "cli-in-pq2.gguf";
+    const std::filesystem::path cli_out = dir / "cli-out-q2.gguf";
+    const std::filesystem::path cli_json = dir / "cli-out.json";
+    {
+        std::ofstream f(cli_in, std::ios::binary | std::ios::trunc);
+        REQUIRE(f.good());
+        f.write(reinterpret_cast<const char*>(raw.data()), static_cast<std::streamsize>(raw.size()));
+    }
+    const std::string exe = SONDER_TEST_INFER_EXE;
+#if defined(_WIN32)
+    // cmd.exe strips outer quotes unless wrapped in an extra pair of quotes.
+    const std::string cmd = "\"\"" + exe + "\" reblock-pq2 --input \"" + cli_in.string() +
+                            "\" --output \"" + cli_out.string() + "\" --json > \"" + cli_json.string() + "\"\"";
+#else
+    const std::string cmd = "\"" + exe + "\" reblock-pq2 --input \"" + cli_in.string() +
+                            "\" --output \"" + cli_out.string() + "\" --json > \"" + cli_json.string() + "\"";
+#endif
+    const int rc = std::system(cmd.c_str());
+    CHECK(rc == 0);
+    std::ifstream jf(cli_json, std::ios::binary);
+    REQUIRE(jf.good());
+    const std::string jbody((std::istreambuf_iterator<char>(jf)), std::istreambuf_iterator<char>());
+    const auto jparsed = json::parse(jbody);
+    REQUIRE_MESSAGE(jparsed.ok(), jparsed.status().to_string());
+    CHECK(jparsed->find("schema")->as_string() == "sonder.inference.pq2_reblock/1");
+    CHECK(jparsed->find("mode")->as_string() == "reblock");
+    CHECK(jparsed->find("verified")->as_bool());
+    CHECK(jparsed->find("reblocked_tensors")->as_uint() == 1u);
+    CHECK(jparsed->find("copied_tensors")->as_uint() == 1u);
+    REQUIRE(verify_pq2_to_q2_gguf(cli_in, cli_out).ok());
+#endif
 }

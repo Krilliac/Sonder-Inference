@@ -11,6 +11,7 @@
 
 #include "server_test_support.hpp"
 #include "src/openai.hpp"
+#include "src/test_hooks.hpp"
 
 using namespace server_test;
 namespace json = sonder::inference::json;
@@ -420,6 +421,12 @@ TEST_CASE("backpressure: a stalled SSE subscriber sees ': dropped N' and a match
     };
     // Losses that happen from here on fall between delivered events (flush
     // first: the bus reaches the hub asynchronously).
+    // A samples-stream event (framed `id: <instance>-s<seq>`) lands in the
+    // stalled subscriber's stream before the flood, so the walk below must cope
+    // with it deterministically rather than only when a periodic sample races in.
+    sonder::inference::TelemetryContext sample_ctx;
+    sample_ctx.session_id = "test-session";
+    REQUIRE(f.server->engine()->telemetry().emit("test.backpressure.sample", sample_ctx, {}));
     f.server->engine()->telemetry().flush();
     const std::int64_t baseline = dropped_so_far();
     for (int i = 0; i < 3000; ++i) {
@@ -451,6 +458,7 @@ TEST_CASE("backpressure: a stalled SSE subscriber sees ': dropped N' and a match
     std::uint64_t pending = 0;
     std::optional<std::uint64_t> last;
     int announced_gaps = 0;
+    int sample_ids = 0;
     std::size_t pos = 0;
     while (pos < acc.size()) {
         const std::size_t eol = acc.find('\n', pos);
@@ -460,7 +468,14 @@ TEST_CASE("backpressure: a stalled SSE subscriber sees ': dropped N' and a match
         if (line.rfind(": dropped ", 0) == 0) {
             pending += std::stoull(line.substr(10));
         } else if (line.rfind("id: ", 0) == 0) {
-            const std::uint64_t seq = std::stoull(line.substr(line.rfind('-') + 1));
+            // Main events are `<instance>-<seq>`, samples `<instance>-s<seq>`
+            // (own sequence). The gap check applies to the main stream only.
+            const std::string suffix = line.substr(line.rfind('-') + 1);
+            if (!suffix.empty() && suffix[0] == 's') {
+                ++sample_ids;
+                continue;
+            }
+            const std::uint64_t seq = std::stoull(suffix);
             if (last) {
                 CHECK(seq - *last - 1 == pending);
                 if (pending > 0) ++announced_gaps;
@@ -470,6 +485,7 @@ TEST_CASE("backpressure: a stalled SSE subscriber sees ': dropped N' and a match
         }
     }
     CHECK(announced_gaps > 0);
+    CHECK(sample_ids > 0);
     CHECK(acc.find("\"telemetry.dropped\"") == std::string::npos);
     stalled.close();
 }
@@ -741,4 +757,350 @@ TEST_CASE("embeddings: HTTP correlation headers emit request.queued, request.sta
         }
     }
     CHECK(fail_lifecycle == std::vector<std::string>{"request.queued", "request.started", "request.failed"});
+}
+
+TEST_CASE("telemetry level metrics: live SSE and NDJSON streams emit complete request lifecycle and model attribution") {
+    auto o = Fixture::defaults();
+    o.telemetry_level = si::TelemetryLevel::metrics;
+    o.models = {"mock:tiny", "mock:alt"};
+    o.lazy_models = true;
+    Fixture f(o);
+
+    const Reply disc_reply = get(f.port, "/.well-known/sonder-telemetry");
+    REQUIRE(disc_reply.status == 200);
+    CHECK(disc_reply.json().find("sampling_level")->as_string() == "metrics");
+
+    Conn sse(f.port);
+    sse.send(build_request("GET", "/v1/telemetry/sse?since=now", f.port));
+    std::string sse_acc;
+    REQUIRE(sse.read_until(sse_acc, "retry: 2000\n\n"));
+
+    Conn nd(f.port);
+    nd.send(build_request("GET", "/v1/telemetry/ndjson?since=now", f.port));
+    std::string nd_acc;
+    REQUIRE(nd.read_until(nd_acc, "\r\n\r\n"));
+
+    const std::vector<std::pair<std::string, std::string>> corr_headers = {
+        {"X-Sonder-Run-Id", "vis01-metrics-run"},
+        {"X-Sonder-Parent-Request-Id", "rt-parent-1"},
+        {"X-Sonder-Agent-Id", "agent-vis01"},
+        {"X-Sonder-Task-Id", "task-vis01"},
+        {"X-Sonder-Priority", "interactive"}};
+
+    const Reply chat_res = post(f.port, "/v1/chat/completions", chat_body(R"(,"max_tokens":3)"), corr_headers);
+    REQUIRE_MESSAGE(chat_res.status == 200, chat_res.body);
+    const std::string chat_id = chat_res.json().find("sonder")->find("request_id")->as_string();
+    CHECK(chat_res.header("x-sonder-request-id") == chat_id);
+
+    const Reply msg_res = post(
+        f.port, "/v1/messages",
+        R"({"model":"mock:alt","max_tokens":3,"messages":[{"role":"user","content":"hello anthropic"}]})",
+        corr_headers);
+    REQUIRE_MESSAGE(msg_res.status == 200, msg_res.body);
+    const std::string msg_id = msg_res.header("x-sonder-request-id");
+    REQUIRE_FALSE(msg_id.empty());
+
+    const Reply resp_res = post(f.port, "/v1/responses", R"({"model":"default","input":"hello responses","max_output_tokens":3})",
+                                corr_headers);
+    REQUIRE_MESSAGE(resp_res.status == 200, resp_res.body);
+    const std::string resp_id = resp_res.header("x-sonder-request-id");
+    REQUIRE_FALSE(resp_id.empty());
+
+    const Reply comp_res = post(f.port, "/v1/completions", R"({"model":"default","prompt":"hello comp","max_tokens":3})",
+                                corr_headers);
+    REQUIRE_MESSAGE(comp_res.status == 200, comp_res.body);
+    const std::string comp_id = comp_res.json().find("sonder")->find("request_id")->as_string();
+
+    const Reply emb_res = post(f.port, "/v1/embeddings", R"({"model":"default","input":"embed me"})", corr_headers);
+    REQUIRE_MESSAGE(emb_res.status == 200, emb_res.body);
+    const std::string emb_id = emb_res.json().find("sonder")->find("request_id")->as_string();
+
+    const Reply rerank_res = post(
+        f.port, "/v1/rerank",
+        R"({"model":"mock:alt","query":"q","documents":["doc a","doc b"]})", corr_headers);
+    REQUIRE_MESSAGE(rerank_res.status == 200, rerank_res.body);
+    const std::string rerank_id = rerank_res.json().find("sonder")->find("request_id")->as_string();
+
+    const Reply score_res = post(
+        f.port, "/v1/score",
+        R"({"model":"default","pairs":[["q","doc a"]]})", corr_headers);
+    REQUIRE_MESSAGE(score_res.status == 200, score_res.body);
+    const std::string score_id = score_res.json().find("sonder")->find("request_id")->as_string();
+
+    // Flush the bus so every event has reached the hub, then read up to the exact
+    // latest main-stream sequence on both live SSE and NDJSON transports.
+    f.envelopes();
+    const std::string instance = f.server->instance_id();
+    const std::int64_t main_next =
+        get(f.port, "/.well-known/sonder-telemetry").json().find("resume")->find("next_sequence")->as_int();
+    REQUIRE(main_next > 0);
+    const std::string want_sse_tail = "id: " + instance + "-" + std::to_string(main_next - 1) + "\ndata: ";
+    REQUIRE(sse.read_until(sse_acc, want_sse_tail));
+    // Ensure the trailing "\n\n" of that final SSE frame has arrived.
+    REQUIRE(eventually([&] {
+        const auto pos = sse_acc.find(want_sse_tail);
+        if (pos == std::string::npos) return false;
+        if (sse_acc.find("\n\n", pos) != std::string::npos) return true;
+        std::string extra;
+        sse.read_until(extra, "\n\n", std::chrono::milliseconds(100));
+        sse_acc += extra;
+        return sse_acc.find("\n\n", pos) != std::string::npos;
+    }));
+    const std::string want_nd_tail = "\"event_id\":\"" + instance + "-" + std::to_string(main_next - 1) + "\"";
+    REQUIRE(nd.read_until(nd_acc, want_nd_tail));
+    REQUIRE(eventually([&] {
+        const auto pos = nd_acc.find(want_nd_tail);
+        if (pos == std::string::npos) return false;
+        if (nd_acc.find('\n', pos) != std::string::npos) return true;
+        std::string extra;
+        nd.read_until(extra, "\n", std::chrono::milliseconds(100));
+        nd_acc += extra;
+        return nd_acc.find('\n', pos) != std::string::npos;
+    }));
+
+    const auto sse_frames = parse_sse(body_of(sse_acc));
+    REQUIRE_FALSE(sse_frames.empty());
+    std::vector<json::Value> live_envs;
+    for (const auto& fr : sse_frames) {
+        auto parsed = json::parse(fr.data);
+        REQUIRE(parsed.ok());
+        live_envs.push_back(parsed.value());
+    }
+
+    auto check_request = [&](const std::string& rid, const std::string& expected_kind,
+                             const std::string& expected_model, const std::string& expected_req_model,
+                             bool expect_decode_stages) {
+        CAPTURE(rid);
+        std::vector<std::string> req_events;
+        bool saw_decode_started = false;
+        bool saw_prefill_completed = false;
+        bool saw_decode_completed = false;
+        for (const auto& e : live_envs) {
+            CHECK(e.find("event_type")->as_string() != "inference.token.generated");
+            const json::Value* erid = e.find("request_id");
+            if (erid == nullptr || !erid->is_string() || erid->as_string() != rid) continue;
+            CHECK(e.find("sampling")->find("level")->as_string() == "metrics");
+            CHECK(e.find("producer")->find("stream") == nullptr);
+            CHECK(e.find("run_id")->as_string() == "vis01-metrics-run");
+            CHECK(e.find("agent_id")->as_string() == "agent-vis01");
+            CHECK(e.find("task_id")->as_string() == "task-vis01");
+            const std::string type = e.find("event_type")->as_string();
+            if (type == "inference.decode.started") saw_decode_started = true;
+            if (type == "inference.prefill.completed") saw_prefill_completed = true;
+            if (type == "inference.decode.completed") saw_decode_completed = true;
+            if (type.rfind("request.", 0) == 0) {
+                req_events.push_back(type);
+                const json::Value* attrs = e.find("attributes");
+                REQUIRE(attrs != nullptr);
+                REQUIRE(attrs->find("kind") != nullptr);
+                CHECK(attrs->find("kind")->as_string() == expected_kind);
+                REQUIRE(attrs->find("model") != nullptr);
+                CHECK(attrs->find("model")->as_string() == expected_model);
+                REQUIRE(attrs->find("requested_model") != nullptr);
+                CHECK(attrs->find("requested_model")->as_string() == expected_req_model);
+                REQUIRE(attrs->find("parent_request_id") != nullptr);
+                CHECK(attrs->find("parent_request_id")->as_string() == "rt-parent-1");
+            }
+        }
+        CHECK(req_events == std::vector<std::string>{"request.queued", "request.started", "request.completed"});
+        if (expect_decode_stages) {
+            CHECK(saw_decode_started);
+            CHECK(saw_prefill_completed);
+            CHECK(saw_decode_completed);
+        }
+    };
+
+    check_request(chat_id, "chat", "mock:tiny", "default", true);
+    check_request(msg_id, "chat", "mock:alt", "mock:alt", true);
+    check_request(resp_id, "chat", "mock:tiny", "default", true);
+    check_request(comp_id, "generate", "mock:tiny", "default", true);
+    check_request(emb_id, "embed", "mock:tiny", "default", false);
+    check_request(rerank_id, "rerank", "mock:alt", "mock:alt", false);
+    check_request(score_id, "score", "mock:tiny", "default", false);
+
+    // NDJSON carries the same metrics-level request.completed for the final request.
+    CHECK(nd_acc.find("\"event_type\":\"request.completed\"") != std::string::npos);
+    CHECK(nd_acc.find("\"inference.token.generated\"") == std::string::npos);
+}
+
+TEST_CASE("telemetry level metrics: pre-session and lazy-load failures emit request.failed on live stream without request.started") {
+    auto o = Fixture::defaults();
+    o.telemetry_level = si::TelemetryLevel::metrics;
+    o.models = {"mock:tiny", "not-a-mock-model"};
+    o.lazy_models = true;
+    Fixture f(o);
+
+    Conn sse(f.port);
+    sse.send(build_request("GET", "/v1/telemetry/sse?since=now", f.port));
+    std::string sse_acc;
+    REQUIRE(sse.read_until(sse_acc, "retry: 2000\n\n"));
+
+    const std::vector<std::pair<std::string, std::string>> corr_headers = {
+        {"X-Sonder-Run-Id", "vis01-fail-run"},
+        {"X-Sonder-Parent-Request-Id", "rt-fail-parent"},
+        {"X-Sonder-Agent-Id", "agent-fail"},
+        {"X-Sonder-Task-Id", "task-fail"},
+        {"X-Sonder-Priority", "subagent"}};
+
+    // 1. Lazy model load failure in residency->acquire (registered model cannot load on backend).
+    const Reply lazy_fail = post(
+        f.port, "/v1/chat/completions",
+        R"({"model":"not-a-mock-model","messages":[{"role":"user","content":"hi"}]})", corr_headers);
+    CHECK(lazy_fail.status == 404);
+    const std::string lazy_rid = lazy_fail.header("x-sonder-request-id");
+    REQUIRE_FALSE(lazy_rid.empty());
+
+    // 2. Unserved model (404 model_not_found) across completions, embeddings, rerank, score.
+    const Reply comp_404 = post(
+        f.port, "/v1/completions", R"({"model":"ghost:model","prompt":"hi"})", corr_headers);
+    CHECK(comp_404.status == 404);
+    const std::string comp_rid = comp_404.header("x-sonder-request-id");
+    REQUIRE_FALSE(comp_rid.empty());
+
+    const Reply emb_404 = post(
+        f.port, "/v1/embeddings", R"({"model":"ghost:model","input":"hi"})", corr_headers);
+    CHECK(emb_404.status == 404);
+    const std::string emb_rid = emb_404.header("x-sonder-request-id");
+    REQUIRE_FALSE(emb_rid.empty());
+
+    const Reply rerank_404 = post(
+        f.port, "/v1/rerank", R"({"model":"ghost:model","query":"q","documents":["a"]})", corr_headers);
+    CHECK(rerank_404.status == 404);
+    const std::string rerank_rid = rerank_404.header("x-sonder-request-id");
+    REQUIRE_FALSE(rerank_rid.empty());
+
+    const Reply score_404 = post(
+        f.port, "/v1/score", R"({"model":"ghost:model","pairs":[["q","a"]]})", corr_headers);
+    CHECK(score_404.status == 404);
+    const std::string score_rid = score_404.header("x-sonder-request-id");
+    REQUIRE_FALSE(score_rid.empty());
+
+    // 3. Grammar validation refusal before Session creation, /v1/responses missing history, and watcher-thread 503.
+    const Reply cap_400 = post(
+        f.port, "/v1/chat/completions",
+        R"({"model":"default","response_format":{"type":"json_schema","json_schema":{"name":"bad","schema":{"type":"not_a_type"}}},"messages":[{"role":"user","content":"hi"}]})",
+        corr_headers);
+    CHECK(cap_400.status == 400);
+    const std::string cap_rid = cap_400.header("x-sonder-request-id");
+    REQUIRE_FALSE(cap_rid.empty());
+
+    const Reply resp_404 = post(
+        f.port, "/v1/responses",
+        R"({"model":"default","previous_response_id":"resp_missing","input":"hi"})", corr_headers);
+    CHECK(resp_404.status == 404);
+    const std::string resp_rid = resp_404.header("x-sonder-request-id");
+    REQUIRE_FALSE(resp_rid.empty());
+
+    det::fail_watcher_spawns_for_test().store(1);
+    const Reply watcher_503 = post(
+        f.port, "/v1/chat/completions",
+        R"({"model":"default","messages":[{"role":"user","content":"hi"}]})", corr_headers);
+    det::fail_watcher_spawns_for_test().store(0);
+    CHECK(watcher_503.status == 503);
+    const std::string watcher_rid = watcher_503.header("x-sonder-request-id");
+    REQUIRE_FALSE(watcher_rid.empty());
+
+    // 4. Malformed JSON body and hostile oversized UTF-8/control-char model name on authenticated inference endpoint.
+    const Reply bad_json = post(f.port, "/v1/chat/completions", "{not-json", corr_headers);
+    CHECK(bad_json.status == 400);
+    const std::string bad_rid = bad_json.header("x-sonder-request-id");
+    REQUIRE_FALSE(bad_rid.empty());
+
+    std::string huge_model;
+    huge_model.reserve(8192);
+    for (int i = 0; i < 2000; ++i) huge_model += "\xF0\x9F\x9A\x80";  // 4-byte UTF-8 rocket (8000 bytes total)
+    const Reply huge_404 = post(
+        f.port, "/v1/chat/completions",
+        json::Value(json::Object{{"model", huge_model},
+                                 {"messages", json::Array{json::Object{{"role", "user"}, {"content", "hi"}}}}}).dump(),
+        corr_headers);
+    CHECK(huge_404.status == 404);
+    const std::string huge_rid = huge_404.header("x-sonder-request-id");
+    REQUIRE_FALSE(huge_rid.empty());
+
+    f.envelopes();
+    const std::string instance = f.server->instance_id();
+    const std::int64_t main_next =
+        get(f.port, "/.well-known/sonder-telemetry").json().find("resume")->find("next_sequence")->as_int();
+    REQUIRE(main_next > 0);
+    const std::string want_tail = "id: " + instance + "-" + std::to_string(main_next - 1) + "\ndata: ";
+    REQUIRE(sse.read_until(sse_acc, want_tail, std::chrono::milliseconds(3000)));
+    REQUIRE(eventually([&] {
+        const auto pos = sse_acc.find(want_tail);
+        if (pos == std::string::npos) return false;
+        if (sse_acc.find("\n\n", pos) != std::string::npos) return true;
+        std::string extra;
+        sse.read_until(extra, "\n\n", std::chrono::milliseconds(100));
+        sse_acc += extra;
+        return sse_acc.find("\n\n", pos) != std::string::npos;
+    }));
+
+    const auto sse_frames = parse_sse(body_of(sse_acc));
+    std::vector<json::Value> live_envs;
+    for (const auto& fr : sse_frames) {
+        auto parsed = json::parse(fr.data);
+        REQUIRE(parsed.ok());
+        live_envs.push_back(parsed.value());
+    }
+
+    auto verify_pre_session_failure = [&](const std::string& rid, const std::string& expected_kind,
+                                          const std::string& expected_code,
+                                          const std::optional<std::string>& expected_model,
+                                          const std::optional<std::string>& expected_req_model) {
+        CAPTURE(rid);
+        int failed_count = 0;
+        for (const auto& e : live_envs) {
+            const json::Value* erid = e.find("request_id");
+            if (erid == nullptr || !erid->is_string() || erid->as_string() != rid) continue;
+            const std::string type = e.find("event_type")->as_string();
+            CHECK(type != "request.started");
+            CHECK(type != "request.queued");
+            if (type != "request.failed") continue;
+            ++failed_count;
+            CHECK(e.find("sampling")->find("level")->as_string() == "metrics");
+            CHECK(e.find("run_id")->as_string() == "vis01-fail-run");
+            CHECK(e.find("agent_id")->as_string() == "agent-fail");
+            CHECK(e.find("task_id")->as_string() == "task-fail");
+            const json::Value* attrs = e.find("attributes");
+            REQUIRE(attrs != nullptr);
+            CHECK(attrs->find("kind")->as_string() == expected_kind);
+            CHECK(attrs->find("outcome")->as_string() == "failed");
+            CHECK(attrs->find("error_code")->as_string() == expected_code);
+            CHECK_FALSE(attrs->find("backend_started")->as_bool());
+            CHECK(attrs->find("parent_request_id")->as_string() == "rt-fail-parent");
+            CHECK(attrs->find("priority_class")->as_string() == "subagent");
+            if (expected_model) {
+                REQUIRE(attrs->find("model") != nullptr);
+                CHECK(attrs->find("model")->as_string() == *expected_model);
+            }
+            if (expected_req_model) {
+                REQUIRE(attrs->find("requested_model") != nullptr);
+                CHECK(attrs->find("requested_model")->as_string() == *expected_req_model);
+            }
+        }
+        CHECK(failed_count == 1);
+    };
+
+    verify_pre_session_failure(lazy_rid, "chat", "model_not_found", "not-a-mock-model", "not-a-mock-model");
+    verify_pre_session_failure(comp_rid, "generate", "model_not_found", "ghost:model", "ghost:model");
+    verify_pre_session_failure(emb_rid, "embed", "model_not_found", "ghost:model", "ghost:model");
+    verify_pre_session_failure(rerank_rid, "rerank", "model_not_found", "ghost:model", "ghost:model");
+    verify_pre_session_failure(score_rid, "score", "model_not_found", "ghost:model", "ghost:model");
+    verify_pre_session_failure(cap_rid, "chat", "unsupported_parameter", "mock:tiny", "default");
+    verify_pre_session_failure(resp_rid, "chat", "not_found", "mock:tiny", "default");
+    verify_pre_session_failure(watcher_rid, "chat", "overloaded", "mock:tiny", "default");
+    verify_pre_session_failure(bad_rid, "chat", "invalid_json", std::nullopt, std::nullopt);
+    verify_pre_session_failure(huge_rid, "chat", "model_not_found", std::nullopt, std::nullopt);
+    for (const auto& e : live_envs) {
+        const json::Value* erid = e.find("request_id");
+        if (erid == nullptr || !erid->is_string() || erid->as_string() != huge_rid) continue;
+        const json::Value* attrs = e.find("attributes");
+        REQUIRE(attrs != nullptr);
+        const std::string m = attrs->find("model")->as_string();
+        const std::string rm = attrs->find("requested_model")->as_string();
+        CHECK_FALSE(m.empty());
+        CHECK(m.size() <= si::kMaxEvidenceStringBytes);
+        CHECK(m.size() % 4 == 0);  // truncated cleanly on a 4-byte UTF-8 codepoint boundary
+        CHECK(rm == m);
+    }
 }

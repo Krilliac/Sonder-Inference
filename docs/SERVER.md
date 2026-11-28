@@ -115,7 +115,8 @@ itself.
 | `--telemetry-level off\|metrics\|standard\|deep` | `standard` | |
 | `--telemetry-buffer N` | `8192` | Retained events for resume, per sequence stream (1 to 1048576): the main stream and the periodic `*.sample` stream each keep this many, so samples never evict lifecycle events and the reverse. Each retained window is contiguous. The default per-subscriber queue holds a whole replay (`2 x N`). |
 | `--telemetry PATH` | none | Also write JSONL to `PATH` (`-` for stderr). |
-| `--capture-text` | off | Include generated text in token events. Requires `--token-file`. |
+| `--capture-text` | off | Include generated text in token events (same as `--text-capture on`). Requires `--token-file`. |
+| `--text-capture off\|on\|full` | `off` | Telemetry [text capture policy](TELEMETRY.md#text-capture-policy): `on` adds generated text to token events, `full` also the prompt to `request.started`. Environment default `SONDER_INFER_TEXT_CAPTURE`; the flag wins; an invalid value is a usage error. `on` and `full` require `--token-file`, and the startup log warns plainly. `--capture-text` with `--text-capture off` is a usage error. |
 | `--max-connections N` | `64` | A warning is printed when it plus 32 exceeds the open-file limit (`ulimit -n`). |
 | `--max-body-bytes N` | `4194304` | |
 | `--shutdown-grace-ms N` | `5000` | |
@@ -283,8 +284,10 @@ reverse proxy (also [SETUP.md](SETUP.md)).
   explicit `--cors-origin` or a configured token. An `Origin` that is present
   and not allowed gets 403 `forbidden_origin` (without CORS headers).
   Requests without `Origin` are unaffected.
-- Telemetry is content-free unless `--capture-text` is set, which requires a
-  token and is announced as `text_capture: "on"` in discovery.
+- Telemetry is content-free unless `--text-capture on|full` (or the legacy
+  `--capture-text`) is set, which requires a token and is announced as
+  `text_capture: "on"` or `"full"` in discovery. A request opts out with
+  `X-Sonder-No-Capture: 1`.
 - Nothing secret is logged: the access log omits bodies and header values.
 
 ## Common behaviour
@@ -303,7 +306,8 @@ The preflight (`OPTIONS`) answers 204 with
 `Access-Control-Allow-Headers: Accept, Authorization, Cache-Control,
 Content-Type, Last-Event-ID, X-Sonder-Run-Id, X-Sonder-Parent-Request-Id,
 X-Sonder-Agent-Id, X-Sonder-Task-Id, X-Sonder-Workload, X-Sonder-Priority,
-X-Sonder-Deadline-Ms, X-Sonder-Reasoning-Budget`
+X-Sonder-Deadline-Ms, X-Sonder-Reasoning-Budget, X-Sonder-No-Capture,
+X-Sonder-Local-Only`
 and `Access-Control-Max-Age: 600` (plus
 `Access-Control-Allow-Private-Network: true` when the browser asks for it).
 
@@ -754,7 +758,7 @@ ranges are 400 `invalid_sampling` naming the field.
 Additional OpenAI-compatible and utility endpoints served alongside `/v1/chat/completions`:
 - `POST /v1/responses`: OpenAI Responses API with stateful `previous_response_id` chaining, `tools`, `text.format`, and SSE events (see [below](#post-v1responses)).
 - `POST /v1/completions`: raw prompt text completions (`prompt`, `max_tokens`, `echo`, `logprobs`, `stream`, `stream_options.include_usage`, `grammar`, sampling parameters).
-- `POST /v1/embeddings`: dense float vector embeddings (`model`, `input` string or string array up to 256 items, `encoding_format: "float"`). Returns 501 `not_implemented` on backends without embedding support.
+- `POST /v1/embeddings`: dense vector embeddings (`model`, `input` as a string, string array, token array or array of token arrays, `encoding_format` `float` or `base64`, optional `dimensions`; see [below](#post-v1embeddings)). Returns 501 `not_implemented` on backends without embedding support.
 - `POST /v1/tokenize` and `POST /v1/detokenize`: model vocabulary tokenization (`content` or `text`) and detokenization (`tokens` integer array). Returns 501 `not_implemented` on backends without tokenizer support.
 
 Non-streaming response:
@@ -926,6 +930,8 @@ Correlation request headers (all optional; values must match
 | `X-Sonder-Workload` | One of the 7 workload classes; default `interactive_user`. |
 | `X-Sonder-Priority` | Integer from -16 to 16 (existing scheduler priority and integer telemetry; admission class `interactive`), or `interactive`, `subagent`, or `background` (class selection). Header wins over body `priority`; no hint defaults to numeric `0` and class `interactive`. |
 | `X-Sonder-Deadline-Ms` | Positive integer up to `INT32_MAX`, measured from connection arrival; a queued request past it returns 504. |
+| `X-Sonder-No-Capture` | `1` or `true` forces the telemetry [text capture policy](TELEMETRY.md#text-capture-policy) to `off` for this request (no output text, no prompt text in its events); `0` or `false` is a no-op. It can never enable capture. Anything else, or a repeated header, is 400 `invalid_correlation_header`. |
+| `X-Sonder-Local-Only` | `1`/`true` or `0`/`false` (case-insensitive). When true and the backend is `ollama_cloud`, the server refuses the request with 400 `invalid_request` ("... is local-only", param `X-Sonder-Local-Only`) before it resolves or loads the model, so no network I/O happens even with `--lazy-models` or after an idle eviction. Only `ollama_cloud` enforces it: every other backend ignores the flag, including `ollama` with `--ollama-allow-remote` and `llamaserver` in external mode pointed at a remote upstream, which still send the prompt off-host. Applies to chat, messages, completions, responses, embeddings, rerank, score, tokenize and detokenize. |
 
 The envelope `request_id` is always Inference's own id (`req-…`), also
 returned as `sonder.request_id`, in the completion id and in
@@ -1052,10 +1058,67 @@ curl http://127.0.0.1:11437/v1/messages \
 
 ### `POST /v1/embeddings`
 
-Returns OpenAI-compatible dense float vector embeddings (`input` string or
-string array up to 256 items, `encoding_format: "float"`) on backends
-advertising `embeddings` (such as `llamacpp` and `llamaserver`), or 501
-`not_implemented` on backends without embedding support.
+OpenAI-compatible dense embeddings, served natively by the in-process
+llama.cpp backend (`--backend llamacpp`; the `llamaserver` and `ollama`
+backends also answer it). Backends without embedding support answer 501
+`not_implemented`.
+
+Request:
+
+| Field | Meaning |
+| --- | --- |
+| `model` | Served model id (default `default`). |
+| `input` | A string; an array of strings; an array of integers (one pre-tokenized input); or an array of integer arrays (several pre-tokenized inputs). Token ids are in the loaded model's own vocabulary and must be 0 to 2147483647. Mixing strings and token arrays is a 400. Token-array inputs need the native `llamacpp` backend (others answer 400). |
+| `encoding_format` | `float` (default) or `base64`. `base64` returns each vector as its float32 values in little-endian byte order, base64-encoded (the OpenAI wire form; Python: `np.frombuffer(base64.b64decode(s), dtype="<f4")`). Any other value is 400 `unsupported_parameter`. |
+| `dimensions` | Optional output size. It must equal the model's native dimension unless the backend declares truncation support (the mock backend can). Anything else is a 400; vectors are never silently cut. |
+| `pooling_type` | Sonder extension: `mean`, `cls`, `last`, `none`, or `unspecified` (default). `rank` is refused (use `/v1/rerank`). |
+| `normalize` | Sonder extension, default `true`: scale each vector to unit L2 length. |
+| `priority`, `deadline_ms` | As on the other routes. |
+
+`user` is accepted and ignored.
+
+Pooling when `pooling_type` is absent comes from the model: the native backend
+reads `<arch>.pooling_type` from the GGUF metadata (BERT-style models: `cls` or
+`mean`; Qwen3-Embedding: `last`). A model that declares no usable pooling falls
+back to `mean` (decoder-only) or to llama.cpp's own choice (encoder models).
+The pooling actually used is reported in `sonder.pooling_type`.
+
+Limits, all answered with 400 `invalid_request` and `param: "input"`, before
+any tokenization:
+
+| Limit | Value |
+| --- | --- |
+| Items in `input` | 256 |
+| One text input | 256 KiB (bytes) |
+| All text inputs together | 2 MiB (bytes) |
+| One token array | 65536 ids |
+| All token arrays together | 262144 ids |
+
+On top of those the native backend checks the tokenized request (it refuses a
+single input longer than the model's context window; the whole request may
+total at most `embed_max_total_tokens`, default 262144, and each input at most
+`embed_max_input_tokens` when set). Inputs are batched by length through the
+embedding batch planner (`embed_batch_tokens`, `embed_max_sequences`) in an
+isolated context, so a running chat's KV cache is never disturbed.
+
+Response:
+
+```json
+{"object":"list","model":"bge-small","data":[{"object":"embedding","index":0,"embedding":[0.01,-0.02]}],
+ "usage":{"prompt_tokens":8,"total_tokens":8},
+ "sonder":{"api_version":1,"request_id":"req_...","backend":"llamacpp","model":"bge-small",
+           "synthetic":false,"dimensions":384,"pooling_type":"cls","encoding_format":"float"}}
+```
+
+With `encoding_format: "base64"` each `embedding` is a string. `usage` counts the
+tokens actually evaluated, including special tokens the tokenizer adds
+(`prompt_tokens` equals `total_tokens`; there is no completion). Token-array
+inputs are evaluated exactly as given, with no special tokens added.
+
+```sh
+curl -s http://127.0.0.1:11437/v1/embeddings -H 'Content-Type: application/json' \
+  -d '{"model":"default","input":["first text","second text"],"encoding_format":"float"}'
+```
 
 ## Live telemetry
 
@@ -1176,7 +1239,7 @@ These follow the contract review, which overrides the contract where they
 conflict:
 
 - Default CORS origins apply to read-only GET routes only; POST needs an
-  explicit `--cors-origin` or a token. `--capture-text` requires a token.
+  explicit `--cors-origin` or a token. `--capture-text` and `--text-capture on|full` require a token.
 - Per-subscriber losses are reported per subscriber (`: dropped <n>`, sequence
   gaps, `subscriber_dropped_events`), not as `telemetry.dropped` on the shared
   stream.

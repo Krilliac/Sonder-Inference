@@ -590,17 +590,22 @@ const sonder::cli::CommandSpec& bench_cli_spec() {
     static const cli::CommandSpec spec{
         "",
         "standalone benchmark runner (docs/BENCHMARK_PLAN.md)",
-        {"--model NAME [options]", "--backend ollama --list-models",
+        {"--model PATH.gguf [options]", "--backend ollama --list-models",
          "--backend llamaserver --llamaserver-url URL --list-models"},
         {{"Backend",
-          {{"backend", cli::OptionKind::value, "NAME", "ollama | llamaserver | mock (default: ollama)"},
+          {{"backend", cli::OptionKind::value, "NAME", "llamacpp | ollama | llamaserver | mock (default: llamacpp)"},
+           {"ctx-size", cli::OptionKind::value, "N",
+            "llamacpp: context tokens (default: 4096; 0 = model training context)"},
+           {"threads", cli::OptionKind::value, "N", "llamacpp: CPU threads (default: 0 = backend default)"},
+           {"gpu-layers", cli::OptionKind::value, "N", "llamacpp: offloaded layers (default: -1 = all; 0 = CPU)"},
            {"ollama-url", cli::OptionKind::value, "URL",
             "Ollama base URL (default: http://127.0.0.1:11434, loopback only)"},
            {"llamaserver-url", cli::OptionKind::value, "URL",
             "llama-server base URL (default: http://127.0.0.1:8080, loopback only)"},
            {"llamaserver-config", cli::OptionKind::value, "PATH",
             "llama-server JSON config (attach or spawn, loopback only)"},
-           {"model", cli::OptionKind::value, "NAME", "model to benchmark (required unless --list-models)"},
+           {"model", cli::OptionKind::value, "PATH|NAME",
+            "GGUF path for llamacpp, model name otherwise (required unless --list-models)"},
            {"require-idle", cli::OptionKind::flag, "",
             "ollama: refuse to run if a different model is resident\n(avoids competing with live traffic for the GPU)"},
            {"list-models", cli::OptionKind::flag, "", "list models on the backend and exit"}}},
@@ -628,7 +633,8 @@ const sonder::cli::CommandSpec& bench_cli_spec() {
          "markdown summary is headed 'MOCK BACKEND: not a performance claim'.",
          "Exit status: 0 ok, 1 a request failed or an output file could not be written, 2 usage error,\n"
          "3 backend unreachable or model load failed, 4 --require-idle refused to run."},
-        {"--backend ollama --list-models",
+        {"--model models/model.gguf --ctx-size 4096 --threads 4 --gpu-layers 0 --warmup 1 --runs 3",
+         "--backend ollama --list-models",
          "--backend ollama --model qwen3:0.6b --warmup 1 --runs 3 --require-idle --hardware \"RTX 4090\"",
          "--backend llamaserver --llamaserver-url http://127.0.0.1:8080 --list-models",
          "--backend llamaserver --llamaserver-url http://127.0.0.1:8080 --model bonsai-2 --warmup 1 --runs 3",
@@ -919,9 +925,32 @@ bool parse_bench_cli_args(const std::vector<std::string>& args, BenchCliArgs& ou
         return false;
     }
 
-    out.backend = a.get("backend").value_or("ollama");
-    if (out.backend != "ollama" && out.backend != "llamaserver" && out.backend != "mock") {
-        error = "unsupported backend '" + out.backend + "' (expected ollama, llamaserver or mock)";
+    out.backend = a.get("backend").value_or(out.backend);
+    if (out.backend != "llamacpp" && out.backend != "ollama" && out.backend != "llamaserver" &&
+        out.backend != "mock") {
+        error = "unsupported backend '" + out.backend + "' (expected llamacpp, ollama, llamaserver or mock)";
+        return false;
+    }
+
+    for (const char* option : {"ctx-size", "threads", "gpu-layers"}) {
+        if (a.values.count(option) != 0 && out.backend != "llamacpp") {
+            error = std::string("--") + option + " requires --backend llamacpp";
+            return false;
+        }
+    }
+    if (auto v = a.get("ctx-size");
+        v && !cli::parse_integer<std::uint32_t>("ctx-size", *v, 0, std::numeric_limits<std::int32_t>::max(),
+                                              out.context_length, error)) {
+        return false;
+    }
+    if (auto v = a.get("threads");
+        v && !cli::parse_integer<std::int32_t>("threads", *v, 0, std::numeric_limits<std::int32_t>::max(),
+                                             out.threads, error)) {
+        return false;
+    }
+    if (auto v = a.get("gpu-layers");
+        v && !cli::parse_integer<std::int32_t>("gpu-layers", *v, -1, std::numeric_limits<std::int32_t>::max(),
+                                             out.gpu_layers, error)) {
         return false;
     }
 

@@ -7,16 +7,31 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
 #include "sonder/inference/backend.hpp"
 #include "sonder/inference/speculative_verifier.hpp"
 #include "sonder/inference/swa_policy.hpp"
+#include "sonder/inference/telemetry.hpp"
 
 namespace sonder::inference {
 
 inline constexpr const char* kLlamaCppBackendName = "llamacpp";
+
+// One LoRA adapter file + scale attached to a named LoRA alias.
+struct LlamaCppLoraAdapterOption {
+    std::string path;
+    float scale = 1.0f;
+};
+
+// Named LoRA alias mapping an alias string to a base model + one or more adapters.
+struct LlamaCppLoraAliasOption {
+    std::string alias;
+    std::string base_model;
+    std::vector<LlamaCppLoraAdapterOption> adapters;
+};
 
 struct LlamaCppBackendOptions {
     // Directories scanned (non-recursively) by list_models() for *.gguf files.
@@ -34,16 +49,23 @@ struct LlamaCppBackendOptions {
     // Physical micro-batch (llama.cpp n_ubatch). 0 = llama.cpp's default (512)
     // capped at batch_size; otherwise must be <= batch_size.
     std::uint32_t ubatch_size = 0;
-    // KV cache element types: f16 (default), f32, bf16, q8_0, q5_1, q5_0,
-    // q4_1, q4_0, iq4_nl. q8_0 roughly halves KV memory, q4_0 roughly quarters
-    // it (docs/PLACEMENT.md, "KV cache types").
-    std::string kv_cache_type_k = "f16";
-    std::string kv_cache_type_v = "f16";
+    // KV cache element types: "auto" (default: resolves per model to q8_0 when
+    // the model's head dims are multiples of 32 and flash_attention != "off",
+    // otherwise f16), or an explicit type: q8_0, f16, f32, bf16, q5_1, q5_0,
+    // q4_1, q4_0 (K requires kv_k_q4_allowed + model rotation), iq4_nl, f8_e4m3 (CUDA-only).
+    std::string kv_cache_type_k = "auto";
+    std::string kv_cache_type_v = "auto";
+    // Explicit opt-in permitting q4_0 for K when the model supports Hadamard K rotation.
+    bool kv_k_q4_allowed = false;
     // Flash Attention: auto (default, llama.cpp decides), on or off. A
     // quantized V cache needs it: "off" with a quantized V type is rejected.
     std::string flash_attention = "auto";
     // Explicit ggml device names (e.g. "CUDA0", "ROCm0", "Vulkan0", "CUDA1")
-    // for vendor-targeted or multi-GPU offloading. Empty = llama.cpp default.
+    // for vendor-targeted or multi-GPU offloading. Non-empty is an exact
+    // allowlist (case-insensitive names; an iGPU is used only when named; two
+    // backend views of one card collapse to the first named). Empty = automatic:
+    // discrete GPUs only, never an iGPU, CPU-only when there is none. A load
+    // request's ModelLoadOptions::devices overrides this per model.
     std::vector<std::string> devices;
     // Primary GPU index for single-GPU mode (split_mode == "none") and
     // non-split / scratch tensors. Must be >= 0.
@@ -78,6 +100,12 @@ struct LlamaCppBackendOptions {
     std::string spec_type = "none";
     // Max draft tokens per speculative step (0 = automatic default for spec_type).
     std::int32_t spec_draft_max = 0;
+    // Minimum draft-token probability for model-based speculation ([0, 1], default 0.0).
+    double spec_p_min = 0.0;
+    // Per-route / per-task-class speculation rules (<selector>=<policy>), parsed by ParseSpecRule().
+    std::vector<std::string> spec_route_rules{};
+    // Determinism mode: disables model-based drafting (draft-model / draft-mtp).
+    bool deterministic = false;
     // Speculative decoding verification policy: TargetMatch (default reference
     // path) vs opt-in StochasticRejection (Leviathan et al. sum min(p, q) +
     // residual (p - q)_+ resampling). StochasticRejection activates only when
@@ -86,6 +114,10 @@ struct LlamaCppBackendOptions {
     SpeculativeVerificationMode spec_verification_mode = SpeculativeVerificationMode::TargetMatch;
     // Bounded L2 host-RAM prefix state cache budget in MiB (0 = disabled, max 65536).
     std::uint32_t cache_ram_mib = 0;
+    // Context checkpoint spacing in tokens (normal / dense for hybrid & recurrent models) and per-slot cap.
+    std::uint32_t checkpoint_spacing_tokens = 2048;
+    std::uint32_t checkpoint_dense_spacing_tokens = 1024;
+    std::uint32_t checkpoint_max_per_slot = 8;
     // Dynamic GPU cache in MiB for host-resident MoE experts (0 = disabled, max 262144).
     std::uint32_t moe_cache_mib = 0;
     // Unused/rejected by the direct llamacpp backend (no execution consumer):
@@ -114,6 +146,39 @@ struct LlamaCppBackendOptions {
     std::uint32_t embed_batch_tokens = 2048;
     // Maximum sequences packed per embedding/rerank forward pass (0 = auto, max 64).
     std::uint32_t embed_max_sequences = 16;
+    // In-process workload role ("main_decode" or "auxiliary"), CUDA stream priorities
+    // ("high", "default", "low"), and decode-aware auxiliary gate settings (NAT-12).
+    std::string workload_role = "main_decode";
+    std::string main_stream_priority = "high";
+    std::string aux_stream_priority = "low";
+    bool aux_gate_enabled = true;
+    double max_aux_duty_cycle = 0.05;
+    std::uint32_t aux_active_slice_tokens = 512;
+    std::uint32_t aux_active_max_sequences = 4;
+    std::uint32_t aux_max_decode_hold_ms = 25;
+    // Optional root directories constraining allowed LoRA adapter files (defaults to model_dirs when empty).
+    std::vector<std::string> lora_roots{};
+    // Named LoRA aliases mapping alias -> base model + one or more (adapter, scale) pairs.
+    std::vector<LlamaCppLoraAliasOption> lora_aliases{};
+    // Opt-in startup greedy smoke test after load (default off).
+    bool startup_smoke_test = false;
+    // Per-request embedding limits on the tokenized inputs (0 = no limit). A single input is
+    // always bounded by the context window as well.
+    std::uint32_t embed_max_total_tokens = 262144;
+    std::uint32_t embed_max_input_tokens = 0;
+    // Telemetry verbosity for backend-internal instrumentation. Layer and
+    // operator graph telemetry (and Capability::layer_telemetry) activate
+    // strictly at TelemetryLevel::deep; below deep no ggml callback is installed.
+    TelemetryLevel telemetry_level = TelemetryLevel::standard;
+    // Sample graph eval telemetry every N evals when telemetry_level == deep (>= 1).
+    std::uint32_t graph_telemetry_sample_every = 1;
+    // Collect per-layer / per-op wall timings on sampled evals at deep level.
+    bool graph_telemetry_timings = true;
+    // Optional non-owning TelemetryBus receiving backend.layer.timing and
+    // backend.operator.activity events at TelemetryLevel::deep.
+    TelemetryBus* telemetry_bus = nullptr;
+    // Optional correlation context for emitted graph telemetry events.
+    TelemetryContext telemetry_context{};
 };
 
 // Checks the llama.cpp context and placement options (KV cache types,
@@ -124,5 +189,10 @@ struct LlamaCppBackendOptions {
 Status validate_llamacpp_options(const LlamaCppBackendOptions& options);
 
 std::shared_ptr<Backend> make_llamacpp_backend(LlamaCppBackendOptions options = {});
+
+#define SONDER_HAS_LLAMACPP_DEVICE_HEALTH_API 1
+inline constexpr std::string_view kLlamaCppDeviceUnhealthyError = "device_unhealthy";
+[[nodiscard]] bool is_llamacpp_device_unhealthy_error(const Status& status) noexcept;
+Status recover_llamacpp_device(Backend& backend, std::string_view device);
 
 }  // namespace sonder::inference

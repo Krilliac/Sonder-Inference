@@ -1,4 +1,4 @@
-# Module: benchmark harness (owner: feat/ollama-bench).
+# Module: benchmark harness for native and compatibility backends.
 # Library code compiles into sonder_inference (used by `sonder-infer bench`);
 # `sonder-bench` is a standalone runner that also writes a markdown summary.
 sonder_module_sources(src/benchmark.cpp src/report.cpp)
@@ -25,6 +25,16 @@ if(SONDER_BUILD_TESTS AND TARGET sonder-infer)
 endif()
 
 if(SONDER_BUILD_TESTS)
+    add_test(NAME sonder.bench.tool_llamacpp
+        COMMAND ${CMAKE_COMMAND}
+            "-DBENCH_EXE=$<TARGET_FILE:sonder-bench>"
+            "-DNATIVE_ENABLED=${SONDER_WITH_LLAMA_CPP}"
+            "-DCORPUS=${CMAKE_CURRENT_SOURCE_DIR}/corpus/smoke.json"
+            "-DOUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/bench-native-results"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/run_llamacpp_bench.cmake")
+    set_tests_properties(sonder.bench.tool_llamacpp PROPERTIES
+        SKIP_REGULAR_EXPRESSION "SKIP: native bench" TIMEOUT 180)
+
     add_test(NAME sonder.bench.tool_mock
         COMMAND sonder-bench --backend mock --model mock:tiny
                 --corpus "${CMAKE_CURRENT_SOURCE_DIR}/corpus/baseline.json"

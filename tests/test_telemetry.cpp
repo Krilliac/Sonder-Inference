@@ -2100,3 +2100,189 @@ TEST_CASE("NAT-08: gpu_memory_sample_attributes emits additive device telemetry 
     CHECK(min_attrs.find("vulkan_heaps") == nullptr);
     CHECK(min_attrs.find("ggml_device") == nullptr);
 }
+#if defined(SONDER_HAS_SAMPLER_CHAIN)
+TEST_CASE("VIS-03: Sonder sampler emits inference.sampling.candidates with bounds and opt-in text") {
+    auto run_sonder = [](TelemetryOptions telemetry, const SamplingConfig& sampling, bool use_chat = false,
+                         int default_tokens = 4, std::function<void(const TokenChunk&)> on_chunk = {}) {
+        auto sink = std::make_shared<MemoryTelemetrySink>();
+        EngineOptions eo;
+        eo.telemetry = telemetry;
+        eo.telemetry_sinks.push_back(sink);
+        eo.sample_devices_on_start = false;
+        eo.sample_gpu_devices = false;
+        eo.device_sample_interval = std::chrono::milliseconds(0);
+        eo.scheduling.enabled = false;
+        Engine engine(std::move(eo));
+        MockBackendOptions mo;
+        mo.token_logits = true;
+        mo.default_completion_tokens = default_tokens;
+        REQUIRE(engine.register_backend(make_mock_backend(mo)).ok());
+        auto model = engine.load_model(kMockBackendName, ModelLoadOptions{"mock:tiny", "cpu:0"});
+        REQUIRE(model.ok());
+        auto sess = engine.create_session(model.value(), {});
+        REQUIRE(sess.ok());
+        auto cb = [&](const TokenChunk& c) {
+            if (on_chunk) on_chunk(c);
+            return true;
+        };
+        // Named, not a braced temporary inside the ternary: GCC's -Wdangling-pointer flags the latter.
+        const std::vector<ChatMessage> messages{{"user", "candidates probe"}};
+        Result<GenerationResult> res = use_chat ? sess.value()->chat(messages, cb, sampling)
+                                                : sess.value()->generate("candidates probe", cb, sampling);
+        REQUIRE_MESSAGE(res.ok(), res.status().to_string());
+        engine.telemetry().flush();
+        std::vector<json::Value> events;
+        for (const auto& line : sink->lines()) {
+            auto parsed = json::parse(line);
+            REQUIRE(parsed.ok());
+            check_envelope(parsed.value());
+            events.push_back(std::move(parsed).value());
+        }
+        return std::pair{std::move(res).value(), std::move(events)};
+    };
+
+    auto filter_events = [](const std::vector<json::Value>& all, std::string_view type) {
+        std::vector<json::Value> out;
+        for (const auto& e : all) {
+            if (e.find("event_type")->as_string() == type) out.push_back(e);
+        }
+        return out;
+    };
+
+    SUBCASE("default standard telemetry emits top-5 post-sampling candidates without text or logprob leak") {
+        TelemetryOptions t;
+        SamplingConfig sc = SamplingConfig::greedy(4);
+        unsigned caller_logprob_chunks = 0;
+        auto [res, events] = run_sonder(t, sc, false, 8, [&](const TokenChunk& c) {
+            if (c.logprob.has_value() || !c.top_logprobs.empty()) ++caller_logprob_chunks;
+        });
+        CHECK(res.logprobs.empty());
+        CHECK(caller_logprob_chunks == 0u);
+
+        const auto tokens = filter_events(events, "inference.token.generated");
+        const auto cands = filter_events(events, "inference.sampling.candidates");
+        REQUIRE(tokens.size() == 4u);
+        REQUIRE(cands.size() == 4u);
+        for (std::size_t i = 0; i < tokens.size(); ++i) {
+            const auto& ta = *tokens[i].find("attributes");
+            const auto& ca = *cands[i].find("attributes");
+            CHECK(cands[i].find("sampling")->find("level")->as_string() == "standard");
+            CHECK(ta.find("unit")->as_string() == "token");
+            CHECK(ta.find("probability_basis")->as_string() == "post_sampling");
+            CHECK(ca.find("index")->as_int() == ta.find("index")->as_int());
+            CHECK(ca.find("sampled_token_id")->as_int() == ta.find("token_id")->as_int());
+            CHECK(ca.find("probability_basis")->as_string() == "post_sampling");
+            const auto& list = ca.find("candidates")->as_array();
+            REQUIRE(list.size() == 5u);
+            // Greedy selects argmax: candidate[0] matches the sampled token and probability.
+            CHECK(list[0].find("token_id")->as_int() == ta.find("token_id")->as_int());
+            CHECK(list[0].find("probability")->as_double() ==
+                  doctest::Approx(ta.find("probability")->as_double()).epsilon(1e-6));
+            for (std::size_t j = 0; j < list.size(); ++j) {
+                const double p = list[j].find("probability")->as_double();
+                CHECK(p > 0.0);
+                CHECK(p <= 1.0);
+                CHECK(list[j].find("text") == nullptr);
+                if (j > 0) {
+                    CHECK(list[j - 1].find("probability")->as_double() >= p);
+                }
+            }
+        }
+    }
+
+    SUBCASE("stochastic chain respects top_k truncation and logit_bias bans in candidates") {
+        TelemetryOptions t;
+        t.token_probability_top_k = 10;
+        SamplingConfig sc;
+        sc.max_tokens = 3;
+        sc.temperature = 0.8f;
+        sc.top_k = 3;
+        sc.top_p = 1.0f;
+        sc.min_p = 0.0f;
+        sc.seed = 42;
+        sc.logit_bias = {{0, -std::numeric_limits<float>::infinity()}};
+        auto [res, events] = run_sonder(t, sc, false, 8);
+        const auto cands = filter_events(events, "inference.sampling.candidates");
+        REQUIRE(cands.size() == 3u);
+        for (const auto& ev : cands) {
+            const auto& list = ev.find("attributes")->find("candidates")->as_array();
+            REQUIRE(list.size() >= 1u);
+            CHECK(list.size() <= 3u);
+            double sum = 0.0;
+            for (const auto& entry : list) {
+                CHECK(entry.find("token_id")->as_int() != 0);
+                sum += entry.find("probability")->as_double();
+            }
+            CHECK(sum == doctest::Approx(1.0).epsilon(1e-4));
+        }
+    }
+
+    SUBCASE("stride, cap, top_k clamping, and capture_text opt-in") {
+        TelemetryOptions t;
+        t.token_probability_top_k = 50;  // clamped to kMaxTelemetryTopK (10)
+        t.token_candidates_stride = 2;
+        t.token_candidates_max_events = 0;
+        t.capture_text = true;
+        SamplingConfig sc = SamplingConfig::greedy(5);
+        auto [res, events] = run_sonder(t, sc, false, 8);
+        const auto tokens = filter_events(events, "inference.token.generated");
+        const auto cands = filter_events(events, "inference.sampling.candidates");
+        REQUIRE(tokens.size() == 5u);
+        REQUIRE(cands.size() == 3u);  // indices 0, 2, 4
+        CHECK(cands[0].find("attributes")->find("index")->as_int() == 0);
+        CHECK(cands[1].find("attributes")->find("index")->as_int() == 2);
+        CHECK(cands[2].find("attributes")->find("index")->as_int() == 4);
+        for (const auto& ev : cands) {
+            const auto& list = ev.find("attributes")->find("candidates")->as_array();
+            REQUIRE(list.size() == static_cast<std::size_t>(kMaxTelemetryTopK));
+            for (const auto& entry : list) {
+                REQUIRE(entry.find("text") != nullptr);
+                CHECK_FALSE(entry.find("text")->as_string().empty());
+            }
+        }
+
+        // Cap 1 and stride 0 (treated as 1) keeps only the first token's candidates.
+        TelemetryOptions capped;
+        capped.token_candidates_stride = 0;
+        capped.token_candidates_max_events = 1;
+        auto [res2, events2] = run_sonder(capped, SamplingConfig::greedy(4), false, 8);
+        CHECK(filter_events(events2, "inference.token.generated").size() == 4u);
+        const auto cands2 = filter_events(events2, "inference.sampling.candidates");
+        REQUIRE(cands2.size() == 1u);
+        CHECK(cands2[0].find("attributes")->find("index")->as_int() == 0);
+    }
+
+    SUBCASE("top_k 0 or negative disables candidates while keeping unit token probabilities") {
+        for (const int k : {0, -5}) {
+            CAPTURE(k);
+            TelemetryOptions t;
+            t.token_probability_top_k = k;
+            auto [res, events] = run_sonder(t, SamplingConfig::greedy(3), false, 8);
+            const auto tokens = filter_events(events, "inference.token.generated");
+            REQUIRE(tokens.size() == 3u);
+            for (const auto& ev : tokens) {
+                CHECK(ev.find("attributes")->find("unit")->as_string() == "token");
+                CHECK(ev.find("attributes")->find("probability") != nullptr);
+            }
+            CHECK(filter_events(events, "inference.sampling.candidates").empty());
+        }
+    }
+
+    SUBCASE("metrics level omits both token and candidates events") {
+        TelemetryOptions t;
+        t.level = TelemetryLevel::metrics;
+        auto [res, events] = run_sonder(t, SamplingConfig::greedy(3), false, 8);
+        CHECK(filter_events(events, "inference.token.generated").empty());
+        CHECK(filter_events(events, "inference.sampling.candidates").empty());
+    }
+
+    SUBCASE("Session::chat on token_logits backend emits inference.sampling.candidates") {
+        TelemetryOptions t;
+        t.token_probability_top_k = 3;
+        auto [res, events] = run_sonder(t, SamplingConfig::greedy(3), /*use_chat=*/true, 8);
+        const auto cands = filter_events(events, "inference.sampling.candidates");
+        REQUIRE(cands.size() == 3u);
+        CHECK(cands[0].find("attributes")->find("candidates")->as_array().size() == 3u);
+    }
+}
+#endif

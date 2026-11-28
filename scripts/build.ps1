@@ -8,23 +8,22 @@
   preset. Requires Visual Studio 2022+ (or Build Tools) with the C++ workload;
   CMake and Ninja from that installation are used when not already on PATH.
 
-  Pass -LlamaCppSourceDir to build direct llama.cpp presets (such as
-  windows-cuda-blackwell, windows-cuda-rtx, windows-rocm-xt, or
-  windows-vulkan-xt) against a local PrismML or mainline llama.cpp checkout,
-  and -ExtraCMakeArgs for any additional -D cache overrides.
+  Sonder Inference builds only its single SHA-pinned llama.cpp archive from
+  cmake/llamacpp-pin.json plus third_party/ggml-patches/. Pass -ExtraCMakeArgs
+  for additional -D cache options (for example -DSONDER_LLAMACPP_URL=<tarball>
+  for offline archive builds).
 
 .EXAMPLE
   powershell -NoProfile -File scripts\build.ps1 -Preset msvc-debug -Test
 
 .EXAMPLE
-  powershell -NoProfile -File scripts\build.ps1 -Preset windows-cuda-blackwell -LlamaCppSourceDir D:\ollama\runtimes\PrismML-Eng\llama.cpp -Test
+  powershell -NoProfile -File scripts\build.ps1 -Preset windows-cuda-blackwell -Jobs 8 -Test
 #>
 [CmdletBinding()]
 param(
     [string]$Preset = 'msvc-debug',
     [switch]$Test,
     [switch]$Clean,
-    [string]$LlamaCppSourceDir = '',
     [ValidateRange(0, 1024)]
     [int]$Jobs = 0,
     [string[]]$ExtraCMakeArgs = @()
@@ -85,13 +84,6 @@ Remove-Item Env:CXX -ErrorAction SilentlyContinue
 Show-GpuToolchainSummary -PresetName $Preset
 
 $configureArgs = @('--preset', $Preset)
-if (-not [string]::IsNullOrWhiteSpace($LlamaCppSourceDir)) {
-    if (-not (Test-Path -LiteralPath $LlamaCppSourceDir -PathType Container)) {
-        throw "LlamaCppSourceDir does not exist or is not a directory: $LlamaCppSourceDir"
-    }
-    $normalizedLlamaSrc = (Resolve-Path -LiteralPath $LlamaCppSourceDir).ProviderPath.Replace('\', '/')
-    $configureArgs += "-DFETCHCONTENT_SOURCE_DIR_LLAMACPP=$normalizedLlamaSrc"
-}
 if ($ExtraCMakeArgs -and $ExtraCMakeArgs.Count -gt 0) {
     $configureArgs += $ExtraCMakeArgs
 }

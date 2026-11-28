@@ -1114,6 +1114,99 @@ int cmd_coopmat_canary(const Args& a) {
     return result.ok ? cli::kExitOk : cli::kExitFailure;
 }
 
+int cmd_reblock_pq2(const Args& a) {
+    const auto in_opt = a.get("input");
+    if (!in_opt || in_opt->empty()) {
+        return usage_error("reblock-pq2", "--input is required");
+    }
+    const bool inspect_only = a.has("inspect");
+    const auto out_opt = a.get("output");
+    if (inspect_only) {
+        if (out_opt.has_value()) {
+            return usage_error("reblock-pq2", "--output cannot be combined with --inspect");
+        }
+        si::Pq2GgufInspection insp;
+        const si::Status st = si::inspect_pq2_gguf(si::pq2_path_from_utf8(*in_opt), insp);
+        if (!st.ok()) {
+            err() << "error: reblock-pq2: " << st.to_string() << "\n";
+            return cli::kExitFailure;
+        }
+        if (a.has("json")) {
+            si::json::Object doc{
+                {"schema", "sonder.inference.pq2_reblock/1"},
+                {"mode", "inspect"},
+                {"input", *in_opt},
+                {"gguf_version", static_cast<std::uint64_t>(insp.gguf_version)},
+                {"tensor_count", insp.tensor_count},
+                {"pq2_tensor_count", insp.pq2_tensor_count},
+                {"q2_tensor_count", insp.q2_tensor_count},
+                {"pq2_input_bytes", insp.pq2_input_bytes},
+                {"q2_output_bytes", insp.q2_output_bytes},
+                {"other_tensor_bytes", insp.other_tensor_bytes},
+                {"prism_hadamard", insp.prism_hadamard},
+                {"file_type", insp.file_type ? si::json::Value(static_cast<std::uint64_t>(*insp.file_type))
+                                             : si::json::Value(nullptr)},
+            };
+            std::cout << si::json::Value(doc).dump() << "\n";
+        } else {
+            std::cout << "gguf_version=" << insp.gguf_version << "  tensors=" << insp.tensor_count
+                      << "  pq2_tensors=" << insp.pq2_tensor_count << "  q2_tensors=" << insp.q2_tensor_count
+                      << "  pq2_input_bytes=" << insp.pq2_input_bytes << "  q2_output_bytes=" << insp.q2_output_bytes
+                      << "  prism_hadamard=" << (insp.prism_hadamard ? "true" : "false") << "\n";
+        }
+        return cli::kExitOk;
+    }
+
+    if (!out_opt || out_opt->empty()) {
+        return usage_error("reblock-pq2", "--output is required (or pass --inspect)");
+    }
+
+    const std::filesystem::path in_path = si::pq2_path_from_utf8(*in_opt);
+    const std::filesystem::path out_path = si::pq2_path_from_utf8(*out_opt);
+    std::error_code pre_ec;
+    const bool had_existing_out = std::filesystem::exists(out_path, pre_ec) && !pre_ec;
+
+    si::Pq2ReblockReport report;
+    const si::Status reb_st = si::reblock_pq2_to_q2_gguf(in_path, out_path, &report);
+    if (!reb_st.ok()) {
+        err() << "error: reblock-pq2: " << reb_st.to_string() << "\n";
+        return cli::kExitFailure;
+    }
+
+    const si::Status ver_st = si::verify_pq2_to_q2_gguf(in_path, out_path);
+    if (!ver_st.ok()) {
+        if (!had_existing_out) {
+            std::error_code rm_ec;
+            std::filesystem::remove(out_path, rm_ec);
+        }
+        err() << "error: reblock-pq2: parity verification failed: " << ver_st.to_string() << "\n";
+        return cli::kExitFailure;
+    }
+
+    if (a.has("json")) {
+        si::json::Object doc{
+            {"schema", "sonder.inference.pq2_reblock/1"},
+            {"mode", "reblock"},
+            {"verified", true},
+            {"input", *in_opt},
+            {"output", *out_opt},
+            {"reblocked_tensors", report.reblocked_tensors},
+            {"copied_tensors", report.copied_tensors},
+            {"pq2_input_bytes", report.inspection.pq2_input_bytes},
+            {"q2_output_bytes", report.inspection.q2_output_bytes},
+            {"output_file_bytes", report.output_file_bytes},
+            {"output_sha256", report.output_sha256},
+            {"prism_hadamard", report.inspection.prism_hadamard},
+        };
+        std::cout << si::json::Value(doc).dump() << "\n";
+    } else {
+        std::cout << "reblocked_tensors=" << report.reblocked_tensors << "  copied_tensors=" << report.copied_tensors
+                  << "  output_file_bytes=" << report.output_file_bytes << "  sha256=" << report.output_sha256
+                  << "  verified=true\n";
+    }
+    return cli::kExitOk;
+}
+
 int cmd_help(const std::vector<std::string>& args) {
     if (args.empty()) {
         std::cout << cli::overview();
@@ -1209,6 +1302,7 @@ int main(int argc, char** argv) {
     if (cmd == "coopmat-canary") return cmd_coopmat_canary(a);
     if (cmd == "node") return cmd_node(a);
     if (cmd == "plan") return cmd_plan(a);
+    if (cmd == "reblock-pq2") return cmd_reblock_pq2(a);
     if (cmd == "backends") return cmd_backends(a, env);
     if (cmd == "models") return cmd_models(a, env);
     if (cmd == "generate") return cmd_generate(a, env);

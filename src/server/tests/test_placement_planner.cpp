@@ -9,7 +9,7 @@
 #include <utility>
 #include <vector>
 
-#include "backends/llamaserver/env_policy.hpp"
+#include "server/src/env_policy.hpp"
 #include "sonder/inference/device.hpp"
 #include "sonder/inference/json.hpp"
 #include "sonder/inference/launch_profile.hpp"
@@ -258,9 +258,25 @@ TEST_CASE("placement planner: Ternary Bonsai-2-27B on RTX 5070 Ti fits on GPU wi
     CHECK(plan.profile.speculative->types == std::vector<std::string>{"ngram-mod"});
     CHECK(plan.estimate.total_mib() <= plan.budget_mib);
     CHECK(plan.estimate.requires_prism_runtime);
-    CHECK(any_contains(plan.warnings, "PrismML"));
     CHECK(any_contains(plan.warnings, "PQ2_0/PTQ1_0"));
+    CHECK(any_contains(plan.warnings, "Q2_0"));
+    CHECK(any_contains(plan.warnings, "sonder-infer reblock-pq2"));
+    CHECK_FALSE(any_contains(plan.warnings, "stock llama-server"));
     CHECK_FALSE(plan.reasons.empty());
+
+    // Re-blocked stock Q2_0 (has_prism_private_tensors=false, prism_hadamard=true) runs
+    // natively on SI's pinned llama.cpp v1.0.0 engine with requires_prism_runtime=false.
+    si::GgufModelInfo q2_bonsai = model;
+    q2_bonsai.has_prism_private_tensors = false;
+    si::PlacementPlanRequest q2_req = req;
+    q2_req.model_path = "D:/models/Bonsai-2-27B-Q2_0_g64.gguf";
+    const si::PlacementPlan q2_plan = si::plan_model_placement(q2_bonsai, gpus, host_ram(32, 24), q2_req);
+    verify_plan_contracts(q2_plan);
+    CHECK_FALSE(q2_plan.requires_prism_runtime);
+    CHECK_FALSE(q2_plan.estimate.requires_prism_runtime);
+    CHECK(q2_plan.estimate.prism_hadamard);
+    CHECK_FALSE(any_contains(q2_plan.warnings, "PQ2_0/PTQ1_0"));
+    CHECK(any_contains(q2_plan.reasons, "prism.hadamard"));
 }
 
 TEST_CASE("placement planner: Ternary Bonsai-2-9B-MTP on RTX 5070 Ti enables draft-mtp and rollback snapshots") {

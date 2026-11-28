@@ -960,4 +960,85 @@ TEST_CASE("session rerank and score lifecycle, sorting, index preservation, canc
     }
 }
 
+TEST_CASE("session request lifecycle at TelemetryLevel::metrics carries model, requested_model, and kind") {
+    auto sink = std::make_shared<MemoryTelemetrySink>();
+    EngineOptions eo;
+    eo.telemetry.level = TelemetryLevel::metrics;
+    eo.telemetry_sinks.push_back(sink);
+    eo.sample_devices_on_start = false;
+    eo.device_sample_interval = std::chrono::milliseconds(0);
+    Engine engine(eo);
+    REQUIRE(engine.register_backend(make_mock_backend()).ok());
+    auto loaded = engine.load_model(kMockBackendName, {"mock:tiny", "cpu:0"});
+    REQUIRE(loaded.ok());
+    auto sess = engine.create_session(loaded.value(), SessionOptions{.sampling = SamplingConfig::greedy(3)});
+    REQUIRE(sess.ok());
+
+    const auto gen = sess.value()->generate("hello metrics");
+    REQUIRE(gen.ok());
+    const auto chat_res = sess.value()->chat({{"user", "hello chat metrics"}});
+    REQUIRE(chat_res.ok());
+    const auto emb = sess.value()->embed({"hello embed"});
+    REQUIRE(emb.ok());
+    RerankRequest rreq;
+    rreq.query = "q";
+    rreq.documents = {"d1"};
+    const auto rrk = sess.value()->rerank(rreq);
+    REQUIRE(rrk.ok());
+    ScoreRequest sreq;
+    sreq.pairs = {{"q", "d1"}};
+    const auto scr = sess.value()->score(sreq);
+    REQUIRE(scr.ok());
+
+    engine.telemetry().flush();
+    std::vector<json::Value> envs;
+    for (const auto& line : sink->lines()) {
+        auto parsed = json::parse(line);
+        REQUIRE(parsed.ok());
+        CHECK(parsed.value().find("event_type")->as_string() != "inference.token.generated");
+        envs.push_back(parsed.value());
+    }
+
+    auto check_req = [&](const std::string& rid, const std::string& expected_kind) {
+        CAPTURE(rid);
+        std::vector<std::string> req_types;
+        for (const auto& e : envs) {
+            const json::Value* erid = e.find("request_id");
+            if (erid == nullptr || !erid->is_string() || erid->as_string() != rid) continue;
+            const std::string type = e.find("event_type")->as_string();
+            if (type.rfind("request.", 0) != 0) continue;
+            req_types.push_back(type);
+            const json::Value* attrs = e.find("attributes");
+            REQUIRE(attrs != nullptr);
+            REQUIRE(attrs->find("kind") != nullptr);
+            CHECK(attrs->find("kind")->as_string() == expected_kind);
+            REQUIRE(attrs->find("model") != nullptr);
+            CHECK(attrs->find("model")->as_string() == "mock:tiny");
+            REQUIRE(attrs->find("requested_model") != nullptr);
+            CHECK(attrs->find("requested_model")->as_string() == "mock:tiny");
+        }
+        CHECK(req_types == std::vector<std::string>{"request.queued", "request.started", "request.completed"});
+    };
+
+    check_req(gen->request_id, "generate");
+    check_req(chat_res->request_id, "chat");
+    // Also verify embed, rerank, score request.* events carry model and requested_model.
+    int non_gen_completed = 0;
+    for (const auto& e : envs) {
+        const std::string type = e.find("event_type")->as_string();
+        if (type != "request.queued" && type != "request.started" && type != "request.completed") continue;
+        const json::Value* attrs = e.find("attributes");
+        REQUIRE(attrs != nullptr);
+        const std::string k = attrs->find("kind") ? attrs->find("kind")->as_string() : std::string{};
+        if (k == "embed" || k == "rerank" || k == "score") {
+            REQUIRE(attrs->find("model") != nullptr);
+            CHECK(attrs->find("model")->as_string() == "mock:tiny");
+            REQUIRE(attrs->find("requested_model") != nullptr);
+            CHECK(attrs->find("requested_model")->as_string() == "mock:tiny");
+            if (type == "request.completed") ++non_gen_completed;
+        }
+    }
+    CHECK(non_gen_completed == 3);
+}
+
 }

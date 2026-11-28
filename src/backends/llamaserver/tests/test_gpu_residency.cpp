@@ -1,6 +1,6 @@
 #include <doctest/doctest.h>
 
-#include "../gpu_memory.hpp"
+#include "../spill_guard.hpp"
 #include "../gpu_residency.hpp"
 
 #include <limits>

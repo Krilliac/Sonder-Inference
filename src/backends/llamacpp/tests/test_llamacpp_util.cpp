@@ -1,10 +1,18 @@
 // Pure helper tests (no model weights); the lazy-grammar cases at the end use a vocab-only GGUF fixture.
+#include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
 #include <limits>
+#include <memory>
 #include <string>
 #include <vector>
 
+#include "ggml.h"
+#include "gguf.h"
+#include "device_health.hpp"
 #include "sonder/backends/llamacpp/llamacpp_backend.h"
 #include <doctest/doctest.h>
 
@@ -711,3 +719,683 @@ TEST_CASE("llamacpp lazy grammar: a replay failure is deterministic, so a restor
     be.Unload();
 }
 #endif
+
+namespace {
+
+DeviceInfo MockDev(const char* name, const char* desc, DeviceKind kind, std::uint64_t total, const char* id = "") {
+    DeviceInfo d;
+    d.name = name;
+    d.description = desc;
+    d.kind = kind;
+    d.memory_total_bytes = total;
+    d.device_id = id;
+    return d;
+}
+
+constexpr std::uint64_t kGiB = 1024ULL * 1024ULL * 1024ULL;
+
+std::vector<DeviceInfo> MockMainPc() {
+    return {
+        MockDev("CUDA0", "RTX 5070 Ti", DeviceKind::kGpu, 16 * kGiB, "00000000:01:00.0"),
+        MockDev("Vulkan0", "RTX 5070 Ti", DeviceKind::kGpu, 16 * kGiB, "0000:01:00.0"),
+        MockDev("Vulkan1", "Radeon 780M", DeviceKind::kIntegratedGpu, 8 * kGiB, "0000:c5:00.0"),
+        MockDev("CPU", "Ryzen", DeviceKind::kCpu, 31 * kGiB),
+    };
+}
+
+std::string MakeUniqueTempGgufPath(const std::string& name) {
+    static std::atomic<unsigned> counter{0};
+    const std::string unique = std::to_string(static_cast<unsigned long long>(
+                                   std::chrono::steady_clock::now().time_since_epoch().count())) +
+                               "_" + std::to_string(counter.fetch_add(1)) + "_" + name;
+    const std::u8string u = (std::filesystem::temp_directory_path() / unique).u8string();
+    return std::string(u.begin(), u.end());
+}
+
+// Writes a metadata-only GGUF (no tensors) carrying the given u32 keys.
+std::string WriteTinyMetadataGguf(const std::string& name, const std::vector<std::string>& u32_keys) {
+    const std::string path = MakeUniqueTempGgufPath(name);
+    gguf_context* g = gguf_init_empty();
+    REQUIRE(g != nullptr);
+    gguf_set_val_str(g, "general.architecture", "llama");
+    for (const std::string& k : u32_keys) gguf_set_val_u32(g, k.c_str(), 1U);
+    const bool written = gguf_write_to_file(g, path.c_str(), /*only_meta=*/true);
+    gguf_free(g);
+    REQUIRE(written);
+    return path;
+}
+
+enum class SyntheticSmokeWeights {
+    kZero,
+    kNaN,
+    kRepeatToken,
+    kImmediateEog,
+    kVariedCycle,
+};
+
+// Writes a tiny 1-layer F32 Llama GGUF (~30 KiB) whose GPT-2 vocab covers every
+// character of the startup smoke prompt ("The capital of France is").
+std::string WriteSyntheticSmokeLlamaGguf(const std::string& name, SyntheticSmokeWeights mode,
+                                         std::uint32_t pooling_type = 0u) {
+    struct GgufDeleter {
+        void operator()(gguf_context* ctx) const noexcept {
+            if (ctx != nullptr) gguf_free(ctx);
+        }
+    };
+    struct GgmlDeleter {
+        void operator()(ggml_context* ctx) const noexcept {
+            if (ctx != nullptr) ggml_free(ctx);
+        }
+    };
+
+    constexpr std::int64_t kEmbd = 32;
+    constexpr std::int64_t kHead = 1;
+    constexpr std::int64_t kHeadKv = 1;
+    constexpr std::int64_t kFf = 32;
+    constexpr std::int64_t kVocab = 18;
+
+    std::unique_ptr<gguf_context, GgufDeleter> ctx(gguf_init_empty());
+    REQUIRE(ctx != nullptr);
+    gguf_set_val_str(ctx.get(), "general.architecture", "llama");
+    gguf_set_val_str(ctx.get(), "general.name", "smoke-test-tiny-llama");
+    gguf_set_val_u32(ctx.get(), "llama.context_length", 128u);
+    gguf_set_val_u32(ctx.get(), "llama.embedding_length", static_cast<std::uint32_t>(kEmbd));
+    gguf_set_val_u32(ctx.get(), "llama.block_count", 1u);
+    gguf_set_val_u32(ctx.get(), "llama.feed_forward_length", static_cast<std::uint32_t>(kFf));
+    gguf_set_val_u32(ctx.get(), "llama.attention.head_count", static_cast<std::uint32_t>(kHead));
+    gguf_set_val_u32(ctx.get(), "llama.attention.head_count_kv", static_cast<std::uint32_t>(kHeadKv));
+    gguf_set_val_f32(ctx.get(), "llama.attention.layer_norm_rms_epsilon", 1e-5f);
+    if (pooling_type != 0u) {
+        gguf_set_val_u32(ctx.get(), "llama.pooling_type", pooling_type);
+    }
+
+    gguf_set_val_str(ctx.get(), "tokenizer.ggml.model", "gpt2");
+    const char* tokens[kVocab] = {
+        "<|endoftext|>", "T", "h", "e", "\xC4\xA0", "c", "a", "p", "i",
+        "t",             "l", "o", "f", "F",        "r", "n", "s", "Th",
+    };
+    gguf_set_arr_str(ctx.get(), "tokenizer.ggml.tokens", tokens, kVocab);
+    std::int32_t token_types[kVocab];
+    token_types[0] = 3;  // control / EOG
+    for (std::int64_t i = 1; i < kVocab; ++i) token_types[i] = 1;
+    gguf_set_arr_data(ctx.get(), "tokenizer.ggml.token_type", GGUF_TYPE_INT32, token_types, kVocab);
+    const char* merges[1] = {"T h"};
+    gguf_set_arr_str(ctx.get(), "tokenizer.ggml.merges", merges, 1);
+    gguf_set_val_u32(ctx.get(), "tokenizer.ggml.eos_token_id", 0u);
+
+    ggml_init_params gparams{std::size_t{4} << 20, nullptr, /*no_alloc=*/false};
+    std::unique_ptr<ggml_context, GgmlDeleter> gctx(ggml_init(gparams));
+    REQUIRE(gctx != nullptr);
+
+    auto add_1d = [&](const char* tname, std::int64_t n0) -> ggml_tensor* {
+        ggml_tensor* t = ggml_new_tensor_1d(gctx.get(), GGML_TYPE_F32, n0);
+        REQUIRE(t != nullptr);
+        ggml_set_name(t, tname);
+        ggml_set_zero(t);
+        gguf_add_tensor(ctx.get(), t);
+        return t;
+    };
+    auto add_2d = [&](const char* tname, std::int64_t n0, std::int64_t n1) -> ggml_tensor* {
+        ggml_tensor* t = ggml_new_tensor_2d(gctx.get(), GGML_TYPE_F32, n0, n1);
+        REQUIRE(t != nullptr);
+        ggml_set_name(t, tname);
+        ggml_set_zero(t);
+        gguf_add_tensor(ctx.get(), t);
+        return t;
+    };
+
+    ggml_tensor* tok_embd = add_2d("token_embd.weight", kEmbd, kVocab);
+    ggml_tensor* out_norm = add_1d("output_norm.weight", kEmbd);
+    ggml_tensor* out_w = add_2d("output.weight", kEmbd, kVocab);
+
+    add_1d("blk.0.attn_norm.weight", kEmbd);
+    add_2d("blk.0.attn_q.weight", kEmbd, kEmbd);
+    add_2d("blk.0.attn_k.weight", kEmbd, kEmbd);
+    add_2d("blk.0.attn_v.weight", kEmbd, kEmbd);
+    add_2d("blk.0.attn_output.weight", kEmbd, kEmbd);
+    add_1d("blk.0.ffn_norm.weight", kEmbd);
+    add_2d("blk.0.ffn_gate.weight", kEmbd, kFf);
+    add_2d("blk.0.ffn_down.weight", kFf, kEmbd);
+    add_2d("blk.0.ffn_up.weight", kEmbd, kFf);
+
+    auto* emb_f = static_cast<float*>(tok_embd->data);
+    auto* norm_f = static_cast<float*>(out_norm->data);
+    auto* out_f = static_cast<float*>(out_w->data);
+
+    switch (mode) {
+        case SyntheticSmokeWeights::kZero: break;
+        case SyntheticSmokeWeights::kNaN:
+            for (std::int64_t i = 0; i < kEmbd; ++i) norm_f[i] = std::numeric_limits<float>::quiet_NaN();
+            for (std::int64_t i = 0; i < kEmbd * kVocab; ++i) emb_f[i] = 1.0f;
+            for (std::int64_t i = 0; i < kEmbd * kVocab; ++i) out_f[i] = 1.0f;
+            break;
+        case SyntheticSmokeWeights::kRepeatToken:
+            // All layer deltas are 0; residual carries positive embedding to output_norm (=1) -> output.weight.
+            // Row 1 ("T", non-EOS) has +1 weights while all other rows are 0 -> token 1 repeats every step.
+            for (std::int64_t i = 0; i < kEmbd; ++i) norm_f[i] = 1.0f;
+            for (std::int64_t i = 0; i < kEmbd * kVocab; ++i) emb_f[i] = 1.0f;
+            for (std::int64_t i = 0; i < kEmbd; ++i) out_f[1 * kEmbd + i] = 1.0f;
+            break;
+        case SyntheticSmokeWeights::kImmediateEog:
+            // Row 0 ("<|endoftext|>", EOS/EOG) is the only nonzero row -> step 0 emits EOG immediately.
+            for (std::int64_t i = 0; i < kEmbd; ++i) norm_f[i] = 1.0f;
+            for (std::int64_t i = 0; i < kEmbd * kVocab; ++i) emb_f[i] = 1.0f;
+            for (std::int64_t i = 0; i < kEmbd; ++i) out_f[0 * kEmbd + i] = 1.0f;
+            break;
+        case SyntheticSmokeWeights::kVariedCycle:
+            // Row t of token_embd is unit vector e_t; row next(t) (cyclic over 1..kVocab-1) of output.weight
+            // is e_t -> each greedy step produces a sharp finite logit peak at a distinct next non-EOS token.
+            for (std::int64_t i = 0; i < kEmbd; ++i) norm_f[i] = 1.0f;
+            for (std::int64_t t = 0; t < kVocab; ++t) {
+                emb_f[t * kEmbd + t] = 1.0f;
+                const std::int64_t next_tok = (t % (kVocab - 1)) + 1;
+                out_f[next_tok * kEmbd + t] = 1.0f;
+            }
+            break;
+    }
+
+    const std::string path = MakeUniqueTempGgufPath(name);
+    REQUIRE(gguf_write_to_file(ctx.get(), path.c_str(), /*only_meta=*/false));
+    return path;
+}
+
+}  // namespace
+
+TEST_CASE("NAT-07 NormalizePciBusId canonicalizes 8-digit CUDA and 4-digit Vulkan PCI BDF strings") {
+    CHECK(NormalizePciBusId("") == "");
+    CHECK(NormalizePciBusId("   ") == "");
+    CHECK(NormalizePciBusId("00000000:01:00.0") == "0000:01:00.0");
+    CHECK(NormalizePciBusId("0000:01:00.0") == "0000:01:00.0");
+    CHECK(NormalizePciBusId("0000:C5:00.0") == "0000:c5:00.0");
+    CHECK(NormalizePciBusId("00010000:0A:1F.3") == "10000:0a:1f.3");
+    CHECK(NormalizePciBusId("00000000:01:00.0-v0") == "0000:01:00.0-v0");
+    CHECK(NormalizePciBusId("00000000:01:00.0-V1") == "0000:01:00.0-v1");
+    CHECK(NormalizePciBusId("Apple-M4-Max") == "apple-m4-max");
+}
+
+TEST_CASE("NAT-07 SelectDevices: auto mode skips iGPU and deduplicates CUDA0 and Vulkan0") {
+    DeviceSelection sel;
+    REQUIRE(SelectDevices(MockMainPc(), {}, &sel).ok());
+    CHECK(sel.names == std::vector<std::string>{"CUDA0"});
+    CHECK(sel.main_gpu == 0);
+    CHECK(sel.tensor_split.empty());
+    CHECK(sel.notes.size() == 2u);  // Vulkan0 duplicate, Vulkan1 iGPU
+
+    // Non-Vulkan native backend wins regardless of enumeration order.
+    std::vector<DeviceInfo> rev = MockMainPc();
+    std::swap(rev[0], rev[1]);
+    REQUIRE(SelectDevices(rev, {}, &sel).ok());
+    CHECK(sel.names == std::vector<std::string>{"CUDA0"});
+
+    // ROCm also beats Vulkan on AMD discrete GPUs.
+    const std::vector<DeviceInfo> node1{
+        MockDev("Vulkan0", "AMD Radeon RX 9060 XT", DeviceKind::kGpu, 16 * kGiB, "0000:03:00.0"),
+        MockDev("ROCm0", "AMD Radeon RX 9060 XT", DeviceKind::kGpu, 16 * kGiB, "00000000:03:00.0"),
+        MockDev("Vulkan1", "AMD Radeon 780M", DeviceKind::kIntegratedGpu, 8 * kGiB, "0000:c5:00.0"),
+    };
+    REQUIRE(SelectDevices(node1, {}, &sel).ok());
+    CHECK(sel.names == std::vector<std::string>{"ROCm0"});
+}
+
+TEST_CASE("NAT-07 SelectDevices: auto mode without discrete GPU is CPU-only and rejects tensor_split or main_gpu") {
+    const std::vector<DeviceInfo> igpu_only{
+        MockDev("Vulkan0", "Radeon 780M", DeviceKind::kIntegratedGpu, 8 * kGiB, "0000:c5:00.0"),
+        MockDev("CPU", "Ryzen", DeviceKind::kCpu, 31 * kGiB),
+    };
+    DeviceSelection sel;
+    REQUIRE(SelectDevices(igpu_only, {}, &sel).ok());
+    CHECK(sel.names.empty());
+
+    // Without a discrete GPU, tensor_split and non-zero main_gpu fail closed.
+    CHECK(SelectDevices(igpu_only, {}, {0.6F, 0.4F}, 0, &sel).code == ErrorCode::kInvalidArgument);
+    CHECK(SelectDevices(igpu_only, {}, {1.0F}, 0, &sel).code == ErrorCode::kInvalidArgument);
+    CHECK(SelectDevices(igpu_only, {}, {}, 1, &sel).code == ErrorCode::kInvalidArgument);
+    CHECK(SelectDevices({MockDev("CPU", "Ryzen", DeviceKind::kCpu, 31 * kGiB)}, {}, {1.0F}, 0, &sel).code ==
+          ErrorCode::kInvalidArgument);
+}
+
+TEST_CASE("NAT-07 SelectDevices: distinct cards on one backend stay and fallback dedup matches description and memory") {
+    DeviceSelection sel;
+    // Identical description and memory on the same backend are two physical cards.
+    REQUIRE(SelectDevices({MockDev("CUDA0", "RTX 3090", DeviceKind::kGpu, 24 * kGiB),
+                           MockDev("CUDA1", "RTX 3090", DeviceKind::kGpu, 24 * kGiB)},
+                          {}, &sel)
+                .ok());
+    CHECK(sel.names == std::vector<std::string>{"CUDA0", "CUDA1"});
+
+    // Differing PCI bus IDs are always distinct even across backends.
+    REQUIRE(SelectDevices({MockDev("CUDA0", "RTX 3090", DeviceKind::kGpu, 24 * kGiB, "0000:01:00.0"),
+                           MockDev("Vulkan1", "RTX 3090", DeviceKind::kGpu, 24 * kGiB, "0000:02:00.0")},
+                          {}, &sel)
+                .ok());
+    CHECK(sel.names.size() == 2u);
+
+    // Missing device_id on one or both sides falls back to cross-backend description + memory.
+    REQUIRE(SelectDevices({MockDev("Vulkan0", "RTX 5070 Ti", DeviceKind::kGpu, 16 * kGiB),
+                           MockDev("CUDA0", "RTX 5070 Ti", DeviceKind::kGpu, 16 * kGiB, "0000:01:00.0")},
+                          {}, &sel)
+                .ok());
+    CHECK(sel.names == std::vector<std::string>{"CUDA0"});
+
+    // Different total memory stays distinct when one id is missing.
+    REQUIRE(SelectDevices({MockDev("CUDA0", "RTX 5070 Ti", DeviceKind::kGpu, 16 * kGiB, "0000:01:00.0"),
+                           MockDev("Vulkan0", "RTX 5070 Ti", DeviceKind::kGpu, 12 * kGiB)},
+                          {"CUDA0", "Vulkan0"}, &sel)
+                .ok());
+    CHECK(sel.names == std::vector<std::string>{"CUDA0", "Vulkan0"});
+}
+
+TEST_CASE("NAT-07 SelectDevices: allowlist is case-insensitive, honours named iGPU, and collapses duplicates") {
+    DeviceSelection sel;
+    REQUIRE(SelectDevices(MockMainPc(), {"Vulkan1"}, &sel).ok());
+    CHECK(sel.names == std::vector<std::string>{"Vulkan1"});
+
+    REQUIRE(SelectDevices(MockMainPc(), {"cuda0", "VULKAN1"}, &sel).ok());
+    CHECK(sel.names == std::vector<std::string>{"CUDA0", "Vulkan1"});
+
+    // Order of the allowlist is preserved.
+    REQUIRE(SelectDevices(MockMainPc(), {"Vulkan1", "CUDA0"}, &sel).ok());
+    CHECK(sel.names == std::vector<std::string>{"Vulkan1", "CUDA0"});
+
+    // Naming both views of one card keeps the first named.
+    REQUIRE(SelectDevices(MockMainPc(), {"Vulkan0", "CUDA0"}, &sel).ok());
+    CHECK(sel.names == std::vector<std::string>{"Vulkan0"});
+    CHECK(sel.notes.size() == 1u);
+
+    // Repeating a name with different case is also collapsed.
+    REQUIRE(SelectDevices(MockMainPc(), {"CUDA0", "cuda0"}, &sel).ok());
+    CHECK(sel.names == std::vector<std::string>{"CUDA0"});
+
+    // Unknown or invalid names fail closed.
+    CHECK(SelectDevices(MockMainPc(), {"CUDA0", "CUDA7"}, &sel).code == ErrorCode::kInvalidArgument);
+    CHECK(SelectDevices(MockMainPc(), {"vulkan9"}, &sel).code == ErrorCode::kInvalidArgument);
+    CHECK(SelectDevices({}, {"CUDA0"}, &sel).code == ErrorCode::kInvalidArgument);
+    CHECK(SelectDevices(MockMainPc(), {""}, &sel).code == ErrorCode::kInvalidArgument);
+}
+
+TEST_CASE("NAT-07 SelectDevices: re-indexes tensor_split and main_gpu when duplicates or iGPUs are removed") {
+    const std::vector<DeviceInfo> multi{
+        MockDev("Vulkan0", "Radeon 780M", DeviceKind::kIntegratedGpu, 8 * kGiB, "0000:c5:00.0"),
+        MockDev("CUDA0", "RTX 5070 Ti", DeviceKind::kGpu, 16 * kGiB, "00000000:01:00.0"),
+        MockDev("Vulkan1", "RTX 5070 Ti", DeviceKind::kGpu, 16 * kGiB, "0000:01:00.0"),
+        MockDev("CUDA1", "RTX 3090", DeviceKind::kGpu, 24 * kGiB, "00000000:02:00.0"),
+        MockDev("CPU", "Ryzen", DeviceKind::kCpu, 64 * kGiB),
+    };
+
+    // 1. Allowlist with collapsed duplicate view re-indexes both tensor_split and main_gpu.
+    DeviceSelection sel;
+    REQUIRE(SelectDevices(multi, {"CUDA0", "Vulkan1", "CUDA1"}, {16.0F, 16.0F, 24.0F}, 2, &sel).ok());
+    CHECK(sel.names == std::vector<std::string>{"CUDA0", "CUDA1"});
+    CHECK(sel.tensor_split == std::vector<float>{16.0F, 24.0F});  // re-indexed, not doubled
+    CHECK(sel.main_gpu == 1);                                     // CUDA1 moved from index 2 to 1
+
+    // main_gpu pointing at the collapsed duplicate view maps to its surviving card.
+    REQUIRE(SelectDevices(multi, {"CUDA0", "Vulkan1", "CUDA1"}, {0.0F, 0.7F, 0.3F}, 1, &sel).ok());
+    CHECK(sel.names == std::vector<std::string>{"CUDA0", "CUDA1"});
+    CHECK(sel.tensor_split == std::vector<float>{0.7F, 0.3F});
+    CHECK(sel.main_gpu == 0);
+
+    // Out-of-range main_gpu in allowlist mode is rejected.
+    CHECK(SelectDevices(multi, {"CUDA0", "CUDA1"}, {0.5F, 0.5F}, 2, &sel).code == ErrorCode::kInvalidArgument);
+
+    // 2. Auto mode: caller already sized tensor_split and main_gpu for the 2 selected discrete GPUs.
+    REQUIRE(SelectDevices(multi, {}, {0.4F, 0.6F}, 1, &sel).ok());
+    CHECK(sel.names == std::vector<std::string>{"CUDA0", "CUDA1"});
+    CHECK(sel.tensor_split == std::vector<float>{0.4F, 0.6F});
+    CHECK(sel.main_gpu == 1);
+
+    // 3. Auto mode: caller supplied raw-GPU-indexed tensor_split (4 entries) and main_gpu (3 -> CUDA1).
+    REQUIRE(SelectDevices(multi, {}, {0.2F, 0.5F, 0.0F, 0.3F}, 3, &sel).ok());
+    CHECK(sel.names == std::vector<std::string>{"CUDA0", "CUDA1"});
+    CHECK(sel.tensor_split == std::vector<float>{0.5F, 0.3F});
+    CHECK(sel.main_gpu == 1);
+
+    // 4. Auto mode: raw tensor_split that placed 100% weight on the skipped iGPU fails closed.
+    CHECK(SelectDevices(multi, {}, {1.0F, 0.0F, 0.0F, 0.0F}, 0, &sel).code == ErrorCode::kInvalidArgument);
+
+    // 5. Auto mode: main_gpu targeting the skipped iGPU (raw index 0 when raw split given, or raw iGPU index >= S) fails.
+    const std::vector<DeviceInfo> main_pc = MockMainPc();  // [0: CUDA0, 1: Vulkan0(dup), 2: Vulkan1(iGPU)]
+    REQUIRE(SelectDevices(main_pc, {}, {}, 1, &sel).ok());
+    CHECK(sel.main_gpu == 0);  // Vulkan0 dup maps to CUDA0 at 0
+    CHECK(SelectDevices(main_pc, {}, {}, 2, &sel).code == ErrorCode::kInvalidArgument);  // Vulkan1 iGPU refused
+    CHECK(SelectDevices(main_pc, {}, {0.5F, 0.5F}, 0, &sel).code == ErrorCode::kInvalidArgument);  // 2 > 1 selected dGPU
+}
+
+TEST_CASE("llamacpp wrapper: IsPrismHadamardKey matches only the prism.hadamard namespace") {
+    CHECK(IsPrismHadamardKey("prism.hadamard.version"));
+    CHECK(IsPrismHadamardKey("prism.hadamard.sign_values"));
+    CHECK(IsPrismHadamardKey("prism.hadamard.block_size"));
+    CHECK_FALSE(IsPrismHadamardKey("prism.hadamard"));
+    CHECK_FALSE(IsPrismHadamardKey("general.architecture"));
+    CHECK_FALSE(IsPrismHadamardKey("qwen35.prism.hadamard.x"));
+    CHECK_FALSE(IsPrismHadamardKey(""));
+}
+
+TEST_CASE("llamacpp wrapper: EvaluateHadamardGuard refuses folded models without runtime support") {
+    const std::vector<std::string> folded = {"general.architecture", "prism.hadamard.version",
+                                             "prism.hadamard.block_size"};
+    const std::vector<std::string> plain = {"general.architecture", "general.name"};
+
+    const Status refused = EvaluateHadamardGuard(folded, false, "bonsai.gguf");
+    CHECK_FALSE(refused.ok());
+    CHECK(refused.code == ErrorCode::kUnsupported);
+    CHECK(refused.message.find("prism.hadamard.version") != std::string::npos);
+    CHECK(refused.message.find("bonsai.gguf") != std::string::npos);
+
+    CHECK(EvaluateHadamardGuard(folded, true).ok());
+    CHECK(EvaluateHadamardGuard(plain, false).ok());
+    CHECK(EvaluateHadamardGuard({}, false).ok());
+}
+
+TEST_CASE("llamacpp wrapper: v1.0.0 build auto-detects prism.hadamard runtime support") {
+    // Pinned mainline v1.0.0 carries PR #29600 (prism.hadamard.* in src/llama-arch.cpp).
+    if (std::string_view(LlamaCppBackend::UpstreamVersion()) == "v1.0.0") {
+        CHECK(LinkedLlamaSupportsPrismHadamard());
+    }
+}
+
+TEST_CASE("llamacpp wrapper: ReadGgufKeys handles readable, missing, empty and corrupt files") {
+    {
+        std::vector<std::string> keys{"stale"};
+        const Status s = ReadGgufKeys("", keys);
+        CHECK_FALSE(s.ok());
+        CHECK(s.code == ErrorCode::kLoadFailed);
+        CHECK(keys.empty());
+    }
+    {
+        std::vector<std::string> keys{"stale"};
+        const Status s = ReadGgufKeys("definitely/not/a/file.gguf", keys);
+        CHECK_FALSE(s.ok());
+        CHECK(s.code == ErrorCode::kLoadFailed);
+        CHECK(keys.empty());
+    }
+    {
+        const std::string bad_path = MakeUniqueTempGgufPath("sonder_corrupt.gguf");
+        {
+            std::ofstream out(bad_path, std::ios::binary);
+            out << "GGUF\x03\x00";  // truncated header
+        }
+        std::vector<std::string> keys{"stale"};
+        const Status s = ReadGgufKeys(bad_path, keys);
+        std::error_code ec;
+        std::filesystem::remove(bad_path, ec);
+        CHECK_FALSE(s.ok());
+        CHECK(s.code == ErrorCode::kLoadFailed);
+        CHECK(keys.empty());
+    }
+    {
+        const std::string path = WriteTinyMetadataGguf("sonder_hadamard_keys.gguf", {"prism.hadamard.version"});
+        std::vector<std::string> keys;
+        const Status s = ReadGgufKeys(path, keys);
+        std::error_code ec;
+        std::filesystem::remove(path, ec);
+        REQUIRE(s.ok());
+        bool saw_arch = false;
+        bool saw_hadamard = false;
+        for (const std::string& k : keys) {
+            saw_arch = saw_arch || k == "general.architecture";
+            saw_hadamard = saw_hadamard || k == "prism.hadamard.version";
+        }
+        CHECK(saw_arch);
+        CHECK(saw_hadamard);
+    }
+}
+
+TEST_CASE("llamacpp wrapper: Load enforces Hadamard guard before Unload and skips plain/vocab_only/supported") {
+    const std::string folded_path = WriteTinyMetadataGguf("sonder_hadamard_refuse.gguf", {"prism.hadamard.version"});
+    const std::string plain_path = WriteTinyMetadataGguf("sonder_hadamard_plain.gguf", {});
+    const auto cleanup = [&] {
+        std::error_code ec;
+        std::filesystem::remove(folded_path, ec);
+        std::filesystem::remove(plain_path, ec);
+    };
+
+    // 1. Without FWHT runtime support: Hadamard-folded GGUF is refused with kUnsupported.
+    {
+        detail::ScopedPrismHadamardSupportOverrideForTest no_fwht(false);
+        LlamaCppBackend be;
+        LoadOptions opts;
+        opts.model_path = folded_path;
+        const Status s = be.Load(opts);
+        CHECK_FALSE(s.ok());
+        CHECK(s.code == ErrorCode::kUnsupported);
+        CHECK(s.message.find("prism.hadamard.version") != std::string::npos);
+
+        // Plain GGUF passes the guard (fails later in llama.cpp for lacking tensors, not kUnsupported).
+        opts.model_path = plain_path;
+        const Status plain_s = be.Load(opts);
+        CHECK_FALSE(plain_s.ok());
+        CHECK(plain_s.code != ErrorCode::kUnsupported);
+
+        // vocab_only bypasses the guard (no weight execution).
+        opts.model_path = folded_path;
+        opts.vocab_only = true;
+        const Status vo_s = be.Load(opts);
+        CHECK(vo_s.code != ErrorCode::kUnsupported);
+    }
+
+    // 2. Guard runs BEFORE Unload(): a previously loaded model remains loaded after refusal.
+#ifdef SONDER_LLAMACPP_VOCAB_DIR
+    {
+        LlamaCppBackend be;
+        LoadOptions good;
+        good.model_path = std::string(SONDER_LLAMACPP_VOCAB_DIR) + "/ggml-vocab-llama-bpe.gguf";
+        good.vocab_only = true;
+        REQUIRE(be.Load(good).ok());
+        REQUIRE(be.IsLoaded());
+
+        detail::ScopedPrismHadamardSupportOverrideForTest no_fwht(false);
+        LoadOptions refused;
+        refused.model_path = folded_path;
+        const Status s = be.Load(refused);
+        CHECK(s.code == ErrorCode::kUnsupported);
+        CHECK(be.IsLoaded());  // prior model kept intact
+        be.Unload();
+    }
+#endif
+
+    // 3. With FWHT runtime support enabled: Hadamard-folded GGUF passes the guard.
+    {
+        detail::ScopedPrismHadamardSupportOverrideForTest has_fwht(true);
+        LlamaCppBackend be;
+        LoadOptions opts;
+        opts.model_path = folded_path;
+        const Status s = be.Load(opts);
+        CHECK_FALSE(s.ok());
+        CHECK(s.code != ErrorCode::kUnsupported);
+    }
+
+    cleanup();
+}
+
+TEST_CASE("llamacpp wrapper: EvaluateSmokeLogits and EvaluateSmokeTokens sanity heuristics") {
+    std::int32_t argmax = -1;
+    CHECK_FALSE(EvaluateSmokeLogits({}, argmax).ok());
+
+    const std::vector<float> nan_logits = {1.0f, std::numeric_limits<float>::quiet_NaN(), 2.0f};
+    const Status s_nan = EvaluateSmokeLogits(nan_logits, argmax);
+    CHECK(s_nan.code == ErrorCode::kLoadFailed);
+    CHECK(s_nan.message.find("non-finite") != std::string::npos);
+
+    const std::vector<float> inf_logits = {1.0f, std::numeric_limits<float>::infinity()};
+    CHECK(EvaluateSmokeLogits(inf_logits, argmax).code == ErrorCode::kLoadFailed);
+    const std::vector<float> ninf_logits = {-std::numeric_limits<float>::infinity(), 1.0f};
+    CHECK(EvaluateSmokeLogits(ninf_logits, argmax).code == ErrorCode::kLoadFailed);
+
+    const std::vector<float> zero_logits(8, 0.0f);
+    const Status s_zero = EvaluateSmokeLogits(zero_logits, argmax);
+    CHECK(s_zero.code == ErrorCode::kLoadFailed);
+    CHECK(s_zero.message.find("uniform") != std::string::npos);
+
+    const std::vector<float> flat_logits(4, -3.5f);
+    CHECK(EvaluateSmokeLogits(flat_logits, argmax).code == ErrorCode::kLoadFailed);
+
+    const std::vector<float> peaked = {-1.0f, 3.25f, 3.25f, 0.5f};
+    REQUIRE(EvaluateSmokeLogits(peaked, argmax).ok());
+    CHECK(argmax == 1);  // first argmax on tie
+
+    CHECK(EvaluateSmokeTokens({11, 42, 7, 7, 99}, true).ok());
+    CHECK(EvaluateSmokeTokens({5, 5}, true).ok());  // too short to call degenerate
+    CHECK_FALSE(EvaluateSmokeTokens({}, true).ok());
+    CHECK_FALSE(EvaluateSmokeTokens({1, 2, 3}, false).ok());
+    const Status degenerate = EvaluateSmokeTokens(std::vector<std::int32_t>(8, 13), true);
+    CHECK_FALSE(degenerate.ok());
+    CHECK(degenerate.code == ErrorCode::kLoadFailed);
+}
+
+TEST_CASE("llamacpp wrapper: startup smoke test defaults off and executes end-to-end on synthetic GGUFs") {
+    CHECK_FALSE(LoadOptions{}.startup_smoke_test);
+
+    // 1. Uniform zero weights: succeeds when smoke test is off; fails with kLoadFailed when on.
+    {
+        const std::string path = WriteSyntheticSmokeLlamaGguf("smoke_zero.gguf", SyntheticSmokeWeights::kZero);
+        LlamaCppBackend be;
+        LoadOptions opts;
+        opts.model_path = path;
+        opts.n_ctx = 64;
+        opts.n_batch = 32;
+        opts.startup_smoke_test = false;
+        REQUIRE(be.Load(opts).ok());
+        be.Unload();
+
+        opts.startup_smoke_test = true;
+        const Status s = be.Load(opts);
+        std::error_code ec;
+        std::filesystem::remove(path, ec);
+        CHECK(s.code == ErrorCode::kLoadFailed);
+        CHECK(s.message.find("uniform") != std::string::npos);
+        CHECK_FALSE(be.IsLoaded());
+    }
+
+    // 2. NaN weights: fails with non-finite logits.
+    {
+        const std::string path = WriteSyntheticSmokeLlamaGguf("smoke_nan.gguf", SyntheticSmokeWeights::kNaN);
+        LlamaCppBackend be;
+        LoadOptions opts;
+        opts.model_path = path;
+        opts.n_ctx = 64;
+        opts.n_batch = 32;
+        opts.startup_smoke_test = true;
+        const Status s = be.Load(opts);
+        std::error_code ec;
+        std::filesystem::remove(path, ec);
+        CHECK(s.code == ErrorCode::kLoadFailed);
+        CHECK(s.message.find("non-finite") != std::string::npos);
+        CHECK_FALSE(be.IsLoaded());
+    }
+
+    // 3. Degenerate repeated token (sharp peak on non-EOS token 1 every step): fails EvaluateSmokeTokens.
+    {
+        const std::string path = WriteSyntheticSmokeLlamaGguf("smoke_repeat.gguf", SyntheticSmokeWeights::kRepeatToken);
+        LlamaCppBackend be;
+        LoadOptions opts;
+        opts.model_path = path;
+        opts.n_ctx = 64;
+        opts.n_batch = 32;
+        opts.startup_smoke_test = true;
+        const Status s = be.Load(opts);
+        std::error_code ec;
+        std::filesystem::remove(path, ec);
+        CHECK(s.code == ErrorCode::kLoadFailed);
+        CHECK(s.message.find("degenerate output") != std::string::npos);
+        CHECK_FALSE(be.IsLoaded());
+    }
+
+    // 4. Immediate EOG on step 0 (0 non-EOG content tokens): must fail, not pass silently.
+    {
+        const std::string path = WriteSyntheticSmokeLlamaGguf("smoke_eog.gguf", SyntheticSmokeWeights::kImmediateEog);
+        LlamaCppBackend be;
+        LoadOptions opts;
+        opts.model_path = path;
+        opts.n_ctx = 64;
+        opts.n_batch = 32;
+        opts.startup_smoke_test = true;
+        const Status s = be.Load(opts);
+        std::error_code ec;
+        std::filesystem::remove(path, ec);
+        CHECK(s.code == ErrorCode::kLoadFailed);
+        CHECK(s.message.find("no tokens produced") != std::string::npos);
+        CHECK_FALSE(be.IsLoaded());
+    }
+
+    // 5. Pooled (embedding MEAN=1) model: smoke test is skipped even when enabled.
+    {
+        const std::string path =
+            WriteSyntheticSmokeLlamaGguf("smoke_pooled_mean.gguf", SyntheticSmokeWeights::kZero, /*pooling_type=*/1u);
+        LlamaCppBackend be;
+        LoadOptions opts;
+        opts.model_path = path;
+        opts.n_ctx = 64;
+        opts.n_batch = 32;
+        opts.startup_smoke_test = true;
+        const Status s = be.Load(opts);
+        INFO("load error: " << s.message);
+        CHECK(s.ok());
+        CHECK(be.IsLoaded());
+        be.Unload();
+        std::error_code ec;
+        std::filesystem::remove(path, ec);
+    }
+
+    // 6. Healthy varied weights: passes smoke test, leaves KV cache clean for normal Generate().
+    {
+        const std::string path = WriteSyntheticSmokeLlamaGguf("smoke_varied.gguf", SyntheticSmokeWeights::kVariedCycle);
+        LlamaCppBackend be;
+        LoadOptions opts;
+        opts.model_path = path;
+        opts.n_ctx = 64;
+        opts.n_batch = 16;  // forces multi-chunk prefill inside RunStartupSmokeTest
+        opts.startup_smoke_test = true;
+        const Status s = be.Load(opts);
+        INFO("load error: " << s.message);
+        REQUIRE(s.ok());
+        CHECK(be.IsLoaded());
+
+        GenerateRequest req;
+        req.prompt = {1, 2};
+        req.max_new_tokens = 3;
+        req.sampling.temperature = 0.0F;
+        std::vector<Token> generated;
+        const GenerateResult gen = be.Generate(req, [&](const TokenEvent& ev) {
+            if (ev.token >= 0) generated.push_back(ev.token);
+            return true;
+        });
+        CHECK(gen.status.ok());
+        CHECK(generated.size() == 3u);
+        be.Unload();
+        std::error_code ec;
+        std::filesystem::remove(path, ec);
+    }
+
+    // 7. The smoke-test decode goes through the bound device-fault guard. A device
+    //    already marked unhealthy must fail the load fast with the guard's sentinel;
+    //    a raw llama_decode would run on the CPU and let the load succeed.
+    {
+        const std::string path = WriteSyntheticSmokeLlamaGguf("smoke_guard.gguf", SyntheticSmokeWeights::kVariedCycle);
+        auto tracker = std::make_shared<DeviceHealthTracker>("llamacpp");
+        LlamaCppBackend be;
+        BindBackendDeviceHealth(&be, tracker, {"CUDA0"});
+        REQUIRE(tracker->MarkDeviceUnhealthy("CUDA0", DeviceFaultReason::kDeviceLost));
+        LoadOptions opts;
+        opts.model_path = path;
+        opts.n_ctx = 64;
+        opts.n_batch = 32;
+        opts.startup_smoke_test = true;
+        const Status s = be.Load(opts);
+        INFO("load error: " << s.message);
+        CHECK_FALSE(s.ok());
+        CHECK(s.code == ErrorCode::kLoadFailed);
+        CHECK(s.message.find("rc=" + std::to_string(kDeviceUnhealthyDecodeSentinel)) != std::string::npos);
+        CHECK_FALSE(be.IsLoaded());
+
+        // After recovery the same guarded path lets the load through.
+        REQUIRE(tracker->RecoverDevice("CUDA0").ok());
+        const Status s2 = be.Load(opts);
+        INFO("load error after recovery: " << s2.message);
+        CHECK(s2.ok());
+        be.Unload();
+        UnbindBackendDeviceHealth(&be);
+        std::error_code ec;
+        std::filesystem::remove(path, ec);
+    }
+}

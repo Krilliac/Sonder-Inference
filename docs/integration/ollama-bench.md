@@ -128,10 +128,9 @@ contracts that core and the CLI use are preserved:
 Most items below record the state when this page was written (branch era).
 The TLS item is updated to the 2026-11-20 state and says so.
 
-- **Ollama baseline: PENDING** (`bench/results/PENDING_ollama_baseline.md`).
-  The workstation was offline while this was built, so no live Ollama was
-  reachable. No numbers were invented, and the capture command is in that
-  file.
+- **Ollama baseline was not captured.** The standalone runner now defaults
+  to native `llamacpp`; use explicit `--backend ollama` for the compatibility
+  path. See [the benchmark guide](../../bench/README.md) for native usage.
 - **No context-window control.** `SamplingConfig` has no `num_ctx`, so the
   long-context case is sized for Ollama's default 4096 window.
 - **TLS only in opt-in builds.** In the default build the core HTTP client is

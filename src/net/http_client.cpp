@@ -514,6 +514,26 @@ Status send_all(socket_t s, std::string_view data, std::chrono::steady_clock::ti
     return Status::success();
 }
 
+// Overwrites a buffer that held request headers (credentials) before it is
+// released. Volatile stores so the writes are not elided as dead.
+void wipe_string(std::string& text) noexcept {
+    volatile char* p = text.data();
+    for (std::size_t i = 0; i < text.size(); ++i) {
+        p[i] = '\0';
+    }
+    text.clear();
+}
+
+// Wipes the serialized request head on every exit path, including
+// exceptions thrown while sending.
+struct HeadWipe {
+    std::string& head;
+    explicit HeadWipe(std::string& h) noexcept : head(h) {}
+    HeadWipe(const HeadWipe&) = delete;
+    HeadWipe& operator=(const HeadWipe&) = delete;
+    ~HeadWipe() { wipe_string(head); }
+};
+
 std::string lower(std::string s) {
     std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     return s;
@@ -783,19 +803,36 @@ Result<HttpResponseInfo> http_request(const HttpRequest& request, const std::fun
 #endif
 
     std::string host_header = request.host.find(':') != std::string::npos ? "[" + request.host + "]" : request.host;
-    std::string head = request.method + " " + request.target + " HTTP/1.1\r\n";
-    head += "Host: " + host_header + ":" + std::to_string(request.port) + "\r\n";
-    head += "User-Agent: sonder-inference\r\nAccept: */*\r\nConnection: close\r\n";
+    // The head can carry credentials (Authorization). It is sized once up
+    // front so appends never reallocate (no unwiped copy is left in freed
+    // memory), header values are appended in place rather than through
+    // temporaries, and the buffer is wiped right after sending and on every
+    // other exit path.
+    std::string head;
+    HeadWipe head_wipe{head};
+    {
+        std::size_t size = 256 + request.method.size() + request.target.size() + host_header.size() +
+                           request.content_type.size();
+        for (const auto& header : request.headers) {
+            size += header.first.size() + header.second.size() + 4;
+        }
+        head.reserve(size);
+    }
+    head.append(request.method).append(" ").append(request.target).append(" HTTP/1.1\r\n");
+    head.append("Host: ").append(host_header).append(":").append(std::to_string(request.port)).append("\r\n");
+    head.append("User-Agent: sonder-inference\r\nAccept: */*\r\nConnection: close\r\n");
     if (!request.body.empty() || request.method == "POST" || request.method == "PUT") {
-        head += "Content-Type: " + request.content_type + "\r\n";
-        head += "Content-Length: " + std::to_string(request.body.size()) + "\r\n";
+        head.append("Content-Type: ").append(request.content_type).append("\r\n");
+        head.append("Content-Length: ").append(std::to_string(request.body.size())).append("\r\n");
     }
     for (const auto& header : request.headers) {
-        head += header.first + ": " + header.second + "\r\n";
+        head.append(header.first).append(": ").append(header.second).append("\r\n");
     }
-    head += "\r\n";
-    if (auto st = send_bytes(head); !st.ok()) {
-        return st;
+    head.append("\r\n");
+    const Status head_sent = send_bytes(head);
+    wipe_string(head);
+    if (!head_sent.ok()) {
+        return head_sent;
     }
     if (!request.body.empty()) {
         if (auto st = send_bytes(request.body); !st.ok()) {
@@ -804,6 +841,7 @@ Result<HttpResponseInfo> http_request(const HttpRequest& request, const std::fun
     }
 
     HttpResponseInfo info;
+    std::uint64_t received_total = 0;  // every byte read, for max_response_bytes
     std::string header_buf;
     bool headers_done = false;
     bool chunked = false;
@@ -941,6 +979,12 @@ Result<HttpResponseInfo> http_request(const HttpRequest& request, const std::fun
         }
         if (n > 0) {
             last_activity = std::chrono::steady_clock::now();
+            received_total += static_cast<std::uint64_t>(n);
+            if (request.max_response_bytes > 0 && received_total > request.max_response_bytes) {
+                return Status(ErrorCode::protocol_error, "response exceeds the " +
+                                                             std::to_string(request.max_response_bytes) +
+                                                             "-byte limit");
+            }
         }
         if (n < 0) {
             if (would_block(last_socket_error())) {

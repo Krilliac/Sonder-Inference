@@ -144,10 +144,10 @@ regressions, bounded concurrent controls, timing comparisons and remaining limit
 
 | Event | Level | Attributes |
 | --- | --- | --- |
-| `engine.started` | metrics | `version` str, `commit` str, `platform` str, `device_count` int, `text_capture` str (`on` / `off`); optional `server` obj `{host` str, `port` int, `api_version` int`}` when the engine is hosted by `sonder-infer serve` (`EngineOptions::server`) |
+| `engine.started` | metrics | `version` str, `commit` str, `platform` str, `device_count` int, `text_capture` str (`off` / `on` / `full`); optional `server` obj `{host` str, `port` int, `api_version` int`}` when the engine is hosted by `sonder-infer serve` (`EngineOptions::server`) |
 | `engine.stopped` | metrics | none |
-| `scheduler.configured` | metrics | emitted once at engine start when scheduling is active: `mode` str (`automatic`, `gate`, `account`), `kv_block_size_tokens` int, `kv_num_blocks` int, `prefix_caching` bool, `max_running_sequences` int, `max_step_sequences` int, `max_step_tokens` int, `prefill_chunk_tokens` int, `admission_watermark_blocks` int, `max_requeue_count` int, `step_stall_timeout_ms` int |
-| `device.memory.sample` | metrics | at start (`sample_devices_on_start`) and every `EngineOptions::device_sample_interval` (default 10 s, 0 disables): for CPU (`kind: "cpu"`), `name`, `logical_cores`, `total_bytes`, `available_bytes`, optional `used_bytes`. For GPUs (`kind: "gpu"`, `sample_gpu_devices`), `gpu_id`, `name`, `vendor`, `vendor_id`, `device_id`, `is_integrated_uma`, `backend_hint`, `source`, `dedicated_total_bytes`, `dedicated_free_bytes`, `shared_total_bytes`, `total_bytes`, `available_bytes`, `used_bytes`, `effective_vram_mib`, `effective_free_vram_mib`, plus optional additive device telemetry (NAT-08): `pci_bus_id` str, `driver_name` str, `driver_build` str, `rebar` bool, `shared_memory_bytes` int, `warp_size` int, `matrix_cores` str, `pcie` obj (`current_gen`, `current_width`, `max_gen`, `max_width`, `aspm_state`, `aspm_source`), `vulkan_heaps` arr of `{heap_index, size_bytes, budget_bytes, usage_bytes, device_local, multi_instance, host_visible, host_coherent}` (`VK_EXT_memory_budget`), and `ggml_device` obj (parsed `ggml_vulkan:` device line). Per-process VRAM of a spawned llama-server is `backend.gpu_memory.sample` |
+| `scheduler.configured` | metrics | emitted once at engine start when scheduling is active: `mode` str (`automatic`, `gate`, `account`), `kv_block_size_tokens` int, `kv_num_blocks` int, `kv_capacity_tokens` int (`kv_block_size_tokens` x `kv_num_blocks`: the LOGICAL admission pool, not the native backend's physical KV, which is `kv.pool.configured`), `prefix_caching` bool, `max_running_sequences` int, `max_step_sequences` int, `max_step_tokens` int, `prefill_chunk_tokens` int, `admission_watermark_blocks` int, `max_requeue_count` int, `step_stall_timeout_ms` int |
+| `device.memory.sample` | metrics | at start (`sample_devices_on_start`) and every `EngineOptions::device_sample_interval` (default 10 s, 0 disables): for CPU (`kind` str `"cpu"`): `name` str, `logical_cores` int, `total_bytes` int, `available_bytes` int, optional `used_bytes` int. For GPUs (`kind` str `"gpu"`, `sample_gpu_devices`): `gpu_id` str, `name` str, `vendor` str, `vendor_id` int, `device_id` int, `is_integrated_uma` bool, `backend_hint` str, `source` str, `dedicated_total_bytes` int, `dedicated_free_bytes` int, `shared_total_bytes` int, `total_bytes` int, `available_bytes` int, `used_bytes` int, `effective_vram_mib` int, `effective_free_vram_mib` int, plus optional additive device telemetry (NAT-08): `pci_bus_id` str, `driver_name` str, `driver_build` str, `rebar` bool, `shared_memory_bytes` int, `warp_size` int, `matrix_cores` str, `pcie` obj (`current_gen`, `current_width`, `max_gen`, `max_width`, `aspm_state`, `aspm_source`), `vulkan_heaps` arr of `{heap_index, size_bytes, budget_bytes, usage_bytes, device_local, multi_instance, host_visible, host_coherent}` (`VK_EXT_memory_budget`), and `ggml_device` obj (parsed `ggml_vulkan:` device line). Per-process VRAM of a spawned llama-server is `backend.gpu_memory.sample` |
 | `backend.registered` | metrics | `backend` str, `description` str, `capabilities` arr of str |
 | `backend.gpu_memory.sample` | metrics | from the engine's periodic sampler, once per new sample of a backend that reports `Backend::runtime_status()` (a spawned `llamaserver` child): `backend`, `probe`, `status` str; `dedicated_bytes`, `shared_bytes`, `peak_shared_bytes`, `shared_baseline_bytes` (effective, including any per-1k-ctx growth), `spill_threshold_bytes`, `samples` int; `spilled` bool; `fitted_ctx` int or null; `fit_outcome` str ([vram-spill](integration/vram-spill.md)) |
 | `backend.metrics.sample` | metrics | each attempted native child poll: `backend`, `port` int, `status` str (`ok`, `error`, or `unavailable`), `sampled_at` monotonic milliseconds; on `ok`, `metrics`, `slots`, and `speculation` directly in attributes, matching the child health object below. Failure details are in the accompanying warning. A 404 is reported once per child |
@@ -253,10 +253,10 @@ GPU and warning events. The pending queue remains bounded and counts drops.
 
 | Event | Level | Attributes |
 | --- | --- | --- |
-| `session.created` | metrics | `model`, `backend` str; `priority` int; `workload` str (see below); `text_capture` str (`on` / `off`); `sampling` obj |
+| `session.created` | metrics | `model`, `backend` str; `priority` int; `workload` str (see below); `text_capture` str (`off` / `on` / `full`); `sampling` obj |
 | `session.closed` | metrics | `requests` int |
 | `request.queued` | metrics | `kind` str (`generate` from `Session::generate`, `chat` from `Session::chat`), `priority` int (legacy scheduler rank, preserved), `priority_class` str (`interactive`, `subagent`, `background`), `workload` str, `prompt_bytes` int (for chat: the generic formatted prompt); `chat` adds `messages` int |
-| `request.started` | metrics | `kind` str, `sampling` obj, `scheduled` bool, `sampler` str (`sonder` or `backend`); when scheduled, `scheduler_mode` str (`gate`: per-chunk grants; `account`: admission and prompt accounting only); `chat` adds `chat_template` str (`native`: the backend's chat API or model template received the messages; `generic`: `format_chat_prompt()`) |
+| `request.started` | metrics | `kind` str, `sampling` obj, `scheduled` bool, `sampler` str (`sonder` or `backend`); when scheduled, `scheduler_mode` str (`gate`: per-chunk grants; `account`: admission and prompt accounting only); `chat` adds `chat_template` str (`native`: the backend's chat API or model template received the messages; `generic`: `format_chat_prompt()`); optional `prompt` str and `prompt_truncated` bool (policy `full` only), optional `text_capture_opt_out` true ([text capture policy](#text-capture-policy)) |
 | `request.completed` / `request.cancelled` / `request.failed` | metrics | `outcome`, `stop_reason` str; `prompt_tokens`, `completion_tokens`, `chunks` int; `token_counts_from_backend` bool; `ttft_ms`, `total_ms` num; `scheduled` bool; `sampler` str. For hosted requests: additive `priority_class` str and `admission` obj with `priority` str and `queue_ms` num. When scheduled: the existing `queue_ms`, `preemptions`, `accounted_prompt_tokens`, and `reused_prompt_tokens` remain. Backend request attributes are optional and additive: `backend_cached_tokens`, `backend_draft_tokens`, `backend_draft_accepted_tokens`, `backend_draft_acceptance_ratio`, and `backend_predicted_tokens_per_second`. `cancelled` optionally adds `cancel_latency_ms` num. `failed` adds `error_code`, `error` str, and `scheduler_rejected` bool (true) when the scheduler refused the request before any backend work |
 
 Hosted request admission fields are additive: the historical numeric
@@ -266,12 +266,23 @@ Hosted request admission fields are additive: the historical numeric
 terminal events include the full queue wait, including logical KV admission,
 without double-counting scheduler time. It remains available with scheduling
 off or an oversized account-mode prompt that bypasses the logical pool.
-A queue refusal before a session request begins emits `request.failed` with
-`backend_started: false`, `error_code`, class, queue time and correlation.
-Health exposes `queued_by_class` as instantaneous counts from these tickets.
+A queue or pre-session refusal on `sonder-infer serve` before a session request
+begins (priority queue full/expired, unserved model, lazy residency load or
+budget failure, capability/parameter validation, or server starting/draining)
+emits `request.failed` (or `request.cancelled` on client disconnect) at
+`metrics` level with `backend_started: false`, `outcome`, `kind`, safe
+`error_code`, correlation fields, and (when parsed) `model` and
+`requested_model`, without emitting `request.started` or `request.queued`.
+Health exposes `queued_by_class` as instantaneous counts from admission tickets.
 There is no separate Prometheus metrics endpoint.
 
-All five request lifecycle events carry the optional `parent_request_id` str
+All five request lifecycle events carry `kind` (`generate`, `chat`, `embed`,
+`rerank`, `score`), `model` (served model id when set via
+`RequestOptions::served_model`, else `ModelDescriptor::name`), and
+`requested_model` (`RequestOptions::requested_model` when set, else `model`), so
+Observatory's Stage Pipeline resolves the model lane at `metrics` level even
+without a retained `session.created` or `model.load.completed` event. They also
+carry the optional `parent_request_id` str
 when the caller set `RequestOptions::parent_request_id` (for `sonder-infer
 serve`: the `X-Sonder-Parent-Request-Id` header, i.e. the Sonder Runtime turn
 id). The C ABI/Python SDK can also set this parent with the additive
@@ -299,49 +310,78 @@ optional.
 | Event | Level | Attributes |
 | --- | --- | --- |
 | `inference.decode.started` | metrics | `ttft_ms` num (at the first streamed chunk) |
-| `inference.token.generated` | standard | one per delivered chunk: `index` int, `bytes` int, `elapsed_ms` num, `unit` str. `unit: "token"` means one sampled token and adds `count` int (= 1), `token_id` int, `probability` num: always for Sonder's sampler, and for a backend-sampled token whose probability the backend reported (llamaserver, see [Backend-sampled token probabilities](#backend-sampled-token-probabilities)), which also adds `probability_basis` str (`post_sampling` / `pre_sampling`). `unit: "chunk"` (other backend-sampled streams) means the token count per chunk is unknown; use `request.completed.completion_tokens`. Optional `text` str (only with `capture_text`) |
+| `inference.token.generated` | standard | one per delivered chunk: `index` int, `bytes` int, `elapsed_ms` num, `unit` str. `unit: "token"` means one sampled token and adds `count` int (= 1), `token_id` int, `probability` num, `probability_basis` str (`post_sampling` / `pre_sampling`): always for Sonder's sampler (`post_sampling`), and for a backend-sampled token whose probability the backend reported (native `llamacpp` and deprecated `llamaserver`, see [Token probabilities and top alternatives](#token-probabilities-and-top-alternatives)). `unit: "chunk"` (other backend-sampled streams) means the token count per chunk is unknown; use `request.completed.completion_tokens`. Optional `text` str (only when the [text capture policy](#text-capture-policy) is `on` or `full` for the request) |
 | `inference.prefill.completed` | metrics | once per completed request, emitted at request end: `prompt_tokens` int, `token_counts_from_backend` bool, `ttft_ms` num; optional `backend_prompt_eval_ms` num (backend-reported), `reused_prompt_tokens` int (scheduled requests) |
 | `inference.decode.completed` | metrics | once per completed request: `completion_tokens` int, `chunks` int, `decode_wall_ms` num; optional `backend_eval_ms`, `backend_tokens_per_sec`, `backend_prompt_eval_ms` num |
 
-### Backend-sampled token probabilities
+### Token probabilities and top alternatives
 
-The llamaserver backend can report the probability of each token llama-server
-samples, so Observatory's "Token probabilities" and "Top alternatives"
-panels work without Sonder's sampler. It applies when `standard` events are
-recorded (a sink is attached and the level is `standard` or `deep`) and
-`TelemetryOptions::token_probability_top_k` (default 5, clamped to 10) is not
-0:
+Observatory's "Token probabilities" and "Top alternatives" panels consume
+`inference.token.generated` (`unit: "token"`, `probability`) and
+`inference.sampling.candidates`. Candidate emission is active when `standard`
+events are recorded (a sink is attached and the level is `standard` or `deep`)
+and `TelemetryOptions::token_probability_top_k` (default 5, clamped to 10) is
+not 0:
 
-- **Probe.** Against llama.cpp (`native_completion`, the default) a request
-  whose caller did not ask for logprobs gets `"n_probs": K` and
-  `"post_sampling_probs": true` (native `/completion`, and the OpenAI chat
-  endpoint, which passes both through). The probabilities never reach the
-  caller: `TokenChunk::logprob` / `top_logprobs` and
-  `GenerationResult::logprobs` stay empty, as without the probe. A caller
-  that asked for logprobs gets its request unchanged, and telemetry reuses
-  that data (`probability_basis: "pre_sampling"`, the softmax of the raw
-  logits). No probe is added for chat with tools (llama-server refuses
-  logprobs with tools and streaming) or for a generic OpenAI upstream
-  (`native_completion = false`); those requests keep `unit: "chunk"` events
-  unless the caller's own logprobs carry token ids.
-- **Events.** Each delivered chunk whose llama-server frame carried a
-  probability entry with a token `id` emits `inference.token.generated` with
-  `unit: "token"`, `count` 1, `token_id`, `probability` and
-  `probability_basis` (`post_sampling`: after llama-server's sampler chain,
-  the same basis as Sonder's sampler). Frames without one stay
-  `unit: "chunk"`. A llama-server frame is one sampled token, but its text can
-  hold several tokens when llama-server held text back (a partial stop-string
-  match, or the chat parser waiting on a tag); `probability` is then the last
-  token's. Tokens that produce no visible chunk (hidden reasoning) emit
-  nothing, so authoritative counts still come from `request.completed`.
-- **Cost.** The upstream computes the probabilities for every token of the
-  request. Post-sampling probabilities reuse the sampler's candidate list;
-  pre-sampling ones (the caller's logprobs) cost a pass over the vocabulary
-  per token and turn off llama-server backend sampling.
+- **Sonder's sampler (`token_logits` backends).** `Session` emits
+  `inference.token.generated` with `unit: "token"`, `token_id`, `probability`,
+  and `probability_basis: "post_sampling"`, and emits
+  `inference.sampling.candidates` from `SamplerChain::top_candidates()`
+  (bounded by `token_probability_top_k`, `token_candidates_stride`, and
+  `token_candidates_max_events`). Setting `token_probability_top_k` to 0
+  disables `inference.sampling.candidates` while keeping per-token
+  `probability` on `inference.token.generated`.
+
+#### Backend-sampled token probabilities
+
+- **Native `llamacpp` backend (opt-in probe).** To preserve GPU backend
+  sampling (`llama_set_sampler`) on the default serving path, the native
+  `llamacpp` post-sampling probe is **opt-in**: it activates when
+  `token_probability_top_k > 0` and either
+  `TelemetryOptions::native_token_probabilities` is `true` or the telemetry
+  level is `deep` (e.g. `sonder-infer serve --telemetry-level deep`). When
+  enabled and the caller did not request logprobs, `LlamaCppBackend` reads the
+  post-sampling distribution (`probability_basis: "post_sampling"`) directly
+  from its in-process llama.cpp sampler chain (without populating caller
+  `TokenChunk::logprob` / `top_logprobs` or `GenerationResult::logprobs`). When
+  the caller explicitly requested `sampling.logprobs`, telemetry always reuses
+  the pre-sampling log-softmax (`probability_basis: "pre_sampling"`) at
+  `standard` or `deep` without altering the caller's `top_logprobs`. Stride
+  (`token_candidates_stride`), per-request cap (`token_candidates_max_events`),
+  and text-capture (`capture_text`) are forwarded to the backend so skipped or
+  capped tokens avoid candidate extraction and `TokenToPiece` detokenization.
+  With default `TelemetryOptions` (`standard`, `native_token_probabilities = false`)
+  and no caller `logprobs`, the probe stays off and GPU backend sampling
+  (`llama_set_sampler`) remains active.
+- **Legacy `llamaserver` probe (deprecated).** Against llama.cpp
+  (`native_completion`, the default) a request whose caller did not ask for
+  logprobs gets `"n_probs": K` and `"post_sampling_probs": true` (native
+  `/completion`, and the OpenAI chat endpoint, which passes both through). The
+  probabilities never reach the caller: `TokenChunk::logprob` / `top_logprobs`
+  and `GenerationResult::logprobs` stay empty, as without the probe. A caller
+  that asked for logprobs gets its request unchanged, and telemetry reuses that
+  data (`probability_basis: "pre_sampling"`, the softmax of the raw logits). No
+  probe is added for chat with tools (llama-server refuses logprobs with tools
+  and streaming) or for a generic OpenAI upstream (`native_completion = false`);
+  those requests keep `unit: "chunk"` events unless the caller's own logprobs
+  carry token ids.
+- **Events.** Each delivered chunk carrying a sampled probability emits
+  `inference.token.generated` with `unit: "token"`, `count` 1, `token_id`,
+  `probability` and `probability_basis` (`post_sampling` after the sampler
+  chain, or `pre_sampling` from raw logits). Frames without one stay
+  `unit: "chunk"`. Hidden reasoning tokens produce no visible text chunk, so
+  authoritative counts still come from `request.completed`.
+- **Cost.** Post-sampling probabilities reuse the sampler's candidate list;
+  pre-sampling ones (the caller's logprobs) cost a pass over the vocabulary per
+  token. On native `llamacpp`, opting in to the probe
+  (`native_token_probabilities = true` or `TelemetryLevel::deep`) keeps logits
+  readable on CPU instead of binding GPU backend sampling (`llama_set_sampler`),
+  while skipping candidate sorting and `TokenToPiece` work on stride-skipped or
+  capped tokens and when `capture_text` is off.
 
 | Event | Level | Attributes |
 | --- | --- | --- |
-| `inference.sampling.candidates` | standard | per backend-sampled token with a reported probability and at least one alternative, bounded per request (below): `index` int (the `inference.token.generated` `index` of the same token), `sampled_token_id` int, `probability_basis` str (`post_sampling` / `pre_sampling`), `candidates` arr of `{token_id` int, `probability` num, optional `text` str (only with `capture_text`)`}`, most probable first, at most `token_probability_top_k` entries. Alternatives without a token id are left out |
+| `inference.sampling.candidates` | standard | per sampled token (Sonder's sampler, native `llamacpp`, or `llamaserver`) with a reported probability and at least one candidate, bounded per request (below): `index` int (the `inference.token.generated` `index` of the same token), `sampled_token_id` int, `probability_basis` str (`post_sampling` / `pre_sampling`), `candidates` arr of `{token_id` int, `probability` num, optional `text` str (only when the [text capture policy](#text-capture-policy) is `on` or `full` for the request)`}`, most probable first, at most `token_probability_top_k` entries. Alternatives without a token id are left out |
 
 Volume bounds (`TelemetryOptions`): `token_candidates_stride` (default 1;
 emit for every n-th probability-bearing token of the request, counting from
@@ -350,8 +390,7 @@ request; 0 = no cap). The shape follows Observatory's proposal in its
 `docs/TELEMETRY_PROTOCOL.md` ("3D Inference: reserved and proposed events"),
 with two differences: it is emitted at `standard` rather than `deep` (the
 bounds above keep the volume down, and the panels then work at the default
-level), and it adds `probability_basis`. Sonder's own sampler does not emit it
-yet.
+level), and it adds `probability_basis`.
 
 The Ollama timing helper (`ollama::emit_timing_events`) never reuses these
 names. It emits `backend.model.load.reported` (`backend`, `model`,
@@ -363,6 +402,24 @@ tokens served from Ollama's prompt cache; 0 before Ollama 0.33.3),
 `prompt_tokens_per_sec` num) and `backend.timing.decode` (`backend`,
 `model`, `eval_count` int, `eval_duration_ns` int, `decode_tokens_per_sec`
 num, optional `ttft_ms` num). The engine does not call it yet.
+
+### Layer and operator telemetry (deep)
+
+Emitted strictly when `TelemetryLevel::deep` is active. At any level below
+`deep` (`off`, `metrics`, `standard`), the direct `llamacpp` backend does not
+install ggml's `cb_eval` (`ggml_backend_sched_eval_callback`) on the context at
+all and does not advertise the `layer_telemetry` capability. At `deep`, the
+callback aggregates into fixed-size arrays with zero per-node heap allocation
+or string formatting and emits bounded summaries after each sampled graph
+evaluation (stride `graph_telemetry_sample_every`, default `1`; layers capped
+at `256`, operators at `64` per eval out of `128` tracked op slots, devices at
+`16`). Layer indices are parsed from llama.cpp v1.0.0 tensor names (`<name>-<layer>`,
+stripping trailing ` (view)` / ` (reshaped)` / ` (cont)` tags).
+
+| Event | Level | Attributes |
+| --- | --- | --- |
+| `backend.layer.timing` | deep | one per observed layer per sampled eval (ascending `layer_index`, bounded): `backend` str, `eval_index` int (1-based), `sample_every_n` int, `layer_index` int (0-based), `node_count` int, `backend_device` str (primary ggml device for the layer), `devices` arr of str, `op_count` int (distinct ops in layer), `eval_kind` str (`eval`, `prefill`, `decode`, `batch`, `embed`); optional `batch_tokens` int (when > 0); optional `duration_ms` num and `timed_nodes` int (present only when per-node timings were collected, omitted in counting-only mode) |
+| `backend.operator.activity` | deep | one per observed ggml op type per sampled eval (sorted hottest first, bounded): `backend` str, `eval_index` int (1-based), `sample_every_n` int, `op_type` str (`ggml_op_name`), `op_id` int, `node_count` int, `total_eval_nodes` int, `backend_device` str (primary ggml device for this op), `devices` arr of obj `{device` str, `node_count` int`}`, `eval_kind` str; optional `batch_tokens` int (when > 0); optional `duration_ms` num and `timed_nodes` int (present only when per-node timings were collected) |
 
 ## Sampling
 
@@ -405,6 +462,67 @@ Per-request KV events carry the request's `request_id` in the envelope.
 | `kv.pressure` | metrics | engine-scoped, on watermark level change: `level` str (`normal` / `high` / `critical`), `occupancy` num (0..1), `utilization` num (same value), `pinned_blocks` int, `total_blocks` int |
 | `kv.freed` | metrics | `scheduler_request_id` int, `blocks` int, `reason` str (`completed`, `cancelled`, `failed`, `preempted`) |
 
+### Native KV cache events (physical)
+
+The in-process llama.cpp backend (`--backend llamacpp`) also reports its **physical** KV cache, the
+memory the Observatory's "KV cache pool" panel plots. Every event below carries `scope: "physical"`,
+`backend` (`llamacpp`), `model_id` (int: unique per-loaded-model instance id within the backend),
+and, when known, `model` (str: loaded model filename); the logical events above carry none of those
+physical attribution fields. Each resident model keeps its own `bytes_per_token`, rate limiter, and
+usage gauge, so concurrently loaded models do not overwrite each other and stay separable by
+`model_id`. `kv.evicted` exists in both streams with different attributes, so tell them apart by
+`scope` (absent = logical).
+
+The backend queues these events and the engine sampler drains them, so they are delivered every
+`EngineOptions::device_sample_interval` (default 10 s; `0` disables the sampler and with it these
+events). Each event carries `observed_ms`, the backend's monotonic clock in milliseconds at the moment
+it was observed, because the delivery time says little about it. The events are **standard level**:
+they are dropped at `metrics`.
+
+| Event | Level | Attributes |
+| --- | --- | --- |
+| `kv.pool.configured` | standard | a context was created (model load): `n_ctx` int (total cells), `n_ctx_seq` int (cells one sequence may use), `n_seq` int, `kv_unified` bool, `type_k` / `type_v` str (ggml type names such as `f16`, `q8_0`), `bytes_per_token` int (K+V bytes per token over all layers; 0 when unknown), `bytes_per_token_source` str (`estimate`, `upper_bound_hybrid`, `unavailable`), `total_bytes` int (`n_ctx` x `bytes_per_token`), `device` str (`cpu`, `gpu`, or the first pinned device), `observed_ms` int |
+| `kv.usage` | standard | a gauge, rate limited: `cells_used` int, `cells_total` int, `bytes_used` int, `bytes_total` int, `occupancy` num (0..1), `observed_ms` int |
+| `kv.evicted` | standard | the backend dropped cached sequence tokens (`idle_lru` on unified-pool idle-slot eviction, `slot_reset` on full slot clear, `prefix_trim` on divergent suffix trim): `seq_id` int, `tokens` int, `bytes` int, `reason` str (`idle_lru`, `slot_reset`, `prefix_trim`), `observed_ms` int |
+| `kv.shifted` | standard | positions `[p0, p1)` of a sequence moved by `delta`: `seq_id`, `p0`, `p1`, `delta`, `tokens_discarded`, `bytes_discarded` int, `observed_ms` int. **Reserved: the native backend performs no context shift today, so it never emits this**; the shape is fixed and unit-tested |
+
+How to read them:
+
+- **`kv.usage` rate limit.** At most one event per 64 tokens **and** per 500 ms, whichever comes
+  later (both must have passed); the first observation always passes. It is a gauge, so only the
+  newest observation is kept between drains: a burst collapses to its last state, and the final state
+  of a request is delivered by the next drain even if the limiter suppressed it.
+- **`cells_used`** is the sum of the per-sequence lengths (`llama_memory_seq_pos_max + 1`). It is an
+  upper bound when sequences share cells (prefix cloning on a unified pool).
+- **`bytes_per_token` is an estimate**, computed from model metadata with uniform `n_head_kv` and
+  head sizes (`<arch>.attention.key_length` / `value_length`, else `n_embd / n_head`) and the exact
+  size of the K and V types. It ignores sliding-window layers, MLA latent caches and per-layer
+  variation. For hybrid models it counts every layer (`upper_bound_hybrid`); for recurrent models it
+  is 0 (`unavailable`). Byte fields follow it, so they are estimates too.
+- **Queue bound.** At most 64 discrete events wait between drains; the newest overflow is dropped
+  (the first `kv.pool.configured` survives). Usage is coalesced and never dropped.
+
+### Native prefix checkpoints (llama.cpp backend)
+
+The native `llama.cpp` wrapper exposes prefix-checkpoint activity via
+`TelemetryKind::kPrefixCheckpoint` on `LlamaCppBackend::SetTelemetrySink` (only
+formatted and emitted when a sink is installed) and as a lock-free counter
+snapshot via `LlamaCppBackend::GetPrefixCheckpointStats()` (structured
+`prefix_checkpoint.*` field names from `StatsToFields`).
+
+| Field | Value |
+| --- | --- |
+| `kind` | `TelemetryKind::kPrefixCheckpoint` |
+| `tokens` | checkpoint token position captured or restored (`0` on `miss`) |
+| `elapsed_ms` | `0.0` on `captured`; restore duration in ms on `hit_slot`, `hit_host`, `hit_host_l2`, or `miss` |
+| `detail` | `<event> slot_hits=<u64> host_hits=<u64> misses=<u64> captured=<u64> restored_tokens=<u64> host_entries=<u64> host_bytes=<u64> host_evictions=<u64>` |
+
+`<event>` is one of: `captured` (partial checkpoint saved to slot), `hit_slot`
+(restored from the slot's checkpoint list), `hit_host` (restored from the
+bounded host-RAM LRU tier during slot rollback), `hit_host_l2` (restored from
+the host-RAM tier on top of an evicted L2 radix snapshot), or `miss` (no usable
+checkpoint found or restore failed).
+
 ## Typical order for one scheduled request
 
 `request.queued` → `scheduler.enqueued` → `request.started` →
@@ -428,6 +546,49 @@ Additive within `/1`: `producer.role` and `producer.synthetic`;
 request `admission.priority`, request `admission.queue_ms`, and the server
 health `queued_by_class` gauge. Discovery
 advertises this vocabulary as `vocabularies: {"sonder.inference.events": 1}`.
+
+## Text capture policy
+
+Telemetry never carries prompt or generated text unless the operator opts in.
+The declared policy has three values:
+
+| Policy | Output text (`inference.token.generated.text`) | Prompt text (`request.started.prompt`) |
+| --- | --- | --- |
+| `off` (default) | no | no |
+| `on` | yes | no |
+| `full` | yes | yes |
+
+- **Declared** as `text_capture` (`off` / `on` / `full`) in `engine.started`,
+  `session.created` and the discovery document (`GET
+  /.well-known/sonder-telemetry`, next to `sampling_level`). Consumers must
+  treat an unknown value as `on`.
+- **Set** with `EngineOptions::telemetry.text_capture` (embedding hosts), or for
+  `sonder-infer serve` with `--text-capture off|on|full` or the environment
+  default `SONDER_INFER_TEXT_CAPTURE` (the flag wins; an invalid value is a
+  usage error, never silently `off` or `on`). The older boolean
+  `capture_text` / `--capture-text` still means `on`; the more permissive of
+  the two applies, and `--capture-text` with `--text-capture off` is refused.
+  `on` and `full` require `--token-file`.
+- **Announced**: when the policy is not `off`, `sonder-infer serve` logs a
+  warning at startup (`text capture is ON ...` / `text capture is FULL ...`).
+- **Per-request opt-out**: the `X-Sonder-No-Capture: 1` request header (also
+  `true`) forces `off` for that request: no `text` on its token events and no
+  `prompt` on its `request.started`. A request can only lower the policy,
+  never raise it. `0` / `false` are no-ops; any other value, or a repeated
+  header, is 400 `invalid_correlation_header`. When capture would otherwise
+  have been on, that request's `request.started` carries
+  `text_capture_opt_out: true` so a consumer can tell "suppressed" from
+  "never captured". `RequestOptions::no_text_capture` is the library
+  equivalent.
+- **Bounds**: `prompt` holds at most 64 KiB (cut on a UTF-8 boundary);
+  `prompt_truncated` says whether it was cut. For chat requests the prompt is
+  the flattened conversation text.
+- **Candidates**: the optional `text` of each `inference.sampling.candidates`
+  entry follows the same policy as `inference.token.generated` (`on` or `full`,
+  and never for a request that sent `X-Sonder-No-Capture`).
+- **Not in this tree yet**: `src/sessions` has no local-only or sensitive
+  request flag today. If one is added later, it must force `off` for that
+  request.
 
 ## Observatory change requests (Observatory `docs/telemetry-schema.md` @ f5e3ff5)
 

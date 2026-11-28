@@ -31,6 +31,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 option(SONDER_BUILD_TESTS "Build the Sonder Inference test suite" ${PROJECT_IS_TOP_LEVEL})
 option(SONDER_BUILD_CLI "Build the sonder-infer CLI" ${PROJECT_IS_TOP_LEVEL})
 option(SONDER_WARNINGS_AS_ERRORS "Treat compiler warnings as errors for Sonder targets" OFF)
+option(SONDER_BUILD_LLAMASERVER "Build the external llama-server backend" ON)
 # Direct llama.cpp/GGML backend (src/backends/llamacpp). OFF by default: when ON,
 # llama.cpp is fetched at a pinned tag and compiled (CPU; accelerators via GGML_*).
 option(SONDER_WITH_LLAMA_CPP "Build the direct llama.cpp backend" OFF)
@@ -45,11 +46,15 @@ add_library(sonder_inference
     src/common/json.cpp
     src/common/log_queue.cpp
     src/common/diag_log.cpp
+    src/common/pq2_reblock.cpp
     src/common/sha256.cpp
     src/engine/sampling_config.cpp
     src/devices/device.cpp
     src/devices/coopmat_canary.cpp
+    src/devices/gpu_memory.cpp
+    src/devices/log_diagnostics.cpp
     src/telemetry/telemetry.cpp
+    src/telemetry/text_capture.cpp
     src/sessions/session.cpp
     src/engine/engine.cpp
     src/engine/request_runtime.cpp
@@ -85,7 +90,8 @@ find_package(Threads REQUIRED)
 target_link_libraries(sonder_inference PUBLIC Threads::Threads)
 if(WIN32)
     # ntdll: NtCreateFile for handle-relative opens (src/common/safe_file_win32.cpp).
-    target_link_libraries(sonder_inference PRIVATE ws2_32 advapi32 ntdll)
+    # pdh: shared per-process GPU counters in src/devices/gpu_memory.cpp.
+    target_link_libraries(sonder_inference PRIVATE ws2_32 advapi32 ntdll pdh)
     target_compile_definitions(sonder_inference PRIVATE _WIN32_WINNT=0x0A00)
 elseif(UNIX AND NOT APPLE)
     target_link_libraries(sonder_inference PRIVATE ${CMAKE_DL_LIBS})
@@ -121,6 +127,7 @@ set(SONDER_MODULE_DIRS
     src/sampling
     src/backends/llamacpp
     src/backends/ollama
+    src/backends/ollama_cloud
     src/backends/llamaserver
     src/artifacts
     src/models

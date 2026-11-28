@@ -199,6 +199,14 @@ struct ModelDescriptor {
 struct ModelLoadOptions {
     std::string model;
     std::string device_id = "cpu:0";
+    // Optional exact device allowlist for this model (backend-specific names;
+    // llamacpp: ggml names such as "CUDA0" or "Vulkan0", case-insensitive).
+    // Non-empty overrides the backend-wide list and takes precedence over a
+    // "gpu:N" device_id pin. Empty = backend default.
+    // The model only runs on these devices when device_id is gpu:* or empty
+    // (a cpu:* id offloads no layers, so the default "cpu:0" ignores the list);
+    // the server sets gpu:0 for it. Ignored by backends without named devices.
+    std::vector<std::string> devices{};
 };
 
 struct GenerateRequest {
@@ -229,14 +237,22 @@ struct GenerateRequest {
     int priority_rank = 0;
     // Allow cost-aware spill-to-checkpoint when selectively preempted under pressure.
     bool allow_preempt_spill = false;
+    // The caller requires on-premises execution. Remote providers (e.g.
+    // ollama_cloud) refuse such a request before any network I/O.
+    bool local_only = false;
     // Telemetry-only probability probe, [0, kMaxTelemetryTopK]; 0 = off. Set
-    // by the session when token telemetry is recorded. A backend that samples
-    // upstream and can report probabilities (llamaserver against llama.cpp)
-    // asks for the sampled token's probability and this many alternatives and
-    // reports them in TokenChunk::sampled_probability. The caller-visible
-    // TokenChunk::logprob / top_logprobs stay exactly as sampling.logprobs
-    // asked. Other backends ignore it.
+    // by the session when token telemetry is recorded (for native in-process
+    // backends only when `TelemetryOptions::native_token_probabilities` is set,
+    // level is `deep`, or `sampling.logprobs` is requested). Backends that
+    // support it report the sampled token's probability and up to this many
+    // alternatives in TokenChunk::sampled_probability while leaving caller-
+    // visible TokenChunk::logprob / top_logprobs strictly as sampling.logprobs
+    // asked. Stride, cap, and capture_text let in-process backends skip
+    // candidate extraction and detokenization when not emitted.
     std::int32_t telemetry_top_k = 0;
+    std::uint32_t telemetry_candidates_stride = 1;
+    std::uint32_t telemetry_candidates_max_events = 0;  // 0 = uncapped
+    bool telemetry_capture_text = false;
 };
 
 // Bounded batch limits for embedding, reranking, and pair-scoring requests.
@@ -249,7 +265,12 @@ const char* to_string(EmbedPoolingType pooling) noexcept;
 
 struct EmbedRequest {
     std::string request_id;
+    // Text inputs. Exactly one of `inputs` / `token_inputs` is non-empty.
     std::vector<std::string> inputs;
+    // Pre-tokenized inputs (OpenAI `input` as token arrays). The ids are in the
+    // loaded model's own vocabulary, so only backends that tokenize natively
+    // can serve them; others fail the request.
+    std::vector<std::vector<TokenId>> token_inputs;
     bool normalize = true;
     // Optional requested output dimension. Backends must fail closed if
     // unsupported or > native dimension; never silently truncate arbitrary models.
@@ -571,9 +592,14 @@ struct ChatRequest {
     std::optional<double> target_itl_ms = std::nullopt;
     // Opt-in per-request stage timing hooks (false by default: zero extra clocks).
     bool enable_stage_profiling = false;
+    // Same meaning as GenerateRequest::local_only.
+    bool local_only = false;
     // Telemetry-only probability probe; same contract as
-    // GenerateRequest::telemetry_top_k.
+    // GenerateRequest::telemetry_*.
     std::int32_t telemetry_top_k = 0;
+    std::uint32_t telemetry_candidates_stride = 1;
+    std::uint32_t telemetry_candidates_max_events = 0;  // 0 = uncapped
+    bool telemetry_capture_text = false;
 };
 
 // True for "system", "user", "assistant" and "tool".

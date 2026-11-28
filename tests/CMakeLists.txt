@@ -8,6 +8,7 @@ sonder_add_module_tests(core
     test_model_architecture.cpp
     test_session.cpp
     test_telemetry.cpp
+    test_text_capture.cpp
     test_diag_log.cpp
     test_c_api.cpp
     test_c_api_chat.cpp
@@ -24,6 +25,7 @@ sonder_add_module_tests(core
     test_priority_runtime.cpp
     test_device_memory.cpp
     test_coopmat_canary.cpp
+    test_device_diagnostics.cpp
     test_http_client.cpp
     test_recurrent_checkpoints.cpp
     test_speculative_verifier.cpp
@@ -37,6 +39,11 @@ if(TARGET sonder_core_tests)
     target_include_directories(sonder_core_tests PRIVATE
         "${PROJECT_SOURCE_DIR}/src/backends/llamacpp"
         "${PROJECT_SOURCE_DIR}/src/backends/llamacpp/include")
+    if(SONDER_BUILD_CLI AND TARGET sonder-infer)
+        target_compile_definitions(sonder_core_tests PRIVATE
+            SONDER_TEST_INFER_EXE="$<TARGET_FILE:sonder-infer>")
+        add_dependencies(sonder_core_tests sonder-infer)
+    endif()
 endif()
 
 if(WIN32 AND TARGET sonder_core_tests)
@@ -85,6 +92,14 @@ add_subdirectory(fault)
 add_test(NAME sonder.meta.test_names_have_no_semicolons
     COMMAND ${CMAKE_COMMAND} -DSOURCE_DIR=${PROJECT_SOURCE_DIR} -P ${PROJECT_SOURCE_DIR}/cmake/CheckTestNames.cmake)
 set_tests_properties(sonder.meta.test_names_have_no_semicolons PROPERTIES TIMEOUT 60)
+
+# Verifies CUDA build matrix presets, configure-time CUDA / CUB-10445 / arch
+# guards, llamacpp CMake wiring, and cuobjdump SASS verification mode (MAIN-03).
+add_test(NAME sonder.meta.cuda_build_matrix
+    COMMAND "${CMAKE_COMMAND}" -DSOURCE_DIR=${PROJECT_SOURCE_DIR}
+            -DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/cuda_build_matrix_check
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/cuda_build_matrix_check.cmake")
+set_tests_properties(sonder.meta.cuda_build_matrix PROPERTIES TIMEOUT 90)
 
 if(SONDER_BUILD_CLI)
     # Optional modules compiled into this build (their feature macros).
@@ -201,7 +216,7 @@ if(SONDER_BUILD_CLI)
     sonder_cli_test(unknown_command RC 2 STDERR_REGEX "unknown command 'genrate' \\(did you mean 'generate'\\?\\)"
         COMMAND ${infer} genrate)
     sonder_cli_test(help_unknown_command RC 2 STDERR_REGEX "unknown command 'nope'" COMMAND ${infer} help nope)
-    set(help_commands version devices coopmat-canary backends models generate chat bench help)
+    set(help_commands version devices coopmat-canary backends models generate chat bench reblock-pq2 help)
     if(sonder_cli_has_server)
         list(APPEND help_commands serve)
     endif()
@@ -266,6 +281,14 @@ if(SONDER_BUILD_CLI)
     # --- Runtime failures (exit 1) -----------------------------------------
     sonder_cli_test(model_not_found RC 1 STDERR_REGEX "not_found"
         COMMAND ${infer} generate --backend mock --model notmock --prompt hi)
+    sonder_cli_test(reblock_pq2_missing_input RC 2 STDERR_REGEX "error: reblock-pq2: --input is required"
+        COMMAND ${infer} reblock-pq2)
+    sonder_cli_test(reblock_pq2_missing_output RC 2 STDERR_REGEX "error: reblock-pq2: --output is required"
+        COMMAND ${infer} reblock-pq2 --input in.gguf)
+    sonder_cli_test(reblock_pq2_inspect_output_conflict RC 2 STDERR_REGEX "--output cannot be combined with --inspect"
+        COMMAND ${infer} reblock-pq2 --input in.gguf --output out.gguf --inspect)
+    sonder_cli_test(reblock_pq2_not_found RC 1 STDERR_REGEX "error: reblock-pq2: not_found"
+        COMMAND ${infer} reblock-pq2 --input "${CMAKE_CURRENT_BINARY_DIR}/absent-pq2.gguf" --inspect)
     sonder_cli_test(telemetry_unwritable RC 1 STDERR_REGEX "cannot open --telemetry"
         COMMAND ${infer} generate ${mock} --prompt hi
                 --telemetry "${CMAKE_CURRENT_BINARY_DIR}/no-such-dir/sub/t.jsonl")
@@ -440,7 +463,7 @@ grep -q 'outcome=cancelled' \"$2\" || { echo 'no outcome=cancelled stats line'; 
     # --- sonder-bench -------------------------------------------------------
     if(TARGET sonder-bench)
         set(bench_tool $<TARGET_FILE:sonder-bench>)
-        sonder_cli_test(bench_tool_no_args RC 2 STDERR_REGEX "Usage:\\n  sonder-bench --model NAME"
+        sonder_cli_test(bench_tool_no_args RC 2 STDERR_REGEX "Usage:\\n  sonder-bench --model PATH\\.gguf"
             COMMAND ${bench_tool})
         sonder_cli_test(bench_tool_help RC 0 STDOUT_REGEX "MOCK BACKEND banner.*Exit status: 0 ok"
             COMMAND ${bench_tool} --help)

@@ -4,6 +4,9 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <string>
+#include <utility>
+#include <vector>
 
 namespace sonder::backends::llamacpp {
 
@@ -46,6 +49,392 @@ std::string_view ToString(DeviceKind kind) noexcept {
     return "unknown";
 }
 
+namespace {
+
+bool EqualsIgnoreCase(std::string_view a, std::string_view b) noexcept {
+    if (a.size() != b.size()) return false;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        const auto ca = static_cast<unsigned char>(a[i]);
+        const auto cb = static_cast<unsigned char>(b[i]);
+        const auto la = static_cast<unsigned char>(ca >= 'A' && ca <= 'Z' ? ca + ('a' - 'A') : ca);
+        const auto lb = static_cast<unsigned char>(cb >= 'A' && cb <= 'Z' ? cb + ('a' - 'A') : cb);
+        if (la != lb) return false;
+    }
+    return true;
+}
+
+std::string_view TrimAscii(std::string_view s) noexcept {
+    while (!s.empty() && (s.front() == ' ' || s.front() == '\t' || s.front() == '\r' || s.front() == '\n')) {
+        s.remove_prefix(1);
+    }
+    while (!s.empty() && (s.back() == ' ' || s.back() == '\t' || s.back() == '\r' || s.back() == '\n')) {
+        s.remove_suffix(1);
+    }
+    return s;
+}
+
+bool ParseHexU32(std::string_view s, std::uint32_t& out) noexcept {
+    if (s.empty() || s.size() > 8) return false;
+    std::uint64_t val = 0;
+    for (char ch : s) {
+        std::uint32_t digit = 0;
+        if (ch >= '0' && ch <= '9') {
+            digit = static_cast<std::uint32_t>(ch - '0');
+        } else if (ch >= 'a' && ch <= 'f') {
+            digit = static_cast<std::uint32_t>(ch - 'a' + 10);
+        } else if (ch >= 'A' && ch <= 'F') {
+            digit = static_cast<std::uint32_t>(ch - 'A' + 10);
+        } else {
+            return false;
+        }
+        val = (val << 4) | digit;
+    }
+    if (val > 0xFFFFFFFFULL) return false;
+    out = static_cast<std::uint32_t>(val);
+    return true;
+}
+
+void AppendHexPadded(std::string& dst, std::uint32_t v, std::size_t min_digits) {
+    static constexpr char kHex[] = "0123456789abcdef";
+    char buf[8];
+    std::size_t n = 0;
+    do {
+        buf[n++] = kHex[v & 0xFU];
+        v >>= 4;
+    } while (v != 0 && n < sizeof(buf));
+    while (n < min_digits) dst.push_back('0'), --min_digits;
+    while (n > 0) dst.push_back(buf[--n]);
+}
+
+// "CUDA0" -> "CUDA", "Vulkan12" -> "Vulkan".
+std::string_view BackendPrefix(std::string_view name) noexcept {
+    while (!name.empty() && name.back() >= '0' && name.back() <= '9') name.remove_suffix(1);
+    return name;
+}
+
+// Lower number = higher preference when one physical GPU appears under multiple
+// ggml backends in automatic mode (native vendor backends beat Vulkan/OpenCL/WebGPU).
+int BackendPriority(std::string_view name) noexcept {
+    const std::string_view p = BackendPrefix(name);
+    if (EqualsIgnoreCase(p, "CUDA") || EqualsIgnoreCase(p, "ROCm") || EqualsIgnoreCase(p, "HIP") ||
+        EqualsIgnoreCase(p, "Metal") || EqualsIgnoreCase(p, "SYCL") || EqualsIgnoreCase(p, "MUSA") ||
+        EqualsIgnoreCase(p, "CANN")) {
+        return 0;
+    }
+    if (EqualsIgnoreCase(p, "Vulkan") || EqualsIgnoreCase(p, "OpenCL") || EqualsIgnoreCase(p, "WebGPU")) {
+        return 2;
+    }
+    return 1;
+}
+
+bool SamePhysicalDevice(const DeviceInfo& a, const DeviceInfo& b) noexcept {
+    if (a.kind == DeviceKind::kCpu || b.kind == DeviceKind::kCpu) return false;
+    const std::string id_a = NormalizePciBusId(a.device_id);
+    const std::string id_b = NormalizePciBusId(b.device_id);
+    if (!id_a.empty() && !id_b.empty()) return id_a == id_b;
+    // Without ids on both sides, identical cards on the same backend stay distinct.
+    if (EqualsIgnoreCase(BackendPrefix(a.name), BackendPrefix(b.name))) return false;
+    const std::string_view desc_a = TrimAscii(a.description);
+    const std::string_view desc_b = TrimAscii(b.description);
+    return !desc_a.empty() && EqualsIgnoreCase(desc_a, desc_b) && a.memory_total_bytes != 0 &&
+           a.memory_total_bytes == b.memory_total_bytes;
+}
+
+Status ValidateTensorSplitShape(const std::vector<float>& tensor_split) {
+    if (tensor_split.empty()) return Status::Ok();
+    if (tensor_split.size() > kMaxTensorSplitDevices) {
+        return Status::Error(ErrorCode::kInvalidArgument,
+                             "tensor_split has " + std::to_string(tensor_split.size()) +
+                                 " entries (maximum is " + std::to_string(kMaxTensorSplitDevices) + ")");
+    }
+    bool any_positive = false;
+    for (const float weight : tensor_split) {
+        if (!std::isfinite(weight) || weight < 0.0F) {
+            return Status::Error(ErrorCode::kInvalidArgument, "tensor_split values must be finite and >= 0");
+        }
+        if (weight > 0.0F) any_positive = true;
+    }
+    if (!any_positive) {
+        return Status::Error(ErrorCode::kInvalidArgument, "tensor_split must contain at least one positive value");
+    }
+    return Status::Ok();
+}
+
+}  // namespace
+
+std::string NormalizePciBusId(std::string_view raw) {
+    raw = TrimAscii(raw);
+    if (raw.empty()) return {};
+
+    // Split optional virtual-device suffix such as "-v0" (ggml-cuda virtual devices).
+    std::string_view bdf = raw;
+    std::string_view suffix;
+    if (const std::size_t dash = raw.find('-'); dash != std::string_view::npos) {
+        bdf = raw.substr(0, dash);
+        suffix = raw.substr(dash);
+    }
+
+    const std::size_t c1 = bdf.find(':');
+    const std::size_t c2 = c1 == std::string_view::npos ? std::string_view::npos : bdf.find(':', c1 + 1);
+    const std::size_t dot = c2 == std::string_view::npos ? std::string_view::npos : bdf.find('.', c2 + 1);
+    if (c1 != std::string_view::npos && c2 != std::string_view::npos && dot != std::string_view::npos &&
+        bdf.find(':', c2 + 1) == std::string_view::npos && bdf.find('.', dot + 1) == std::string_view::npos) {
+        std::uint32_t domain = 0;
+        std::uint32_t bus = 0;
+        std::uint32_t dev = 0;
+        std::uint32_t fn = 0;
+        if (ParseHexU32(bdf.substr(0, c1), domain) && ParseHexU32(bdf.substr(c1 + 1, c2 - c1 - 1), bus) &&
+            ParseHexU32(bdf.substr(c2 + 1, dot - c2 - 1), dev) && ParseHexU32(bdf.substr(dot + 1), fn) &&
+            bus <= 0xFFU && dev <= 0xFFU && fn <= 0xFU) {
+            std::string norm;
+            norm.reserve(12 + suffix.size());
+            AppendHexPadded(norm, domain, 4);
+            norm.push_back(':');
+            AppendHexPadded(norm, bus, 2);
+            norm.push_back(':');
+            AppendHexPadded(norm, dev, 2);
+            norm.push_back('.');
+            AppendHexPadded(norm, fn, 1);
+            for (char ch : suffix) {
+                const auto u = static_cast<unsigned char>(ch);
+                norm.push_back(static_cast<char>(u >= 'A' && u <= 'Z' ? u + ('a' - 'A') : u));
+            }
+            return norm;
+        }
+    }
+
+    std::string lower;
+    lower.reserve(raw.size());
+    for (char ch : raw) {
+        const auto u = static_cast<unsigned char>(ch);
+        lower.push_back(static_cast<char>(u >= 'A' && u <= 'Z' ? u + ('a' - 'A') : u));
+    }
+    return lower;
+}
+
+Status SelectDevices(const std::vector<DeviceInfo>& available, const std::vector<std::string>& allowlist,
+                     DeviceSelection* out) {
+    return SelectDevices(available, allowlist, {}, 0, out);
+}
+
+Status SelectDevices(const std::vector<DeviceInfo>& available, const std::vector<std::string>& allowlist,
+                     const std::vector<float>& tensor_split, std::int32_t main_gpu, DeviceSelection* out) {
+    if (main_gpu < 0) {
+        return Status::Error(ErrorCode::kInvalidArgument,
+                             "main_gpu (" + std::to_string(main_gpu) + ") must be >= 0");
+    }
+    if (allowlist.size() > kMaxTensorSplitDevices) {
+        return Status::Error(ErrorCode::kInvalidArgument,
+                             "too many devices (" + std::to_string(allowlist.size()) + ", maximum is " +
+                                 std::to_string(kMaxTensorSplitDevices) + ")");
+    }
+    for (const std::string& name : allowlist) {
+        if (name.empty()) {
+            return Status::Error(ErrorCode::kInvalidArgument, "device name in devices list is empty");
+        }
+        if (name.find('\0') != std::string::npos) {
+            return Status::Error(ErrorCode::kInvalidArgument, "device name in devices list contains NUL");
+        }
+    }
+    if (Status s = ValidateTensorSplitShape(tensor_split); !s.ok()) return s;
+
+    DeviceSelection sel;
+    if (!allowlist.empty()) {
+        std::vector<const DeviceInfo*> chosen;
+        std::vector<std::size_t> allowlist_to_selected(allowlist.size(), 0);
+        std::vector<std::size_t> selected_first_idx;
+        for (std::size_t j = 0; j < allowlist.size(); ++j) {
+            const std::string& name = allowlist[j];
+            const auto it = std::find_if(available.begin(), available.end(),
+                                         [&](const DeviceInfo& d) { return EqualsIgnoreCase(d.name, name); });
+            if (it == available.end()) {
+                return Status::Error(ErrorCode::kInvalidArgument,
+                                     "device '" + name + "' is not available in this build");
+            }
+            const auto dup = std::find_if(chosen.begin(), chosen.end(), [&](const DeviceInfo* c) {
+                return EqualsIgnoreCase(c->name, it->name) || SamePhysicalDevice(*c, *it);
+            });
+            if (dup != chosen.end()) {
+                sel.notes.push_back("skipping " + it->name + ": same physical device as " + (*dup)->name);
+                allowlist_to_selected[j] = static_cast<std::size_t>(dup - chosen.begin());
+                continue;
+            }
+            allowlist_to_selected[j] = chosen.size();
+            selected_first_idx.push_back(j);
+            chosen.push_back(&*it);
+            sel.names.push_back(it->name);
+        }
+
+        const std::size_t L = allowlist.size();
+        const std::size_t S = sel.names.size();
+        if (!tensor_split.empty()) {
+            if (S == L) {
+                sel.tensor_split = tensor_split;
+            } else {
+                if (tensor_split.size() > L) {
+                    sel.tensor_split = tensor_split;
+                    sel.main_gpu = main_gpu;
+                    if (out != nullptr) *out = std::move(sel);
+                    return Status::Error(ErrorCode::kInvalidArgument,
+                                         "tensor_split has " + std::to_string(tensor_split.size()) +
+                                             " entries, exceeding allowlist size (" + std::to_string(L) + ")");
+                }
+                sel.tensor_split.assign(S, 0.0F);
+                for (std::size_t k = 0; k < S; ++k) {
+                    const std::size_t orig = selected_first_idx[k];
+                    if (orig < tensor_split.size()) {
+                        sel.tensor_split[k] = tensor_split[orig];
+                    }
+                    if (sel.tensor_split[k] == 0.0F) {
+                        for (std::size_t j = 0; j < std::min(L, tensor_split.size()); ++j) {
+                            if (allowlist_to_selected[j] == k && tensor_split[j] > 0.0F) {
+                                sel.tensor_split[k] = tensor_split[j];
+                                break;
+                            }
+                        }
+                    }
+                }
+                const bool any_pos =
+                    std::any_of(sel.tensor_split.begin(), sel.tensor_split.end(), [](float w) { return w > 0.0F; });
+                if (!any_pos) {
+                    sel.main_gpu = main_gpu;
+                    if (out != nullptr) *out = std::move(sel);
+                    return Status::Error(ErrorCode::kInvalidArgument,
+                                         "tensor_split assigns zero weight to every selected device");
+                }
+            }
+        }
+
+        if (static_cast<std::size_t>(main_gpu) < L) {
+            sel.main_gpu = static_cast<std::int32_t>(allowlist_to_selected[static_cast<std::size_t>(main_gpu)]);
+        } else {
+            sel.main_gpu = main_gpu;
+            if (out != nullptr) *out = std::move(sel);
+            return Status::Error(ErrorCode::kInvalidArgument,
+                                 "main_gpu (" + std::to_string(main_gpu) + ") exceeds selected device count (" +
+                                     std::to_string(S) + ")");
+        }
+        if (out != nullptr) *out = std::move(sel);
+        return Status::Ok();
+    }
+
+    // Automatic selection: discrete GPUs only (never integrated GPUs), de-duplicated across backends.
+    std::vector<const DeviceInfo*> raw_gpus;
+    for (const DeviceInfo& d : available) {
+        if (d.kind == DeviceKind::kGpu || d.kind == DeviceKind::kIntegratedGpu) {
+            raw_gpus.push_back(&d);
+        }
+    }
+    const std::size_t R = raw_gpus.size();
+    std::vector<int> raw_to_selected(R, -1);
+    std::vector<std::size_t> selected_raw_idx;
+    std::vector<const DeviceInfo*> chosen;
+
+    for (std::size_t r = 0; r < R; ++r) {
+        const DeviceInfo& d = *raw_gpus[r];
+        if (d.kind == DeviceKind::kIntegratedGpu) {
+            sel.notes.push_back("skipping " + d.name + ": integrated GPU not in the device allowlist");
+            continue;
+        }
+        const auto dup =
+            std::find_if(chosen.begin(), chosen.end(), [&](const DeviceInfo* c) { return SamePhysicalDevice(*c, d); });
+        if (dup == chosen.end()) {
+            raw_to_selected[r] = static_cast<int>(chosen.size());
+            selected_raw_idx.push_back(r);
+            chosen.push_back(&d);
+        } else {
+            const auto k = static_cast<std::size_t>(dup - chosen.begin());
+            raw_to_selected[r] = static_cast<int>(k);
+            if (BackendPriority(d.name) < BackendPriority((*dup)->name)) {
+                sel.notes.push_back("skipping " + (*dup)->name + ": same physical device as " + d.name);
+                *dup = &d;
+                selected_raw_idx[k] = r;
+            } else {
+                sel.notes.push_back("skipping " + d.name + ": same physical device as " + (*dup)->name);
+            }
+        }
+    }
+    for (const DeviceInfo* c : chosen) sel.names.push_back(c->name);
+
+    const std::size_t S = sel.names.size();
+    if (S == 0) {
+        sel.main_gpu = main_gpu;
+        sel.tensor_split = tensor_split;
+        if (out != nullptr) *out = std::move(sel);
+        if (!tensor_split.empty()) {
+            return Status::Error(ErrorCode::kInvalidArgument,
+                                 "tensor_split requires at least one discrete GPU when no device allowlist is set");
+        }
+        if (main_gpu > 0) {
+            return Status::Error(ErrorCode::kInvalidArgument,
+                                 "main_gpu (" + std::to_string(main_gpu) + ") exceeds selected discrete GPU count (0)");
+        }
+        return Status::Ok();
+    }
+
+    const bool raw_indexed_split = (R > S) && (tensor_split.size() == R);
+    if (!tensor_split.empty()) {
+        if (raw_indexed_split) {
+            sel.tensor_split.assign(S, 0.0F);
+            for (std::size_t k = 0; k < S; ++k) {
+                sel.tensor_split[k] = tensor_split[selected_raw_idx[k]];
+                if (sel.tensor_split[k] == 0.0F) {
+                    for (std::size_t r = 0; r < R; ++r) {
+                        if (raw_to_selected[r] == static_cast<int>(k) && tensor_split[r] > 0.0F) {
+                            sel.tensor_split[k] = tensor_split[r];
+                            break;
+                        }
+                    }
+                }
+            }
+            const bool any_pos =
+                std::any_of(sel.tensor_split.begin(), sel.tensor_split.end(), [](float w) { return w > 0.0F; });
+            if (!any_pos) {
+                sel.main_gpu = main_gpu;
+                if (out != nullptr) *out = std::move(sel);
+                return Status::Error(ErrorCode::kInvalidArgument,
+                                     "tensor_split assigns zero weight to every selected discrete GPU");
+            }
+        } else if (tensor_split.size() <= S) {
+            sel.tensor_split = tensor_split;
+        } else {
+            sel.tensor_split = tensor_split;
+            sel.main_gpu = main_gpu;
+            if (out != nullptr) *out = std::move(sel);
+            return Status::Error(ErrorCode::kInvalidArgument,
+                                 "tensor_split has " + std::to_string(tensor_split.size()) +
+                                     " entries, exceeding selected discrete GPU count (" + std::to_string(S) + ")");
+        }
+    }
+
+    if (main_gpu == 0) {
+        sel.main_gpu = (raw_indexed_split && raw_to_selected[0] >= 0) ? raw_to_selected[0] : 0;
+    } else {
+        const auto mg = static_cast<std::size_t>(main_gpu);
+        if (!raw_indexed_split && mg < S) {
+            sel.main_gpu = main_gpu;
+        } else if (R > S && mg < R) {
+            if (raw_to_selected[mg] < 0) {
+                sel.main_gpu = main_gpu;
+                if (out != nullptr) *out = std::move(sel);
+                return Status::Error(ErrorCode::kInvalidArgument,
+                                     "main_gpu (" + std::to_string(main_gpu) + ") targets integrated GPU '" +
+                                         raw_gpus[mg]->name + "' which is not in the device allowlist");
+            }
+            sel.main_gpu = raw_to_selected[mg];
+        } else {
+            sel.main_gpu = main_gpu;
+            if (out != nullptr) *out = std::move(sel);
+            return Status::Error(ErrorCode::kInvalidArgument,
+                                 "main_gpu (" + std::to_string(main_gpu) + ") exceeds selected discrete GPU count (" +
+                                     std::to_string(S) + ")");
+        }
+    }
+
+    if (out != nullptr) *out = std::move(sel);
+    return Status::Ok();
+}
+
 Status Validate(const SamplingParams& params) {
     if (!std::isfinite(params.temperature)) {
         return Status::Error(ErrorCode::kInvalidArgument, "temperature must be finite");
@@ -81,6 +470,11 @@ Status Validate(const SamplingParams& params) {
     if (params.top_logprobs > 0 && !params.compute_logprobs) {
         return Status::Error(ErrorCode::kInvalidArgument, "top_logprobs > 0 requires compute_logprobs = true");
     }
+    if (params.telemetry_top_k < 0 || params.telemetry_top_k > kMaxTopLogprobs) {
+        return Status::Error(ErrorCode::kInvalidArgument,
+                             "telemetry_top_k (" + std::to_string(params.telemetry_top_k) + ") must be in [0, " +
+                                 std::to_string(kMaxTopLogprobs) + "]");
+    }
     return Status::Ok();
 }
 
@@ -91,18 +485,6 @@ constexpr KvCacheType kAllKvCacheTypes[] = {
     KvCacheType::kQ5_1,   KvCacheType::kQ5_0, KvCacheType::kQ4_1, KvCacheType::kQ4_0,
     KvCacheType::kIQ4_NL, KvCacheType::kF8_E4M3, KvCacheType::kQ2_0, KvCacheType::kPQ2_0,
 };
-
-bool EqualsIgnoreCase(std::string_view a, std::string_view b) noexcept {
-    if (a.size() != b.size()) return false;
-    for (std::size_t i = 0; i < a.size(); ++i) {
-        const auto ca = static_cast<unsigned char>(a[i]);
-        const auto cb = static_cast<unsigned char>(b[i]);
-        const auto la = static_cast<unsigned char>(ca >= 'A' && ca <= 'Z' ? ca + ('a' - 'A') : ca);
-        const auto lb = static_cast<unsigned char>(cb >= 'A' && cb <= 'Z' ? cb + ('a' - 'A') : cb);
-        if (la != lb) return false;
-    }
-    return true;
-}
 
 std::uint64_t Mix64(std::uint64_t x) noexcept {
     x += 0x9E3779B97F4A7C15ULL;
@@ -345,6 +727,75 @@ Status ValidatePlacementOptions(const LoadOptions& options) {
     return Status::Ok();
 }
 
+bool IsPrismHadamardKey(std::string_view key) noexcept {
+    constexpr std::string_view kPrefix = "prism.hadamard.";
+    return key.size() >= kPrefix.size() && key.substr(0, kPrefix.size()) == kPrefix;
+}
+
+Status EvaluateHadamardGuard(const std::vector<std::string>& gguf_keys, bool runtime_supports_hadamard,
+                             std::string_view model_path) {
+    if (runtime_supports_hadamard) return Status::Ok();
+    for (const std::string& key : gguf_keys) {
+        if (!IsPrismHadamardKey(key)) continue;
+        std::string msg = "model is Hadamard-folded (GGUF key '" + key +
+                          "', Bonsai/Prism ternary Q2_0) but the linked llama.cpp has no FWHT / "
+                          "prism.hadamard runtime support; loading it would produce garbage output. "
+                          "Rebuild against a llama.cpp with prism.hadamard support (mainline >= b11556 / v1.0.0, "
+                          "PR #29600, or the PrismML-Eng fork; see -DSONDER_LLAMACPP_FORCE_PRISM_HADAMARD) "
+                          "or use a non-folded GGUF";
+        if (!model_path.empty()) {
+            msg += ": ";
+            msg += model_path;
+        }
+        return Status::Error(ErrorCode::kUnsupported, std::move(msg));
+    }
+    return Status::Ok();
+}
+
+Status EvaluateSmokeLogits(std::span<const float> logits, std::int32_t& argmax_out) {
+    if (logits.empty()) {
+        return Status::Error(ErrorCode::kLoadFailed, "startup smoke test: empty logits");
+    }
+    if (!std::isfinite(logits[0])) {
+        return Status::Error(ErrorCode::kLoadFailed, "startup smoke test: non-finite logits");
+    }
+    float min_v = logits[0];
+    float max_v = logits[0];
+    std::int32_t best = 0;
+    for (std::size_t i = 1; i < logits.size(); ++i) {
+        const float v = logits[i];
+        if (!std::isfinite(v)) {
+            return Status::Error(ErrorCode::kLoadFailed, "startup smoke test: non-finite logits");
+        }
+        if (v < min_v) min_v = v;
+        if (v > max_v) {
+            max_v = v;
+            best = static_cast<std::int32_t>(i);
+        }
+    }
+    if (logits.size() > 1u && max_v == min_v) {
+        return Status::Error(ErrorCode::kLoadFailed, "startup smoke test: degenerate uniform logits");
+    }
+    argmax_out = best;
+    return Status::Ok();
+}
+
+Status EvaluateSmokeTokens(const std::vector<std::int32_t>& tokens, bool logits_finite) {
+    if (!logits_finite) {
+        return Status::Error(ErrorCode::kLoadFailed, "startup smoke test: non-finite logits");
+    }
+    if (tokens.empty()) {
+        return Status::Error(ErrorCode::kLoadFailed, "startup smoke test: no tokens produced");
+    }
+    if (tokens.size() >= kSmokeMinTokens &&
+        std::all_of(tokens.begin(), tokens.end(), [&](std::int32_t t) { return t == tokens.front(); })) {
+        return Status::Error(ErrorCode::kLoadFailed,
+                             "startup smoke test: degenerate output (one token repeated " +
+                                 std::to_string(tokens.size()) + " times)");
+    }
+    return Status::Ok();
+}
+
 Status ValidateContextOptions(const LoadOptions& options) {
     if (options.vocab_only) return Status::Ok();
     if (ToString(options.type_k) == "unknown" || ToString(options.type_v) == "unknown") {
@@ -448,6 +899,21 @@ Status ValidateContextOptions(const LoadOptions& options) {
         return Status::Error(ErrorCode::kInvalidArgument,
                              "embed_max_sequences (" + std::to_string(options.embed_max_sequences) +
                                  ") must be <= " + std::to_string(kMaxEmbedSequences));
+    }
+    if (ToString(options.workload_role) == "unknown") {
+        return Status::Error(ErrorCode::kInvalidArgument,
+                             "unknown workload_role (expected main_decode or auxiliary)");
+    }
+    if (ToString(options.main_stream_priority) == "unknown") {
+        return Status::Error(ErrorCode::kInvalidArgument,
+                             "unknown main_stream_priority (expected default, high or low)");
+    }
+    if (ToString(options.aux_stream_priority) == "unknown") {
+        return Status::Error(ErrorCode::kInvalidArgument,
+                             "unknown aux_stream_priority (expected default, high or low)");
+    }
+    if (Status s = ValidateAuxGateConfig(options.aux_gate); !s.ok()) {
+        return s;
     }
     // n_batch == 0 keeps its own, older error in Load().
     if (options.n_batch > 0 && options.n_ubatch > options.n_batch) {
@@ -603,6 +1069,255 @@ TokenLogprobInfo ComputeTokenLogprobs(std::span<const float> logits, Token chose
         info.top_logprobs.emplace_back(tok, static_cast<float>(static_cast<double>(raw) - log_z));
     }
     return info;
+}
+
+SampledProbInfo BuildPreSamplingProbInfo(const TokenLogprobInfo& lp, Token chosen_token, std::int32_t top_k,
+                                         bool collect_candidates) {
+    SampledProbInfo out;
+    if (!lp.valid || chosen_token < 0 || top_k <= 0) {
+        return out;
+    }
+    if (std::isnan(lp.logprob) || (std::isinf(lp.logprob) && lp.logprob > 0.0F)) {
+        return out;
+    }
+    const float chosen_p =
+        std::isinf(lp.logprob) ? 0.0F : std::clamp(static_cast<float>(std::exp(static_cast<double>(lp.logprob))), 0.0F, 1.0F);
+    if (collect_candidates) {
+        const std::size_t k = static_cast<std::size_t>(std::min(top_k, kMaxTopLogprobs));
+        out.candidates.reserve(std::min(k, lp.top_logprobs.size()));
+        for (const auto& [tok, tok_lp] : lp.top_logprobs) {
+            if (tok < 0 || std::isnan(tok_lp) || (std::isinf(tok_lp) && tok_lp > 0.0F)) {
+                continue;
+            }
+            const float p = std::isinf(tok_lp)
+                                ? 0.0F
+                                : std::clamp(static_cast<float>(std::exp(static_cast<double>(tok_lp))), 0.0F, 1.0F);
+            if (p <= 0.0F) {
+                continue;
+            }
+            out.candidates.emplace_back(tok, p);
+        }
+        std::sort(out.candidates.begin(), out.candidates.end(), [](const auto& a, const auto& b) {
+            if (a.second != b.second) return a.second > b.second;
+            return a.first < b.first;
+        });
+        if (out.candidates.size() > k) {
+            out.candidates.resize(k);
+        }
+    }
+    out.valid = true;
+    out.probability = chosen_p;
+    out.post_sampling = false;
+    return out;
+}
+
+SampledProbInfo ComputePostSamplingProbInfo(std::span<const CandidateLogitProb> candidates, bool has_probs,
+                                            Token chosen_token, std::int32_t top_k, bool collect_candidates) {
+    SampledProbInfo out;
+    if (candidates.empty() || chosen_token < 0 || top_k <= 0) {
+        return out;
+    }
+    const std::size_t k =
+        collect_candidates
+            ? std::min<std::size_t>(static_cast<std::size_t>(std::min(top_k, kMaxTopLogprobs)), candidates.size())
+            : 0u;
+
+    auto insert_top = [&](std::vector<std::pair<Token, float>>& best, Token tok, float score) {
+        if (k == 0u) return;
+        if (best.size() < k) {
+            best.emplace_back(tok, score);
+            std::size_t j = best.size() - 1;
+            while (j > 0 && (best[j].second > best[j - 1].second ||
+                             (best[j].second == best[j - 1].second && best[j].first < best[j - 1].first))) {
+                std::swap(best[j], best[j - 1]);
+                --j;
+            }
+        } else if (score > best.back().second || (score == best.back().second && tok < best.back().first)) {
+            best.back() = {tok, score};
+            std::size_t j = k - 1;
+            while (j > 0 && (best[j].second > best[j - 1].second ||
+                             (best[j].second == best[j - 1].second && best[j].first < best[j - 1].first))) {
+                std::swap(best[j], best[j - 1]);
+                --j;
+            }
+        }
+    };
+
+    if (has_probs) {
+        bool found_chosen = false;
+        float chosen_p = 0.0F;
+        std::vector<std::pair<Token, float>> best;
+        if (k > 0u) {
+            best.reserve(k);
+        }
+        for (const CandidateLogitProb& c : candidates) {
+            if (c.id < 0 || !std::isfinite(c.p) || c.p < 0.0F) {
+                continue;
+            }
+            const float clamped = std::clamp(c.p, 0.0F, 1.0F);
+            if (c.id == chosen_token && !found_chosen) {
+                found_chosen = true;
+                chosen_p = clamped;
+                if (k == 0u) {
+                    break;
+                }
+            }
+            if (k > 0u && clamped > 0.0F) {
+                insert_top(best, c.id, clamped);
+            }
+        }
+        if (!found_chosen) {
+            return out;
+        }
+        out.valid = true;
+        out.probability = chosen_p;
+        out.post_sampling = true;
+        out.candidates = std::move(best);
+        return out;
+    }
+
+    // Softmax over finite/+inf post-processor logits (e.g. greedy path).
+    float max_logit = -std::numeric_limits<float>::infinity();
+    bool any_finite = false;
+    std::size_t pos_inf_count = 0;
+    bool found_chosen = false;
+    float chosen_logit = -std::numeric_limits<float>::infinity();
+    for (const CandidateLogitProb& c : candidates) {
+        if (c.id < 0 || std::isnan(c.logit)) {
+            continue;
+        }
+        if (std::isinf(c.logit)) {
+            if (c.logit > 0.0F) {
+                ++pos_inf_count;
+                if (c.id == chosen_token && !found_chosen) {
+                    found_chosen = true;
+                    chosen_logit = c.logit;
+                }
+            }
+            continue;
+        }
+        if (!any_finite || c.logit > max_logit) {
+            max_logit = c.logit;
+            any_finite = true;
+        }
+        if (c.id == chosen_token && !found_chosen) {
+            found_chosen = true;
+            chosen_logit = c.logit;
+        }
+    }
+    if (!found_chosen) {
+        return out;
+    }
+
+    if (pos_inf_count > 0u) {
+        const float share = std::clamp(1.0F / static_cast<float>(pos_inf_count), 0.0F, 1.0F);
+        std::vector<std::pair<Token, float>> best;
+        if (k > 0u) {
+            best.reserve(k);
+            for (const CandidateLogitProb& c : candidates) {
+                if (c.id >= 0 && std::isinf(c.logit) && c.logit > 0.0F) {
+                    insert_top(best, c.id, share);
+                }
+            }
+        }
+        out.valid = true;
+        out.probability = (std::isinf(chosen_logit) && chosen_logit > 0.0F) ? share : 0.0F;
+        out.post_sampling = true;
+        out.candidates = std::move(best);
+        return out;
+    }
+
+    if (!any_finite || !std::isfinite(chosen_logit)) {
+        return out;
+    }
+
+    std::vector<std::pair<Token, float>> best_logits;
+    if (k > 0u) {
+        best_logits.reserve(k);
+    }
+    double sum_exp = 0.0;
+    for (const CandidateLogitProb& c : candidates) {
+        if (c.id < 0 || !std::isfinite(c.logit)) {
+            continue;
+        }
+        sum_exp += std::exp(static_cast<double>(c.logit) - static_cast<double>(max_logit));
+        if (k > 0u) {
+            insert_top(best_logits, c.id, c.logit);
+        }
+    }
+    if (!(sum_exp > 0.0) || !std::isfinite(sum_exp)) {
+        return out;
+    }
+
+    out.valid = true;
+    out.probability = std::clamp(
+        static_cast<float>(std::exp(static_cast<double>(chosen_logit) - static_cast<double>(max_logit)) / sum_exp),
+        0.0F, 1.0F);
+    out.post_sampling = true;
+    if (k > 0u) {
+        out.candidates.reserve(best_logits.size());
+        for (const auto& [tok, raw_l] : best_logits) {
+            const float p = std::clamp(
+                static_cast<float>(std::exp(static_cast<double>(raw_l) - static_cast<double>(max_logit)) / sum_exp),
+                0.0F, 1.0F);
+            if (p > 0.0F) {
+                out.candidates.emplace_back(tok, p);
+            }
+        }
+    }
+    return out;
+}
+
+SampledProbInfo ComputePostSamplingProbInfoFromDenseProbs(std::span<const double> probs, Token chosen_token,
+                                                          std::int32_t top_k, bool collect_candidates) {
+    SampledProbInfo out;
+    if (probs.empty() || chosen_token < 0 || static_cast<std::size_t>(chosen_token) >= probs.size() || top_k <= 0) {
+        return out;
+    }
+    const double chosen_raw = probs[static_cast<std::size_t>(chosen_token)];
+    if (!std::isfinite(chosen_raw) || chosen_raw < 0.0) {
+        return out;
+    }
+    out.valid = true;
+    out.probability = std::clamp(static_cast<float>(chosen_raw), 0.0F, 1.0F);
+    out.post_sampling = true;
+    if (!collect_candidates) {
+        return out;
+    }
+    const std::size_t k = std::min<std::size_t>(static_cast<std::size_t>(std::min(top_k, kMaxTopLogprobs)), probs.size());
+    out.candidates.reserve(k);
+    for (std::size_t v = 0; v < probs.size(); ++v) {
+        const double raw = probs[v];
+        if (!std::isfinite(raw) || raw <= 0.0) {
+            continue;
+        }
+        const float p = std::clamp(static_cast<float>(raw), 0.0F, 1.0F);
+        if (p <= 0.0F) {
+            continue;
+        }
+        const Token tok = static_cast<Token>(v);
+        if (out.candidates.size() < k) {
+            out.candidates.emplace_back(tok, p);
+            std::size_t j = out.candidates.size() - 1;
+            while (j > 0 && (out.candidates[j].second > out.candidates[j - 1].second ||
+                             (out.candidates[j].second == out.candidates[j - 1].second &&
+                              out.candidates[j].first < out.candidates[j - 1].first))) {
+                std::swap(out.candidates[j], out.candidates[j - 1]);
+                --j;
+            }
+        } else if (p > out.candidates.back().second ||
+                   (p == out.candidates.back().second && tok < out.candidates.back().first)) {
+            out.candidates.back() = {tok, p};
+            std::size_t j = k - 1;
+            while (j > 0 && (out.candidates[j].second > out.candidates[j - 1].second ||
+                             (out.candidates[j].second == out.candidates[j - 1].second &&
+                              out.candidates[j].first < out.candidates[j - 1].first))) {
+                std::swap(out.candidates[j], out.candidates[j - 1]);
+                --j;
+            }
+        }
+    }
+    return out;
 }
 
 Status ValidateMediaBlobs(const std::vector<std::vector<std::uint8_t>>& media_blobs) {
