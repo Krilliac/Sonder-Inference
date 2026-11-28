@@ -411,7 +411,12 @@ identity only read that cache and never wait on the backend (a hung Ollama
 cannot stall them).
 Top-level `gpus` (additive) reports the live host GPU inventory from
 `enumerate_gpu_devices()` (DXGI on Windows, `amdgpu` sysfs and/or dynamic NVML
-on Linux), cached under a 2 s TTL so health polls never contend on GPU drivers.
+on Linux, enriched with dynamic Vulkan `VK_EXT_memory_budget`/ReBAR/driver
+metadata, PCIe link gen/width and ASPM state when available), cached under a
+2 s TTL so health polls never contend on GPU drivers. Additive GPU telemetry
+fields (`pci_bus_id`, `driver_name`, `driver_build`, `rebar`,
+`shared_memory_bytes`, `warp_size`, `matrix_cores`, `pcie`, `vulkan_heaps`,
+`ggml_device`) are included whenever observed and omitted otherwise.
 A backend that reports runtime observations (a spawned `llamaserver` child, or
 a native `llamaserver` with `adaptive_speculation` enabled) adds
 `backends[].runtime` with `gpu_memory` (Windows PDH, Linux `amdgpu-fdinfo`, or

@@ -50,4 +50,5 @@ include(SonderDoctest)
 add_executable(sonder_cache_tests ${SONDER_CACHE_TEST_SOURCES})
 target_link_libraries(sonder_cache_tests PRIVATE sonder_inference_cache sonder_doctest_main)
 sonder_set_warnings(sonder_cache_tests)
-doctest_discover_tests(sonder_cache_tests TEST_PREFIX "sonder.cache." PROPERTIES TIMEOUT 120)
+doctest_discover_tests(sonder_cache_tests TEST_PREFIX "sonder.cache."
+    PROPERTIES TIMEOUT 120 ENVIRONMENT "SONDER_SKIP_COOPMAT_CANARY=1")

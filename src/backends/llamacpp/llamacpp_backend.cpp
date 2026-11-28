@@ -30,6 +30,7 @@
 #include <vector>
 
 #include "batch_scheduler.hpp"
+#include "sonder/inference/coopmat_canary.hpp"
 #include "device_health.hpp"
 #include "grammar_retry.hpp"
 #include "embed_batch_planner.hpp"
@@ -84,6 +85,83 @@ namespace {
 
 std::atomic<LogSink> g_log_sink{nullptr};
 
+struct GgmlDeviceLineRegistry {
+    static constexpr std::size_t kMaxEntries = 64;
+    static constexpr std::size_t kMaxPendingBytes = 2048;
+
+    std::mutex mutex;
+    std::atomic<bool> has_pending{false};
+    std::string pending;
+    std::vector<sonder::inference::GgmlDeviceTelemetry> entries;
+
+    void Feed(LogLevel level, const char* text) {
+        if (text == nullptr || text[0] == '\0') return;
+        // Lock-free fast path: skip mutex on ordinary log traffic when no
+        // partial ggml_ device line is pending.
+        if (!has_pending.load(std::memory_order_acquire) && std::strstr(text, "ggml_") == nullptr) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(mutex);
+        if (level != LogLevel::kCont) {
+            pending.clear();
+            has_pending.store(false, std::memory_order_release);
+            if (std::strstr(text, "ggml_") == nullptr) {
+                return;
+            }
+        }
+        const std::string_view chunk(text);
+        std::size_t pos = 0;
+        while (pos < chunk.size()) {
+            const std::size_t nl = chunk.find('\n', pos);
+            const std::string_view part =
+                nl == std::string_view::npos ? chunk.substr(pos) : chunk.substr(pos, nl - pos);
+            if (pending.size() < kMaxPendingBytes) {
+                const std::size_t take = std::min(part.size(), kMaxPendingBytes - pending.size());
+                pending.append(part.data(), take);
+            }
+            if (nl == std::string_view::npos) {
+                has_pending.store(!pending.empty(), std::memory_order_release);
+                break;
+            }
+            if (auto parsed = sonder::inference::parse_ggml_device_line(pending)) {
+                sonder::inference::register_ggml_device_telemetry(*parsed);
+                bool updated = false;
+                for (auto& existing : entries) {
+                    if (existing.backend == parsed->backend && existing.index == parsed->index &&
+                        existing.device_name == parsed->device_name) {
+                        existing = std::move(*parsed);
+                        updated = true;
+                        break;
+                    }
+                }
+                if (!updated && entries.size() < kMaxEntries) {
+                    entries.push_back(std::move(*parsed));
+                }
+            }
+            pending.clear();
+            has_pending.store(false, std::memory_order_release);
+            pos = nl + 1;
+        }
+    }
+
+    std::vector<sonder::inference::GgmlDeviceTelemetry> Snapshot() {
+        std::lock_guard<std::mutex> lock(mutex);
+        return entries;
+    }
+
+    void Clear() noexcept {
+        std::lock_guard<std::mutex> lock(mutex);
+        pending.clear();
+        has_pending.store(false, std::memory_order_release);
+        entries.clear();
+    }
+};
+
+GgmlDeviceLineRegistry& DeviceLineRegistry() {
+    static GgmlDeviceLineRegistry registry;
+    return registry;
+}
+
 }  // namespace
 
 void SetLogSink(LogSink sink) noexcept { g_log_sink.store(sink, std::memory_order_release); }
@@ -91,6 +169,9 @@ void SetLogSink(LogSink sink) noexcept { g_log_sink.store(sink, std::memory_orde
 // llama.cpp logs verbosely to stderr by default. Keep warnings and errors;
 // set SONDER_LLAMACPP_VERBOSE=1 to see everything.
 void RouteLog(LogLevel level, const char* text) {
+    if (text != nullptr) {
+        DeviceLineRegistry().Feed(level, text);
+    }
     static const bool verbose = [] {
         const char* v = std::getenv("SONDER_LLAMACPP_VERBOSE");
         return v != nullptr && v[0] != '\0' && v[0] != '0';
@@ -175,6 +256,38 @@ void EnsureBackendInitialized() {
     static std::once_flag once;
     std::call_once(once, [] {
         llama_log_set(&LogCallback, nullptr);
+#if defined(_WIN32)
+        const char* skip_canary = std::getenv("SONDER_SKIP_COOPMAT_CANARY");
+        if (skip_canary == nullptr || skip_canary[0] == '\0' || skip_canary[0] == '0') {
+            const std::string helper_exe = sonder::inference::find_coopmat_canary_executable();
+            const auto gpus = sonder::inference::enumerate_gpu_devices();
+            if (!helper_exe.empty()) {
+                sonder::inference::CoopmatCanaryOptions opts;
+                opts.is_windows = true;
+                opts.executable_path = helper_exe;
+                opts.apply_env_fallback = true;
+                opts.fail_closed_on_runner_error = true;
+                const auto decision = sonder::inference::evaluate_amd_coopmat_canary(gpus, opts);
+                sonder::inference::record_coopmat_canary_decision(decision);
+                if (decision.disable_coopmat &&
+                    decision.status != sonder::inference::CoopmatCanaryStatus::skipped_env_disabled) {
+                    const std::string msg =
+                        "sonder-inference: AMD Windows Vulkan coopmat canary triggered GGML_VK_DISABLE_COOPMAT=1 (" +
+                        decision.reason + ")\n";
+                    RouteLog(LogLevel::kWarn, msg.c_str());
+                }
+            } else {
+                for (const auto& gpu : gpus) {
+                    if (sonder::inference::needs_amd_windows_coopmat_canary(gpu, true)) {
+                        RouteLog(LogLevel::kInfo,
+                                 "sonder-inference: AMD Windows Vulkan coopmat canary skipped (sonder-infer "
+                                 "executable not found alongside binary; set SONDER_INFER_EXE to enable)\n");
+                        break;
+                    }
+                }
+            }
+        }
+#endif
         llama_backend_init();
     });
 }
@@ -2999,6 +3112,7 @@ std::string_view LlamaCppBackend::UpstreamVersion() noexcept { return SONDER_LLA
 
 std::vector<DeviceInfo> LlamaCppBackend::EnumerateDevices() {
     EnsureBackendInitialized();
+    const auto captured = DeviceLineRegistry().Snapshot();
     std::vector<DeviceInfo> out;
     const std::size_t count = ggml_backend_dev_count();
     out.reserve(count);
@@ -3015,10 +3129,32 @@ std::vector<DeviceInfo> LlamaCppBackend::EnumerateDevices() {
         ggml_backend_dev_memory(dev, &free_b, &total_b);
         info.memory_free_bytes = free_b;
         info.memory_total_bytes = total_b;
+        // Attach parsed ggml_vulkan device telemetry when available.
+        if (info.name.rfind("Vulkan", 0) == 0 && info.name.size() > 6) {
+            const std::string_view suffix(info.name.data() + 6, info.name.size() - 6);
+            if (const auto idx = sonder::inference::parse_strict_u64(suffix)) {
+                for (const auto& line : captured) {
+                    if (line.backend == "vulkan" && line.index.has_value() &&
+                        static_cast<std::uint64_t>(*line.index) == *idx) {
+                        info.telemetry = line;
+                        break;
+                    }
+                }
+            }
+        }
         info.device_id = props.device_id != nullptr ? NormalizePciBusId(props.device_id) : std::string();
         out.push_back(std::move(info));
     }
     return out;
+}
+
+std::vector<sonder::inference::GgmlDeviceTelemetry> LlamaCppBackend::CapturedGgmlDevices() {
+    return DeviceLineRegistry().Snapshot();
+}
+
+void LlamaCppBackend::ClearCapturedGgmlDevices() noexcept {
+    DeviceLineRegistry().Clear();
+    sonder::inference::clear_registered_ggml_device_telemetry();
 }
 
 std::string LlamaCppBackend::SystemInfo() {

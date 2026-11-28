@@ -24,6 +24,7 @@ sonder_add_module_tests(core
     test_cli_repl.cpp
     test_priority_runtime.cpp
     test_device_memory.cpp
+    test_coopmat_canary.cpp
     test_device_diagnostics.cpp
     test_http_client.cpp
     test_recurrent_checkpoints.cpp
@@ -152,7 +153,7 @@ if(SONDER_BUILD_CLI)
         add_test(NAME sonder.cli.${name}
             COMMAND "${CMAKE_COMMAND}" -E env
                 --unset=SONDER_INFER_BACKEND --unset=SONDER_INFER_MODEL --unset=SONDER_OLLAMA_URL
-                --unset=OLLAMA_HOST ${T_ENV}
+                --unset=OLLAMA_HOST SONDER_SKIP_COOPMAT_CANARY=1 ${T_ENV}
                 "${CMAKE_COMMAND}" ${defs} -P "${CMAKE_CURRENT_SOURCE_DIR}/cli_expect.cmake" -- ${T_COMMAND})
         set_tests_properties(sonder.cli.${name} PROPERTIES TIMEOUT 90)
     endfunction()
@@ -167,7 +168,8 @@ if(SONDER_BUILD_CLI)
     add_test(NAME sonder.cli.generate_mock
         COMMAND sonder-infer generate --backend mock --model mock:tiny --prompt "hello sonder"
                 --max-tokens 8 --telemetry "${CMAKE_CURRENT_BINARY_DIR}/cli-generate.jsonl")
-    set_tests_properties(sonder.cli.version sonder.cli.devices sonder.cli.generate_mock PROPERTIES TIMEOUT 60)
+    set_tests_properties(sonder.cli.version sonder.cli.devices sonder.cli.generate_mock PROPERTIES
+        TIMEOUT 60 ENVIRONMENT "SONDER_SKIP_COOPMAT_CANARY=1")
     sonder_cli_test(rejects_bad_sampling RC 2 STDERR_REGEX "temperature must be finite"
         COMMAND ${infer} generate ${mock} --prompt x --temperature -1)
 
@@ -176,7 +178,8 @@ if(SONDER_BUILD_CLI)
         COMMAND sonder-infer generate --backend mock --model mock:tiny --prompt "hello sonder" --max-tokens 4
                 --typical-p 0.9 --repeat-last-n -1 --presence-penalty 0.5 --frequency-penalty 0.25
                 --num-ctx 512 --logit-bias "1:-inf,2:1.5")
-    set_tests_properties(sonder.cli.generate_sampling_flags PROPERTIES TIMEOUT 60)
+    set_tests_properties(sonder.cli.generate_sampling_flags PROPERTIES
+        TIMEOUT 60 ENVIRONMENT "SONDER_SKIP_COOPMAT_CANARY=1")
     sonder_cli_test(rejects_bad_logit_bias RC 2 STDERR_REGEX "logit_bias values must be within"
         COMMAND ${infer} generate ${mock} --prompt x --logit-bias 1:500)
     sonder_cli_test(rejects_malformed_logit_bias RC 2 STDERR_REGEX "invalid --logit-bias entry 'oops'"
@@ -188,6 +191,7 @@ if(SONDER_BUILD_CLI)
     add_test(NAME sonder.cli.chat_messages_mock
         COMMAND sonder-infer chat --backend mock --model mock:tiny --max-tokens 6 --messages "${chat_fixture}")
     set_tests_properties(sonder.cli.chat_messages_mock PROPERTIES TIMEOUT 60
+        ENVIRONMENT "SONDER_SKIP_COOPMAT_CANARY=1"
         PASS_REGULAR_EXPRESSION "chat native=no messages=4 outcome=completed stop=max_tokens")
     sonder_cli_test(chat_rejects_bad_role RC 2 STDERR_REGEX "unknown role"
         COMMAND ${infer} chat ${mock} --messages "${CMAKE_CURRENT_SOURCE_DIR}/fixtures/chat_messages_bad_role.json")
@@ -201,6 +205,7 @@ if(SONDER_BUILD_CLI)
                     --corpus "${PROJECT_SOURCE_DIR}/bench/corpus/smoke.json"
                     --out "${CMAKE_CURRENT_BINARY_DIR}/cli-bench-md.json" --warmup 0 --runs 1)
         set_tests_properties(sonder.cli.bench_markdown_mock PROPERTIES TIMEOUT 60
+            ENVIRONMENT "SONDER_SKIP_COOPMAT_CANARY=1"
             PASS_REGULAR_EXPRESSION "wrote [^\n]*cli-bench-md\\.md")
     endif()
 
@@ -211,7 +216,7 @@ if(SONDER_BUILD_CLI)
     sonder_cli_test(unknown_command RC 2 STDERR_REGEX "unknown command 'genrate' \\(did you mean 'generate'\\?\\)"
         COMMAND ${infer} genrate)
     sonder_cli_test(help_unknown_command RC 2 STDERR_REGEX "unknown command 'nope'" COMMAND ${infer} help nope)
-    set(help_commands version devices backends models generate chat bench reblock-pq2 help)
+    set(help_commands version devices coopmat-canary backends models generate chat bench reblock-pq2 help)
     if(sonder_cli_has_server)
         list(APPEND help_commands serve)
     endif()
@@ -293,6 +298,10 @@ if(SONDER_BUILD_CLI)
     sonder_cli_test(version_json_commit RC 0 STDOUT_REGEX "\"commit\":\"(unknown|[0-9a-f]+)\""
         COMMAND ${infer} version --json)
     sonder_cli_test(devices_json RC 0 STDOUT_JSON STDOUT_REGEX "\"platform\":\"[^\"]+\",\"devices\":" COMMAND ${infer} devices --json)
+    sonder_cli_test(coopmat_canary_missing_vendor RC 2 STDERR_REGEX "--vendor-id is required"
+        COMMAND ${infer} coopmat-canary --device-id 0x7590)
+    sonder_cli_test(coopmat_canary_bad_ubatch RC 2 STDERR_REGEX "out of range"
+        COMMAND ${infer} coopmat-canary --vendor-id 0x1002 --device-id 0x7590 --ubatch 4)
     # The mock backend is always available; an absent Ollama is reported, not fatal.
     sonder_cli_test(backends_json RC 0 STDOUT_JSON
         STDOUT_REGEX "\"name\":\"mock\",\"available\":true"

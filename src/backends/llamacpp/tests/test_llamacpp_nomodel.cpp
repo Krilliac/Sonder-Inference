@@ -668,3 +668,58 @@ TEST_CASE("llamacpp wrapper: SwaKvMode defaults to Full, opts into compact swa_f
     bad_swa.swa_kv_mode = static_cast<sonder::inference::SwaKvMode>(99);
     CHECK(ValidateContextOptions(bad_swa).code == ErrorCode::kInvalidArgument);
 }
+
+TEST_CASE("NAT-08: RouteLog captures ggml_vulkan device lines at DEBUG level including chunked lines") {
+    LlamaCppBackend::ClearCapturedGgmlDevices();
+
+    // Emitted at DEBUG (normally filtered from stderr when SONDER_LLAMACPP_VERBOSE is unset).
+    RouteLog(LogLevel::kDebug,
+             "ggml_vulkan: 0 = AMD Radeon RX 9060 XT (AMD proprietary driver) | uma: 0 | rebar: 1 | "
+             "fp16: 1 | bf16: 1 | fp4: 0 | warp size: 64 | shared memory: 32768 | int dot: 1 | "
+             "matrix cores: KHR_coopmat\n");
+    // Chunked across kDebug + kCont (pre-b12171 without rebar).
+    RouteLog(LogLevel::kDebug, "ggml_vulkan: 1 = AMD Radeon 780M Graphics (AMD proprietary driver) | uma: 1 | ");
+    RouteLog(LogLevel::kCont,
+             "fp16: 1 | bf16: 0 | fp4: 0 | warp size: 32 | shared memory: 32768 | int dot: 1 | "
+             "matrix cores: none\n");
+    // Non-device lines must not pollute the captured list, and an unterminated
+    // ggml_ prefix interrupted by an unrelated non-kCont line must clear cleanly.
+    RouteLog(LogLevel::kDebug, "ggml_vulkan: Found 2 Vulkan devices:\n");
+    RouteLog(LogLevel::kDebug, "ordinary debug log line without backend prefix\n");
+    RouteLog(LogLevel::kCont, "continuation of ordinary log line\n");
+    RouteLog(LogLevel::kDebug, "ggml_vulkan: 9 = Unterminated Partial ");
+    RouteLog(LogLevel::kInfo, "unrelated info line interrupts partial\n");
+    RouteLog(LogLevel::kCont, "| uma: 1 | warp size: 64 | shared memory: 32768 | matrix cores: none\n");
+
+    const auto captured = LlamaCppBackend::CapturedGgmlDevices();
+    REQUIRE(captured.size() == 2u);
+    CHECK(captured[0].index == std::optional<std::uint32_t>(0u));
+    CHECK(captured[0].device_name == "AMD Radeon RX 9060 XT");
+    CHECK(captured[0].rebar == std::optional<bool>(true));
+    CHECK(captured[0].matrix_cores == "KHR_coopmat");
+    CHECK(captured[1].index == std::optional<std::uint32_t>(1u));
+    CHECK(captured[1].device_name == "AMD Radeon 780M Graphics");
+    CHECK(captured[1].uma == std::optional<bool>(true));
+    CHECK_FALSE(captured[1].rebar.has_value());
+    CHECK(captured[1].matrix_cores == "none");
+
+    // Re-emitting the same device index updates in place rather than duplicating.
+    RouteLog(LogLevel::kDebug,
+             "ggml_vulkan: 0 = AMD Radeon RX 9060 XT (AMD proprietary driver) | uma: 0 | rebar: 1 | "
+             "fp16: 1 | bf16: 1 | fp4: 0 | warp size: 64 | shared memory: 32768 | int dot: 1 | "
+             "matrix cores: none\n");
+    const auto updated = LlamaCppBackend::CapturedGgmlDevices();
+    REQUIRE(updated.size() == 2u);
+    CHECK(updated[0].matrix_cores == "none");
+
+    // RouteLog also publishes parsed lines into the core device registry so
+    // enumerate_gpu_devices() / health / telemetry surface ggml_device automatically.
+    const auto core_reg = sonder::inference::registered_ggml_device_telemetry();
+    REQUIRE(core_reg.size() == 2u);
+    CHECK(core_reg[0].matrix_cores == "none");
+    CHECK(core_reg[1].device_name == "AMD Radeon 780M Graphics");
+
+    LlamaCppBackend::ClearCapturedGgmlDevices();
+    CHECK(LlamaCppBackend::CapturedGgmlDevices().empty());
+    CHECK(sonder::inference::registered_ggml_device_telemetry().empty());
+}

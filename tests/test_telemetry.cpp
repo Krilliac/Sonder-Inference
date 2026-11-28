@@ -1995,6 +1995,111 @@ TEST_CASE("session separates logical KvCacheManager reuse from physical tiers an
     }
 }
 
+TEST_CASE("NAT-08: gpu_memory_sample_attributes emits additive device telemetry fields cleanly") {
+    constexpr std::uint64_t kMiB = 1024ull * 1024ull;
+    constexpr std::uint64_t kGiB = 1024ull * kMiB;
+
+    GpuDeviceInfo rx9060;
+    rx9060.id = "gpu:0";
+    rx9060.name = "AMD Radeon RX 9060 XT";
+    rx9060.vendor = GpuVendor::amd;
+    rx9060.vendor_id = 0x1002u;
+    rx9060.device_id = 0x7590u;
+    rx9060.dedicated_total = MemoryReading::known(16ull * kGiB);
+    rx9060.dedicated_free = MemoryReading::known(15ull * kGiB);
+    rx9060.shared_total = MemoryReading::known(24ull * kGiB);
+    rx9060.is_integrated_uma = false;
+    rx9060.backend_hint = "vulkan";
+    rx9060.source = "dxgi";
+    rx9060.pci_bus_id = "0000:03:00.0";
+    rx9060.driver_name = "AMD proprietary driver";
+    rx9060.driver_build = "25.10.2 (32.0.21025.1024)";
+    rx9060.rebar = true;
+    rx9060.shared_memory_bytes = 32768ull;
+    rx9060.warp_size = 64u;
+    rx9060.matrix_cores = "KHR_coopmat";
+    rx9060.pcie.current_gen = 5u;
+    rx9060.pcie.current_width = 16u;
+    rx9060.pcie.max_gen = 5u;
+    rx9060.pcie.max_width = 16u;
+    rx9060.pcie.aspm_state = "off";
+    rx9060.pcie.aspm_source = "windows_power_plan";
+
+    VulkanMemoryHeapInfo heap0;
+    heap0.heap_index = 0u;
+    heap0.size_bytes = 16ull * kGiB;
+    heap0.budget_bytes = MemoryReading::known(15ull * kGiB);
+    heap0.usage_bytes = MemoryReading::known(512ull * kMiB);
+    heap0.device_local = true;
+    heap0.host_visible = true;
+    heap0.host_coherent = true;
+    rx9060.vulkan_heaps.push_back(heap0);
+
+    const auto ggml_line = parse_ggml_device_line(
+        "ggml_vulkan: 0 = AMD Radeon RX 9060 XT (AMD proprietary driver) | uma: 0 | rebar: 1 | "
+        "fp16: 1 | bf16: 1 | fp4: 0 | warp size: 64 | shared memory: 32768 | int dot: 1 | "
+        "matrix cores: KHR_coopmat");
+    REQUIRE(ggml_line.has_value());
+    rx9060.ggml_device = *ggml_line;
+
+    const json::Object attrs = gpu_memory_sample_attributes(rx9060);
+    REQUIRE(attrs.find("driver_name") != nullptr);
+    CHECK(attrs.find("driver_name")->as_string() == "AMD proprietary driver");
+    REQUIRE(attrs.find("driver_build") != nullptr);
+    CHECK(attrs.find("driver_build")->as_string() == "25.10.2 (32.0.21025.1024)");
+    REQUIRE(attrs.find("pci_bus_id") != nullptr);
+    CHECK(attrs.find("pci_bus_id")->as_string() == "0000:03:00.0");
+    REQUIRE(attrs.find("rebar") != nullptr);
+    CHECK(attrs.find("rebar")->as_bool());
+    REQUIRE(attrs.find("shared_memory_bytes") != nullptr);
+    CHECK(attrs.find("shared_memory_bytes")->as_uint() == 32768ull);
+    REQUIRE(attrs.find("warp_size") != nullptr);
+    CHECK(attrs.find("warp_size")->as_uint() == 64ull);
+    REQUIRE(attrs.find("matrix_cores") != nullptr);
+    CHECK(attrs.find("matrix_cores")->as_string() == "KHR_coopmat");
+
+    const json::Value* pcie = attrs.find("pcie");
+    REQUIRE(pcie != nullptr);
+    REQUIRE(pcie->is_object());
+    CHECK(pcie->find("current_gen")->as_uint() == 5ull);
+    CHECK(pcie->find("current_width")->as_uint() == 16ull);
+    CHECK(pcie->find("max_gen")->as_uint() == 5ull);
+    CHECK(pcie->find("max_width")->as_uint() == 16ull);
+    CHECK(pcie->find("aspm_state")->as_string() == "off");
+    CHECK(pcie->find("aspm_source")->as_string() == "windows_power_plan");
+
+    const json::Value* heaps = attrs.find("vulkan_heaps");
+    REQUIRE(heaps != nullptr);
+    REQUIRE(heaps->is_array());
+    REQUIRE(heaps->as_array().size() == 1u);
+    const json::Value& h0 = heaps->as_array()[0];
+    CHECK(h0.find("heap_index")->as_uint() == 0ull);
+    CHECK(h0.find("size_bytes")->as_uint() == 16ull * kGiB);
+    CHECK(h0.find("budget_bytes")->as_uint() == 15ull * kGiB);
+    CHECK(h0.find("usage_bytes")->as_uint() == 512ull * kMiB);
+    CHECK(h0.find("device_local")->as_bool());
+    CHECK(h0.find("host_visible")->as_bool());
+    CHECK(h0.find("host_coherent")->as_bool());
+
+    const json::Value* ggml = attrs.find("ggml_device");
+    REQUIRE(ggml != nullptr);
+    REQUIRE(ggml->is_object());
+    CHECK(ggml->find("backend")->as_string() == "vulkan");
+    CHECK(ggml->find("rebar")->as_bool());
+    CHECK(ggml->find("matrix_cores")->as_string() == "KHR_coopmat");
+    CHECK(ggml->find("shared_memory_bytes")->as_uint() == 32768ull);
+
+    // Unset NAT-08 fields are omitted so existing minimal payloads stay compact.
+    GpuDeviceInfo minimal;
+    minimal.id = "gpu:1";
+    minimal.name = "Minimal";
+    const json::Object min_attrs = gpu_memory_sample_attributes(minimal);
+    CHECK(min_attrs.find("driver_build") == nullptr);
+    CHECK(min_attrs.find("rebar") == nullptr);
+    CHECK(min_attrs.find("pcie") == nullptr);
+    CHECK(min_attrs.find("vulkan_heaps") == nullptr);
+    CHECK(min_attrs.find("ggml_device") == nullptr);
+}
 #if defined(SONDER_HAS_SAMPLER_CHAIN)
 TEST_CASE("VIS-03: Sonder sampler emits inference.sampling.candidates with bounds and opt-in text") {
     auto run_sonder = [](TelemetryOptions telemetry, const SamplingConfig& sampling, bool use_chat = false,
