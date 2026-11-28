@@ -18,6 +18,7 @@
 #include <utility>
 #include <vector>
 
+#include "sonder/backends/llamacpp/aux_stream_gate.hpp"
 #include "sonder/inference/model_architecture.hpp"
 #include "sonder/inference/request_priority.hpp"
 #include "sonder/inference/speculative_verifier.hpp"
@@ -267,6 +268,12 @@ struct LoadOptions {
     std::uint32_t embed_batch_tokens = kDefaultEmbedBatchTokens;
     // Maximum sequences packed per embedding/rerank forward pass (0 = auto, max kMaxEmbedSequences).
     std::uint32_t embed_max_sequences = kDefaultEmbedMaxSequences;
+    // In-process workload role, CUDA stream priorities, and decode-aware auxiliary gate (NAT-12).
+    WorkloadRole workload_role = WorkloadRole::kMainDecode;
+    StreamPriority main_stream_priority = StreamPriority::kHigh;
+    StreamPriority aux_stream_priority = StreamPriority::kLow;
+    AuxGateConfig aux_gate{};
+    std::shared_ptr<DecodeAwareAuxGate> shared_aux_gate = nullptr;
     // Opt-in startup greedy smoke test (default off): after a successful load
     // Load() decodes a short fixed prompt greedily and fails the load with
     // kLoadFailed when logits are non-finite/uniform, step 0 emits an immediate
@@ -680,6 +687,8 @@ struct EmbedOutput {
     std::size_t dimensions = 0;
     PoolingType pooling = PoolingType::kUnspecified;
     std::size_t batches_executed = 0;
+    std::size_t gated_slices = 0;
+    double gate_wait_ms = 0.0;
 };
 
 struct ScoreOutput {
@@ -687,6 +696,8 @@ struct ScoreOutput {
     std::int32_t prompt_tokens = 0;
     double eval_ms = 0.0;
     std::size_t batches_executed = 0;
+    std::size_t gated_slices = 0;
+    double gate_wait_ms = 0.0;
 };
 
 enum class DeviceKind { kCpu, kGpu, kIntegratedGpu, kAccelerator, kOther };
@@ -969,6 +980,8 @@ public:
     void SetKvTelemetry(std::shared_ptr<KvTelemetry> kv);
     void SetGraphEvalSink(GraphEvalSink sink);
     [[nodiscard]] PrefixCoalescerStats GetPrefixCoalescerStats() const noexcept;
+    [[nodiscard]] std::shared_ptr<DecodeAwareAuxGate> GetAuxGate() const noexcept;
+    [[nodiscard]] std::string GetAuxExecutionDomain() const;
     [[nodiscard]] PrefixCheckpointCounters GetPrefixCheckpointStats() const noexcept;
 
 private:

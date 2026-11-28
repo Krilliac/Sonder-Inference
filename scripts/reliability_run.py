@@ -266,7 +266,10 @@ class Sampler(threading.Thread):
             self.stop_event.wait(delay)
 
     def sample_once(self):
-        now = time.time()
+        # Every relative value and rate uses the monotonic clock (self.t0 is a time.monotonic() origin), so a
+        # wall-clock step cannot reorder or negate them. time.time() is kept only for the absolute "t" field.
+        wall = time.time()
+        now = time.monotonic()
         targets = list(self.pids)
         if self.pid_file:
             file_pid = read_pid_file(self.pid_file)
@@ -277,7 +280,7 @@ class Sampler(threading.Thread):
                 targets.append(file_pid)
             else:
                 self.pid_missing_samples += 1
-        row = {"t": round(now, 3), "t_rel": round(now - self.t0, 3), "host": host_memory(),
+        row = {"t": round(wall, 3), "t_rel": round(now - self.t0, 3), "host": host_memory(),
                "vram_used_mib": vram_used_mib(), "processes": []}
         for pid in targets:
             counters = process_counters(pid)
@@ -574,7 +577,7 @@ def run(args, stop_event=None, seams=None):
     headers = parse_headers(args.header, getattr(args, "header_env", None), os.environ)
     faults = sorted(parse_fault(item) for item in (args.fault or []))
 
-    t0 = time.time()
+    t0 = time.monotonic()  # single origin for every relative timestamp below, the sampler's included
     sampler = seams.get("sampler_class", Sampler)(os.path.join(args.out_dir, "samples.jsonl"),
                                                   args.sample_interval, args.pid or [], args.pid_file, t0)
     sampler.start()
@@ -590,7 +593,7 @@ def run(args, stop_event=None, seams=None):
     fault_windows = []
 
     def log_event(kind, **fields):
-        row = {"t_rel": round(time.time() - t0, 3), "event": kind}
+        row = {"t_rel": round(time.monotonic() - t0, 3), "event": kind}
         row.update(fields)
         with lock:
             events_out.write(json.dumps(row, separators=(",", ":")) + "\n")
@@ -605,13 +608,13 @@ def run(args, stop_event=None, seams=None):
                 index = counter[0]
                 counter[0] += 1
             prompt_id = index % len(prompts)
-            sent = time.time()
+            sent = time.monotonic()
             seam("request_stamped")
             result = run_request(args.base_url, args.model, prompts[prompt_id], args.max_tokens,
                                  args.request_timeout, headers)
             seam("request_returned")
             result.update({"index": index, "prompt_id": prompt_id, "t_rel": round(sent - t0, 3),
-                           "end_rel": round(time.time() - t0, 3)})
+                           "end_rel": round(time.monotonic() - t0, 3)})
             with lock:
                 results.append(result)
                 requests_out.write(json.dumps(result, separators=(",", ":")) + "\n")
@@ -622,7 +625,7 @@ def run(args, stop_event=None, seams=None):
 
     def fault_runner():
         for offset, command in faults:
-            wait = offset - (time.time() - t0)
+            wait = offset - (time.monotonic() - t0)
             if wait > 0 and wait > args.duration:
                 return  # scheduled past the end: it never fires, the gate will fail the run
             end = time.monotonic() + max(0.0, wait)
@@ -631,11 +634,11 @@ def run(args, stop_event=None, seams=None):
             if time.monotonic() >= deadline:
                 return
             try:
-                fault_start = round(time.time() - t0, 3)
+                fault_start = round(time.monotonic() - t0, 3)
                 run_cmd = subprocess.run(shlex.split(command), capture_output=True,
                                          text=True, timeout=60)
                 seam("fault_command_returned")
-                fault_end = round(time.time() - t0, 3)
+                fault_end = round(time.monotonic() - t0, 3)
                 # Record first, log second. The event row carries the window, so whoever reads the row
                 # sees exactly the window the criteria will use, however long this thread is stalled
                 # before, between or after these statements.
@@ -661,7 +664,7 @@ def run(args, stop_event=None, seams=None):
     fault_thread.join(timeout=70)
     sampler.stop()
     requests_out.close()
-    elapsed = time.time() - t0
+    elapsed = time.monotonic() - t0
 
     completed = [r for r in results if r["ok"]]
     failed = [r for r in results if not r["ok"]]
@@ -1430,6 +1433,30 @@ def self_test():
                 expect(window is not None and witnessed and _passed(summary, code)
                        and summary["faults"]["fired"] == 1,
                        "slow fault (%s) did not pass: %s %s" % (tag, summary["faults"], summary["failed_criteria"]))
+            # 4d. Wall-clock step: time.time() jumps back 100 s while a fault command is running (WSL does
+            #     this). Every relative value comes from the monotonic clock, so the window and the request
+            #     rows must stay ordered and non-negative.
+            real_time = time.time
+            stepped_at = real_time() + 0.8
+
+            def stepping_time():
+                now = real_time()
+                return now - 100.0 if now > stepped_at else now
+
+            time.time = stepping_time
+            try:
+                summary, code, window, witnessed = _run_until(
+                    _namespace(base_url=base, duration=60.0, sample_interval=60.0,
+                               out_dir=os.path.join(root, "clockstep"), fault=["0.3:" + slow]), _ok_after)
+            finally:
+                time.time = real_time
+            step_out = os.path.join(root, "clockstep")
+            step_rows = _read_jsonl(os.path.join(step_out, "requests.jsonl"))
+            expect(window is not None and witnessed and summary["faults"]["fired"] == 1
+                   and window[0] <= window[1] and window[0] >= 0 and _window_in_event_row(step_out, summary),
+                   "wall-clock step disordered the fault window: %s" % summary["faults"])
+            expect(bool(step_rows) and all(0 <= r["t_rel"] <= r["end_rel"] for r in step_rows),
+                   "wall-clock step produced a negative or reversed request time")
         finally:
             server.shutdown()
             server.server_close()

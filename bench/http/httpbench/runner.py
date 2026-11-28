@@ -16,6 +16,8 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable
 
 from . import RESULTS_SCHEMA, SCENARIOS_SCHEMA, __version__
+from .agentx import (DEFAULT_CONCURRENCY_LEVELS, DEFAULT_IDLE_GAP_CAP_S, DEFAULT_MAX_CONTEXT_LENGTH,
+                     DEFAULT_TRACE_FIT, TRACE_FIT_MODES, load_and_fit_weka_traces, replay_trace_session)
 from .client import Target, trace_text, validate_headers
 from .gpumem import GpuSampler, spill_check
 from .metrics import (classify_cache_state, derive, group_summary, split_cold_warm_summary,
@@ -70,9 +72,26 @@ BUILTIN_SCENARIOS: dict[str, Any] = {
     ],
 }
 
+AGENTX_SCENARIOS: dict[str, Any] = {
+    "schema": SCENARIOS_SCHEMA,
+    "defaults": {"temperature": 0, "seed": 42},
+    "scenarios": [
+        {
+            "name": "agentx-trace",
+            "kind": "agentx_trace",
+            "trace_path": "bench/http/fixtures/agentx_synthetic_traces.jsonl",
+            "levels": list(DEFAULT_CONCURRENCY_LEVELS),
+            "max_context_length": DEFAULT_MAX_CONTEXT_LENGTH,
+            "trace_fit": DEFAULT_TRACE_FIT,
+            "idle_gap_cap_s": DEFAULT_IDLE_GAP_CAP_S,
+            "sessions_per_user": 1,
+        },
+    ],
+}
+
 KINDS = ("agent_session", "concurrency_sweep", "long_context", "repeat_prompt", "agent_alternate",
          "priority_contention", "concurrency_stall", "single_request", "simultaneous_siblings",
-         "staggered_arrivals", "long_trailing", "warm_tool_return")
+         "staggered_arrivals", "long_trailing", "warm_tool_return", "agentx_trace")
 
 
 def validate_config(cfg: dict) -> list[str]:
@@ -141,6 +160,29 @@ def validate_config(cfg: dict) -> list[str]:
         if s.get("kind") == "warm_tool_return":
             if type(s.get("turns", 4)) is not int or s.get("turns", 4) < 2:
                 errs.append(f"scenarios[{i}].turns must be an integer >= 2")
+        if s.get("kind") == "agentx_trace":
+            tp = s.get("trace_path")
+            if not isinstance(tp, str) or not tp.strip():
+                errs.append(f"scenarios[{i}].trace_path must be a non-empty string")
+            lv = s.get("levels", list(DEFAULT_CONCURRENCY_LEVELS))
+            if not isinstance(lv, list) or not lv or not all(type(x) is int and x > 0 for x in lv):
+                errs.append(f"scenarios[{i}].levels must be a non-empty list of positive integers")
+            mcl = s.get("max_context_length", DEFAULT_MAX_CONTEXT_LENGTH)
+            if type(mcl) is not int or mcl <= 0:
+                errs.append(f"scenarios[{i}].max_context_length must be a positive integer")
+            tf = s.get("trace_fit", DEFAULT_TRACE_FIT)
+            if tf not in TRACE_FIT_MODES:
+                errs.append(f"scenarios[{i}].trace_fit must be one of {TRACE_FIT_MODES}, got {tf!r}")
+            if "max_traces" in s and s["max_traces"] is not None:
+                if type(s["max_traces"]) is not int or s["max_traces"] <= 0:
+                    errs.append(f"scenarios[{i}].max_traces must be a positive integer")
+            spu = s.get("sessions_per_user", 1)
+            if type(spu) is not int or spu <= 0:
+                errs.append(f"scenarios[{i}].sessions_per_user must be a positive integer")
+            for field, default_val in (("idle_gap_cap_s", DEFAULT_IDLE_GAP_CAP_S), ("idle_time_scale", 1.0)):
+                val = s.get(field, default_val)
+                if type(val) not in (int, float) or not math.isfinite(val) or val < 0:
+                    errs.append(f"scenarios[{i}].{field} must be finite and >= 0")
         if "warm_repeat" in s and not isinstance(s["warm_repeat"], bool):
             errs.append(f"scenarios[{i}].warm_repeat must be a boolean")
         for field in ("prefix_tokens", "background_tokens", "interactive_tokens",
@@ -339,7 +381,8 @@ class Runner:
               "simultaneous_siblings": self._simultaneous_siblings,
               "staggered_arrivals": self._staggered_arrivals,
               "long_trailing": self._long_trailing,
-              "warm_tool_return": self._warm_tool_return}[kind]
+              "warm_tool_return": self._warm_tool_return,
+              "agentx_trace": self._agentx_trace}[kind]
         try:
             fn(sc, name, res, t_run0)
         except Exception as e:  # keep the partial scenario; the checks will fail it
@@ -373,6 +416,8 @@ class Runner:
                 res["groups"][group]["metrics"] = rows[0]["metrics"]
         for g, extra in (res.pop("_group_extra", {}) or {}).items():
             res["groups"].setdefault(g, {}).update(extra)
+        if kind == "agentx_trace":
+            res["agentx_summary"] = _build_agentx_summary(res)
         return res
 
     def _maybe_set_baseline(self, sample: dict | None) -> None:
@@ -795,6 +840,134 @@ class Runner:
             history.append(_assistant_history(r))
         res["warm_tool_reuse"] = warm_tool_return_reuse(reqs)
 
+    def _agentx_trace(self, sc: dict, name: str, res: dict, t_run0: float) -> None:
+        raw_path = str(sc["trace_path"])
+        trace_path = raw_path
+        if not os.path.isabs(trace_path) and not os.path.exists(trace_path):
+            repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+            candidate = os.path.join(repo_root, trace_path)
+            if os.path.exists(candidate):
+                trace_path = candidate
+        max_ctx = int(sc.get("max_context_length", DEFAULT_MAX_CONTEXT_LENGTH))
+        effective_max_ctx = min(max_ctx, self.ctx_size) if self.ctx_size else max_ctx
+        trace_fit = str(sc.get("trace_fit", DEFAULT_TRACE_FIT))
+        levels = [int(x) for x in sc.get("levels", list(DEFAULT_CONCURRENCY_LEVELS))]
+        sessions_per_user = int(sc.get("sessions_per_user", 1))
+        max_traces = sc.get("max_traces")
+        if max_traces is None:
+            max_traces = max(levels) * sessions_per_user
+        idle_gap_cap_s = float(sc.get("idle_gap_cap_s", DEFAULT_IDLE_GAP_CAP_S))
+        idle_time_scale = float(sc.get("idle_time_scale", 1.0))
+        api = sc.get("api", "chat")
+        base_key = sc.get("prompt_cache_key", f"{self.run_id}:{name}")
+
+        batch = load_and_fit_weka_traces(
+            trace_path,
+            max_context_length=effective_max_ctx,
+            trace_fit=trace_fit,
+            max_traces=int(max_traces),
+        )
+        kept = batch.traces
+        skipped = batch.skipped_traces
+        scaled = batch.scaled_traces
+
+        res["trace_path"] = raw_path
+        res["max_context_length"] = max_ctx
+        res["effective_max_context_length"] = effective_max_ctx
+        res["trace_fit"] = trace_fit
+        res["idle_gap_cap_s"] = idle_gap_cap_s
+        res["traces_loaded"] = batch.traces_loaded
+        res["traces_kept"] = len(kept)
+        res["truncated_at_max_traces"] = batch.truncated_at_max_traces
+        res["scaled_traces"] = scaled
+        res["skipped_traces"] = skipped
+        reqs = res.setdefault("requests", [])
+        if not kept:
+            res["expected_requests"] = 0
+            self.log(f"[{name}] 0/{batch.traces_loaded} traces fit effective_max_context_length={effective_max_ctx} "
+                     f"(trace_fit={trace_fit})")
+            return
+
+        expected = 0
+        extra: dict[str, dict[str, Any]] = {}
+        for level in levels:
+            for worker_idx in range(level):
+                for s_idx in range(sessions_per_user):
+                    trace = kept[(worker_idx * sessions_per_user + s_idx) % len(kept)]
+                    expected += trace.total_requests
+
+            def _run_user(worker_idx: int) -> list[dict[str, Any]]:
+                user_rows: list[dict[str, Any]] = []
+                for s_idx in range(sessions_per_user):
+                    trace = kept[(worker_idx * sessions_per_user + s_idx) % len(kept)]
+                    session_id = f"c{level}-u{worker_idx}-s{s_idx}-{trace.trace_id}"
+                    session_salt = f"{self.run_id}:{name}:{session_id}"
+
+                    def _send(meta: dict[str, Any], prompt: str) -> dict[str, Any]:
+                        sub = dict(sc)
+                        if not sc.get("_max_tokens_explicit"):
+                            sub["max_tokens"] = meta["effective_output_tokens"]
+                            sub["_max_tokens_explicit"] = True
+                        if meta["is_subagent"]:
+                            sub["prompt_cache_key"] = f"{base_key}:{session_id}:sub:{meta['agent_id']}"
+                            sub["priority"] = "subagent"
+                        else:
+                            sub["prompt_cache_key"] = f"{base_key}:{session_id}:main"
+                            sub.setdefault("priority", "interactive")
+                        kw = {"prompt": prompt} if api == "completion" else {
+                            "messages": [{"role": "user", "content": prompt}]
+                        }
+                        row = self.one(name, f"c{level}", api, sub, t_run0, **kw)
+                        row["concurrency"] = level
+                        return row
+
+                    user_rows.extend(
+                        replay_trace_session(
+                            trace,
+                            sizer=self.sizer,
+                            session_id=session_id,
+                            session_salt=session_salt,
+                            send_fn=_send,
+                            idle_gap_cap_s=idle_gap_cap_s,
+                            idle_time_scale=idle_time_scale,
+                        )
+                    )
+                return user_rows
+
+            t0 = time.perf_counter()
+            if level == 1:
+                level_rows = _run_user(0)
+            else:
+                level_rows = []
+                with ThreadPoolExecutor(max_workers=level) as ex:
+                    for rows in ex.map(_run_user, range(level)):
+                        level_rows.extend(rows)
+            makespan = time.perf_counter() - t0
+            reqs.extend(level_rows)
+            ok_rows = [r for r in level_rows if r.get("ok")]
+            toks = sum(r.get("completion_tokens") or 0 for r in ok_rows)
+            agg_tps = toks / makespan if makespan > 0 else None
+            extra[f"c{level}"] = {
+                "concurrency": level,
+                "sessions": level * sessions_per_user,
+                "makespan_s": makespan,
+                "aggregate_output_tps": agg_tps,
+                "aggregate_decode_tps": agg_tps,
+                "requests_per_s": len(level_rows) / makespan if makespan > 0 else None,
+                "main_requests": sum(1 for r in level_rows if not r.get("is_subagent")),
+                "subagent_requests": sum(1 for r in level_rows if r.get("is_subagent")),
+            }
+            self.log(f"[{name}] c={level}: {len(ok_rows)}/{len(level_rows)} ok, makespan {makespan:.2f}s, "
+                     f"{agg_tps or 0:.1f} tok/s aggregate")
+
+        res["clamped_output_requests"] = sum(1 for r in reqs if r.get("output_tokens_clamped"))
+        res["output_tokens_shortfall_requests"] = sum(
+            1 for r in reqs
+            if r.get("ok") and isinstance(r.get("output_tokens_delta"), int) and r["output_tokens_delta"] < 0
+        )
+        res["expected_requests"] = expected
+        res["_group_extra"] = extra
+
     # ------------------------------------------------------------------ run
 
     def run(self, cfg: dict, label: str = "", argv: list[str] | None = None) -> dict[str, Any]:
@@ -844,6 +1017,51 @@ class Runner:
         results["provenance"]["validation_outcome"] = summarize_validation_outcome(
             checks, results["verdict"], results["provenance"])
         return results
+
+
+def _build_agentx_summary(res: dict[str, Any]) -> dict[str, Any]:
+    levels_out: dict[str, Any] = {}
+    for g, gs in (res.get("groups") or {}).items():
+        levels_out[g] = {
+            "concurrency": gs.get("concurrency"),
+            "sessions": gs.get("sessions"),
+            "requests": gs.get("requests"),
+            "ok": gs.get("ok"),
+            "main_requests": gs.get("main_requests"),
+            "subagent_requests": gs.get("subagent_requests"),
+            # Headline AgentX interactivity (slow tail): 1000 / itl_ms.p90 pooled per concurrency level.
+            "p90_interactivity_tps": gs.get("p90_interactivity_tps"),
+            "p50_interactivity_tps": gs.get("p50_interactivity_tps"),
+            # Secondary per-request decode rate stats (p90 is the fast tail, not the headline).
+            "req_decode_tps_p50": (gs.get("output_tps_per_user") or {}).get("p50"),
+            "req_decode_tps_p90_fast_tail": gs.get("output_tps_per_user_p90"),
+            "realized_prefix_hit_rate": gs.get("realized_prefix_hit_rate"),
+            "ttft_p50_ms": ((gs.get("client_observed_ms") or {}).get("ttft_ms") or {}).get("p50"),
+            "ttft_p90_ms": ((gs.get("client_observed_ms") or {}).get("ttft_ms") or {}).get("p90"),
+            "itl_p50_ms": ((gs.get("client_observed_ms") or {}).get("itl_ms") or {}).get("p50"),
+            "itl_p90_ms": ((gs.get("client_observed_ms") or {}).get("itl_ms") or {}).get("p90"),
+            "aggregate_output_tps": gs.get("aggregate_output_tps"),
+            "makespan_s": gs.get("makespan_s"),
+        }
+    overall = res.get("summary") or {}
+    return {
+        "headline_metric": "p90_interactivity_tps",
+        "overall_p90_interactivity_tps": overall.get("p90_interactivity_tps"),
+        "overall_p50_interactivity_tps": overall.get("p50_interactivity_tps"),
+        "overall_req_decode_tps_p90_fast_tail": overall.get("output_tps_per_user_p90"),
+        "overall_realized_prefix_hit_rate": overall.get("realized_prefix_hit_rate"),
+        "max_context_length": res.get("max_context_length"),
+        "effective_max_context_length": res.get("effective_max_context_length"),
+        "trace_fit": res.get("trace_fit"),
+        "idle_gap_cap_s": res.get("idle_gap_cap_s"),
+        "traces_loaded": res.get("traces_loaded"),
+        "traces_kept": res.get("traces_kept"),
+        "scaled_traces": res.get("scaled_traces") or [],
+        "skipped_traces": len(res.get("skipped_traces") or []),
+        "clamped_output_requests": res.get("clamped_output_requests", 0),
+        "output_tokens_shortfall_requests": res.get("output_tokens_shortfall_requests", 0),
+        "levels": levels_out,
+    }
 
 
 def _assistant_history(row: dict) -> dict:
@@ -954,6 +1172,8 @@ def run_checks(results: dict, *, require_provenance: bool = False) -> list[dict]
             detail = "0 requests expected"
             if s.get("skipped"):
                 detail += f" (all {len(s['skipped'])} sizes skipped: {s['skipped'][0]['reason']})"
+            elif s.get("skipped_traces"):
+                detail += f" (all {len(s['skipped_traces'])} traces skipped: {s['skipped_traces'][0]['reason']})"
             checks.append(_check("request_count", "warn", detail, name))
         else:
             checks.append(_check("request_count", "pass", f"{ok}/{exp} requests completed", name))
@@ -1042,6 +1262,34 @@ def run_checks(results: dict, *, require_provenance: bool = False) -> list[dict]
             else:
                 checks.append(_check("warm_tool_return_reuse", "pass",
                                      f"warm tool-return prefix hit ratios {reuse.get('ratios')}", name))
+        if s["kind"] == "agentx_trace" and exp:
+            warm = [r for r in reqs if r.get("ok") and r.get("cache_state") == "warm"]
+            if warm:
+                warm_summary = group_summary(warm)
+                realized = warm_summary.get("realized_prefix_hit_rate")
+                p90_inter = (s.get("summary") or {}).get("p90_interactivity_tps")
+                if realized is None:
+                    checks.append(_check(
+                        "agentx_prefix_reuse",
+                        "warn",
+                        "server reports no cached-token count (usage.prompt_tokens_details.cached_tokens / "
+                        "usage.sonder.timings.cache_n): realized prefix hit unknown",
+                        name,
+                    ))
+                elif realized <= 0.0:
+                    checks.append(_check(
+                        "agentx_prefix_reuse",
+                        "warn",
+                        "realized prefix-hit rate is 0 on warm trace turns: prompt cache is not reusing shared prefixes",
+                        name,
+                    ))
+                else:
+                    checks.append(_check(
+                        "agentx_prefix_reuse",
+                        "pass",
+                        f"warm realized prefix-hit rate {realized:.3f}, P90 interactivity {_fmt(p90_inter)} tok/s",
+                        name,
+                    ))
         sp = s.get("spill")
         if sp and sp.get("spill"):
             checks.append(_check("vram_spill", "warn",

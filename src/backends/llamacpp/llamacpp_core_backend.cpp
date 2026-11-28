@@ -870,6 +870,25 @@ Status ApplyBackendOptions(const LlamaCppBackendOptions& o, lc::LoadOptions& lo)
     lo.spec_batch_max_aggregate_draft_tokens = o.spec_batch_max_aggregate_draft_tokens;
     lo.embed_batch_tokens = o.embed_batch_tokens;
     lo.embed_max_sequences = o.embed_max_sequences;
+    if (!lc::ParseWorkloadRole(o.workload_role, lo.workload_role)) {
+        return Status(ErrorCode::invalid_argument,
+                      "unknown workload_role '" + o.workload_role + "' (expected main_decode or auxiliary)");
+    }
+    if (!lc::ParseStreamPriority(o.main_stream_priority, lo.main_stream_priority)) {
+        return Status(ErrorCode::invalid_argument,
+                      "unknown main_stream_priority '" + o.main_stream_priority +
+                          "' (expected default, high or low)");
+    }
+    if (!lc::ParseStreamPriority(o.aux_stream_priority, lo.aux_stream_priority)) {
+        return Status(ErrorCode::invalid_argument,
+                      "unknown aux_stream_priority '" + o.aux_stream_priority +
+                          "' (expected default, high or low)");
+    }
+    lo.aux_gate.enabled = o.aux_gate_enabled;
+    lo.aux_gate.max_aux_duty_cycle = o.max_aux_duty_cycle;
+    lo.aux_gate.active_slice_max_tokens = o.aux_active_slice_tokens;
+    lo.aux_gate.active_slice_max_sequences = o.aux_active_max_sequences;
+    lo.aux_gate.max_decode_hold_ms = o.aux_max_decode_hold_ms;
     lo.startup_smoke_test = o.startup_smoke_test;
     lo.embed_max_total_tokens = o.embed_max_total_tokens;
     lo.embed_max_input_tokens = o.embed_max_input_tokens;
@@ -1667,6 +1686,19 @@ private:
     mutable std::shared_mutex mutex_;
 };
 
+std::shared_ptr<lc::DecodeAwareAuxGate> MakeSharedAuxGate(const LlamaCppBackendOptions& o) {
+    lc::AuxGateConfig cfg;
+    cfg.enabled = o.aux_gate_enabled;
+    cfg.max_aux_duty_cycle = o.max_aux_duty_cycle;
+    cfg.active_slice_max_tokens = o.aux_active_slice_tokens;
+    cfg.active_slice_max_sequences = o.aux_active_max_sequences;
+    cfg.max_decode_hold_ms = o.aux_max_decode_hold_ms;
+    if (!lc::ValidateAuxGateConfig(cfg).ok()) {
+        cfg = lc::AuxGateConfig{};
+    }
+    return std::make_shared<lc::DecodeAwareAuxGate>(cfg);
+}
+
 class LlamaCppCoreBackend final : public Backend {
 public:
     explicit LlamaCppCoreBackend(LlamaCppBackendOptions options,
@@ -1677,7 +1709,8 @@ public:
         : options_(std::move(options)),
           runtime_state_(std::make_shared<RuntimeState>(
               probe ? std::move(probe) : MakeDefaultGpuMemoryProbe(options_.devices), sample_interval, options_,
-              force_uma_mode, force_gpu_offload)) {
+              force_uma_mode, force_gpu_offload)),
+          aux_gate_(MakeSharedAuxGate(options_)) {
         lc::BindCoreBackendDeviceHealth(
             this, runtime_state_->DeviceHealth(),
             [rs = runtime_state_](std::shared_ptr<lc::DeviceHealthTracker> dh) {
@@ -1795,6 +1828,7 @@ public:
         LlamaCppBackendOptions effective = options_;
         if (!options.devices.empty()) effective.devices = options.devices;
         if (Status s = ApplyBackendOptions(effective, lo); !s.ok()) return s;
+        lo.shared_aux_gate = aux_gate_;
         for (const auto& [pattern, device] : options_.tensor_overrides) {
             lo.tensor_overrides.push_back({pattern, device});
         }
@@ -1967,6 +2001,7 @@ private:
 
     LlamaCppBackendOptions options_;
     std::shared_ptr<RuntimeState> runtime_state_;
+    std::shared_ptr<lc::DecodeAwareAuxGate> aux_gate_;
     std::shared_ptr<lc::SpecController> spec_controller_;
 };
 

@@ -421,6 +421,12 @@ TEST_CASE("backpressure: a stalled SSE subscriber sees ': dropped N' and a match
     };
     // Losses that happen from here on fall between delivered events (flush
     // first: the bus reaches the hub asynchronously).
+    // A samples-stream event (framed `id: <instance>-s<seq>`) lands in the
+    // stalled subscriber's stream before the flood, so the walk below must cope
+    // with it deterministically rather than only when a periodic sample races in.
+    sonder::inference::TelemetryContext sample_ctx;
+    sample_ctx.session_id = "test-session";
+    REQUIRE(f.server->engine()->telemetry().emit("test.backpressure.sample", sample_ctx, {}));
     f.server->engine()->telemetry().flush();
     const std::int64_t baseline = dropped_so_far();
     for (int i = 0; i < 3000; ++i) {
@@ -452,6 +458,7 @@ TEST_CASE("backpressure: a stalled SSE subscriber sees ': dropped N' and a match
     std::uint64_t pending = 0;
     std::optional<std::uint64_t> last;
     int announced_gaps = 0;
+    int sample_ids = 0;
     std::size_t pos = 0;
     while (pos < acc.size()) {
         const std::size_t eol = acc.find('\n', pos);
@@ -461,7 +468,14 @@ TEST_CASE("backpressure: a stalled SSE subscriber sees ': dropped N' and a match
         if (line.rfind(": dropped ", 0) == 0) {
             pending += std::stoull(line.substr(10));
         } else if (line.rfind("id: ", 0) == 0) {
-            const std::uint64_t seq = std::stoull(line.substr(line.rfind('-') + 1));
+            // Main events are `<instance>-<seq>`, samples `<instance>-s<seq>`
+            // (own sequence). The gap check applies to the main stream only.
+            const std::string suffix = line.substr(line.rfind('-') + 1);
+            if (!suffix.empty() && suffix[0] == 's') {
+                ++sample_ids;
+                continue;
+            }
+            const std::uint64_t seq = std::stoull(suffix);
             if (last) {
                 CHECK(seq - *last - 1 == pending);
                 if (pending > 0) ++announced_gaps;
@@ -471,6 +485,7 @@ TEST_CASE("backpressure: a stalled SSE subscriber sees ': dropped N' and a match
         }
     }
     CHECK(announced_gaps > 0);
+    CHECK(sample_ids > 0);
     CHECK(acc.find("\"telemetry.dropped\"") == std::string::npos);
     stalled.close();
 }
