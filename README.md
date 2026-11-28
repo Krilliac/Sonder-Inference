@@ -34,9 +34,11 @@ inference onto the native in-process `llama.cpp` backend is in
     [docs/integration/llamacpp.md](docs/integration/llamacpp.md)). Planned to
     move to a single vendored, pinned `ggml`/`llama.cpp` tree with SI's own
     patch series ([docs/ROADMAP_SI_ONLY.md](docs/ROADMAP_SI_ONLY.md)).
-  - **Ollama Cloud** (**in progress, not yet merged on `main`**): opt-in
-    direct HTTPS provider for Ollama Cloud models with no local Ollama daemon
-    (RET-02 in [docs/ROADMAP_SI_ONLY.md](docs/ROADMAP_SI_ONLY.md)).
+  - `ollama_cloud`: Ollama's hosted cloud models straight over HTTPS
+    (`https://ollama.com`, bearer API key from an env var or token file), no
+    local daemon; opt-in per model, refuses `X-Sonder-Local-Only` requests;
+    needs a `SONDER_WITH_TLS=ON` build
+    ([docs/integration/ollama-cloud.md](docs/integration/ollama-cloud.md)).
   - `ollama` (**deprecated, scheduled for removal**): HTTP adapter for an
     Ollama server, with streaming and cancellation
     ([src/backends/ollama](src/backends/ollama/README.md)).
@@ -137,6 +139,7 @@ powershell -NoProfile -File scripts\build.ps1 -Preset msvc-debug -Test
 | `SONDER_BUILD_CLI` | ON when top-level | Build `sonder-infer` |
 | `SONDER_WARNINGS_AS_ERRORS` | OFF | Warnings as errors (ON in `ci-*` presets) |
 | `SONDER_WITH_LLAMA_CPP` | OFF | Fetch llama.cpp at pinned tag `v1.0.0` and build the `llamacpp` backend; accelerators through `GGML_*` options |
+| `SONDER_BUILD_LLAMASERVER` | ON | Build the external llama-server backend and its tests; shared GPU counters and log diagnostics remain available when OFF |
 | `SONDER_WITH_TLS` | OFF | Enable `https://` in the internal HTTP client |
 | `SONDER_TLS_BACKEND` | `auto` | `auto` (Schannel on Windows, OpenSSL elsewhere), `openssl` or `schannel` |
 | `SONDER_BUILD_FUZZERS` | OFF | Build the libFuzzer targets in `fuzz/` (Clang) |

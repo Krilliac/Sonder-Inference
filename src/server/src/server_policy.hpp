@@ -34,8 +34,11 @@ const std::vector<std::string>& default_origins();
 inline constexpr const char* kAllowHeaders =
     "Accept, Authorization, Cache-Control, Content-Type, Last-Event-ID, X-Sonder-Run-Id, "
     "X-Sonder-Parent-Request-Id, X-Sonder-Agent-Id, X-Sonder-Task-Id, X-Sonder-Workload, X-Sonder-Priority, "
-    "X-Sonder-Deadline-Ms, X-Sonder-Reasoning-Budget";
+    "X-Sonder-Deadline-Ms, X-Sonder-Reasoning-Budget, X-Sonder-No-Capture, X-Sonder-Local-Only";
 inline constexpr const char* kExposeHeaders = "X-Sonder-Inference-Api, X-Sonder-Request-Id, Retry-After";
+// Backend name of the only off-premises provider. X-Sonder-Local-Only requests
+// against it are refused before residency (no model load, no network I/O).
+inline constexpr const char* kRemoteProviderBackend = "ollama_cloud";
 
 enum class State { starting, ready, draining, stopped };
 

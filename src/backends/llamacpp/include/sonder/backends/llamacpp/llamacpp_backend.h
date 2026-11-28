@@ -109,6 +109,7 @@ inline constexpr std::uint32_t kMaxSlots = 16;
 inline constexpr std::uint32_t kMaxEmbedSequences = 64;
 inline constexpr std::uint32_t kDefaultEmbedBatchTokens = 2048;
 inline constexpr std::uint32_t kDefaultEmbedMaxSequences = 16;
+inline constexpr std::uint32_t kDefaultEmbedMaxTotalTokens = 262144;
 
 // Maximum draft tokens per speculative step and per-strategy defaults.
 inline constexpr std::int32_t kMaxSpecDraftTokens = 64;
@@ -182,8 +183,14 @@ struct LoadOptions {
     KvCacheType type_v = KvCacheType::kF16;
     FlashAttention flash_attn = FlashAttention::kAuto;
     // Explicit ggml device names (e.g. "CUDA0", "ROCm0", "Vulkan0", "CUDA1")
-    // passed as a null-terminated llama_model_params::devices list. Empty uses
-    // llama.cpp's default device selection. Validated upfront before loading.
+    // passed as a null-terminated llama_model_params::devices list. Non-empty
+    // is an exact allowlist: only these devices are used (an integrated GPU is
+    // used only when named), and names that are the same physical GPU seen
+    // through two backends are reduced to the first one named. Empty selects
+    // automatically via SelectDevices(): discrete GPUs only (one backend per
+    // physical card), never an integrated GPU; CPU-only when no discrete GPU
+    // exists. Names match case-insensitively (as ggml does). A CPU entry is
+    // accepted and is the CPU offload device. Validated upfront before loading.
     std::vector<std::string> devices;
     // Primary GPU index used for the full model when split_mode == kNone and
     // for scratch / non-split tensors. Must be >= 0.
@@ -217,11 +224,22 @@ struct LoadOptions {
     std::string spec_type = "none";
     // Max draft tokens per speculative step (0 = automatic default for spec_type).
     std::int32_t spec_draft_max = 0;
+    // Hint from SpecControllerConfig::MayUseMtp() / MaxPlannedDraft() so Load()
+    // prepares MTP weights/context and output-row capacity for per-route rules
+    // even when base spec_type is "none" or another strategy.
+    bool spec_may_use_mtp = false;
+    bool spec_may_use_p_min = false;
+    std::int32_t spec_max_route_draft = 0;
+    std::int32_t spec_mtp_route_draft = 0;
     // Verification policy for speculative decoding (TargetMatch default vs
     // opt-in StochasticRejection when a stochastic proposer supplies real q).
     SpeculativeVerificationMode spec_verification_mode = SpeculativeVerificationMode::TargetMatch;
     // Bounded L2 host-RAM prefix state cache budget in MiB (0 = disabled, max kMaxCacheRamMiB).
     std::uint32_t cache_ram_mib = 0;
+    // Context checkpoint spacing in tokens (normal / dense for hybrid & recurrent models) and per-slot cap.
+    std::uint32_t checkpoint_spacing_tokens = 2048;
+    std::uint32_t checkpoint_dense_spacing_tokens = 1024;
+    std::uint32_t checkpoint_max_per_slot = 8;
     // Dynamic GPU cache in MiB for host-resident MoE experts (0 = disabled, max kMaxMoeCacheMiB).
     std::uint32_t moe_cache_mib = 0;
     // Unused/rejected by the direct llamacpp backend (no execution consumer):
@@ -249,6 +267,23 @@ struct LoadOptions {
     std::uint32_t embed_batch_tokens = kDefaultEmbedBatchTokens;
     // Maximum sequences packed per embedding/rerank forward pass (0 = auto, max kMaxEmbedSequences).
     std::uint32_t embed_max_sequences = kDefaultEmbedMaxSequences;
+    // Opt-in startup greedy smoke test (default off): after a successful load
+    // Load() decodes a short fixed prompt greedily and fails the load with
+    // kLoadFailed when logits are non-finite/uniform, step 0 emits an immediate
+    // EOG token (0 non-EOG tokens), or the continuation is degenerate (see
+    // EvaluateSmokeLogits / EvaluateSmokeTokens). Ignored for vocab_only loads,
+    // encoder-only models, and pooled contexts (embedding MEAN/CLS/LAST or
+    // reranker RANK).
+    bool startup_smoke_test = false;
+    // Per-request embedding limits on the tokenized inputs (0 = no limit). A single input is
+    // always bounded by the context window as well.
+    std::uint32_t embed_max_total_tokens = kDefaultEmbedMaxTotalTokens;
+    std::uint32_t embed_max_input_tokens = 0;
+    // Deep graph eval telemetry (strictly opt-in at TelemetryLevel::deep; below deep
+    // cb_eval is never installed on llama_context_params).
+    bool graph_telemetry_enabled = false;
+    std::uint32_t graph_telemetry_sample_every = 1;
+    bool graph_telemetry_timings = true;
 };
 
 // Checks placement options (main_gpu >= 0, split_mode, tensor_split finite /
@@ -262,6 +297,64 @@ struct LoadOptions {
 // runs it before touching the model file. Always Ok for vocab_only loads,
 // which create no context.
 [[nodiscard]] Status ValidateContextOptions(const LoadOptions& options);
+
+// True when the linked llama.cpp carries prism.hadamard.* / FWHT runtime
+// support (decided at configure time from the resolved llama.cpp sources;
+// SONDER_LLAMACPP_HAS_PRISM_HADAMARD). Mainline >= b11556 / v1.0.0 and the
+// PrismML-Eng fork have it; older trees such as b11195 do not.
+[[nodiscard]] constexpr bool LinkedLlamaSupportsPrismHadamard() noexcept {
+#if defined(SONDER_LLAMACPP_HAS_PRISM_HADAMARD)
+    return true;
+#else
+    return false;
+#endif
+}
+
+// True when a GGUF metadata key marks a Hadamard-folded (Bonsai / Prism)
+// model: any key under the "prism.hadamard." namespace.
+[[nodiscard]] bool IsPrismHadamardKey(std::string_view key) noexcept;
+
+// Pure guard decision. `gguf_keys` are the model's metadata keys. Returns
+// kUnsupported with an explanatory message when the model is Hadamard-folded
+// and `runtime_supports_hadamard` is false; Ok otherwise.
+[[nodiscard]] Status EvaluateHadamardGuard(const std::vector<std::string>& gguf_keys,
+                                           bool runtime_supports_hadamard,
+                                           std::string_view model_path = {});
+
+// Reads only the metadata key names of a GGUF file (no tensor data). Returns
+// kLoadFailed if the file cannot be parsed.
+[[nodiscard]] Status ReadGgufKeys(const std::string& path, std::vector<std::string>& keys);
+
+// Pure logit sanity check for one greedy step of the startup smoke test.
+// Fails with kLoadFailed on empty logits, any non-finite logit (NaN/Inf), or
+// degenerate uniform logits (all values identical when vocab > 1). On Ok,
+// writes the first argmax token id to `argmax_out`.
+[[nodiscard]] Status EvaluateSmokeLogits(std::span<const float> logits, std::int32_t& argmax_out);
+
+// Pure sanity heuristic for the startup smoke test. `tokens` are the greedy
+// continuation, `logits_finite` whether every inspected logit was finite.
+// Fails on non-finite logits, an empty continuation, or a degenerate one
+// (all tokens identical when at least kSmokeMinTokens were produced).
+inline constexpr std::size_t kSmokeMinTokens = 4;
+[[nodiscard]] Status EvaluateSmokeTokens(const std::vector<std::int32_t>& tokens, bool logits_finite);
+
+namespace detail {
+
+// RAII test seam for exercising the Hadamard refusal path in Load() even when
+// linked against a llama.cpp build that supports prism.hadamard (such as v1.0.0).
+// Not exposed in LoadOptions or user configuration.
+class ScopedPrismHadamardSupportOverrideForTest {
+public:
+    explicit ScopedPrismHadamardSupportOverrideForTest(bool runtime_supported) noexcept;
+    ~ScopedPrismHadamardSupportOverrideForTest() noexcept;
+    ScopedPrismHadamardSupportOverrideForTest(const ScopedPrismHadamardSupportOverrideForTest&) = delete;
+    ScopedPrismHadamardSupportOverrideForTest& operator=(const ScopedPrismHadamardSupportOverrideForTest&) = delete;
+
+private:
+    int previous_ = -1;
+};
+
+}  // namespace detail
 
 // The llama_model_params values a Load() with given options passes to
 // llama.cpp, read back from the real parameter struct. For tests and
@@ -295,6 +388,10 @@ struct ContextParamsSummary {
     bool op_offload = false;
     bool swa_full = true;
     std::uint64_t moe_cache_size = 0;
+    std::uint32_t n_rs_seq = 0;
+    std::uint32_t n_outputs_max_per_seq = 0;
+    std::uint32_t n_outputs_max = 0;
+    bool has_eval_callback = false;
 };
 
 struct SamplingParams {
@@ -321,6 +418,10 @@ struct SamplingParams {
     // request fails with kInvalidArgument. This deliberately diverges from llama-server, which
     // silently skips such texts. Resolved once per request.
     std::vector<std::string> preserved_tokens;
+    // JSON Schema text (normalised by the caller) enforced through llguidance instead of `grammar`.
+    // Needs a build with SONDER_WITH_LLGUIDANCE=ON: otherwise the request fails with
+    // kInvalidArgument rather than running unconstrained. Cannot be combined with grammar_lazy.
+    std::string llguidance_json_schema{};
     // Tokens pre-accepted into a non-lazy grammar before generation (for example the generation
     // prompt already present in the prompt). Requires a non-lazy grammar. If the grammar rejects
     // one (out of range, or masked by the grammar, which includes end-of-generation tokens), it is
@@ -428,6 +529,15 @@ struct GenerateRequest {
     bool allow_preempt_spill = false;
     // Prior requeue count (for anti-starvation protection on physical pressure).
     std::uint32_t requeue_count = 0;
+    // Optional per-request speculative decoding overrides chosen by SpecController.
+    std::optional<SpeculativeType> spec_override = std::nullopt;
+    std::optional<std::int32_t> spec_draft_max_override = std::nullopt;
+    double spec_p_min = 0.0;
+    std::string spec_fallback_reason_override{};
+    // Policy configured before controller overrides (acceptance disable, determinism, etc.),
+    // used for EffectiveExecutionReport configured_spec_method / configured_draft_limit.
+    std::string spec_configured_method{};
+    std::optional<std::int32_t> spec_configured_draft_limit = std::nullopt;
 };
 
 // One event per generated token. After the last token a final event with
@@ -523,6 +633,9 @@ struct SpeculativeLoadInfo {
     bool mtp_build_supported = false;
     bool mtp_model_supported = false;
     bool l2_cache_enabled = false;
+    std::int32_t hybrid_rs_cap = 0;
+    bool can_hybrid_spec_ckpt = false;
+    std::int32_t ctx_outputs_max_per_seq = 0;
 };
 
 enum class PoolingType {
@@ -566,9 +679,48 @@ struct DeviceInfo {
     DeviceKind kind = DeviceKind::kOther;
     std::uint64_t memory_free_bytes = 0;
     std::uint64_t memory_total_bytes = 0;
+    // Lower-case PCI bus id ("0000:c1:00.0") when the ggml backend reports one;
+    // empty when unknown. Equal non-empty ids are the same physical device.
+    std::string device_id;
 };
 
 [[nodiscard]] std::string_view ToString(DeviceKind kind) noexcept;
+
+// Canonicalizes a PCI bus id (e.g. CUDA's "00000000:01:00.0" or mixed-case
+// "0000:C1:00.0") to lower-case "0000:01:00.0", preserving any virtual-device
+// suffix such as "-v0". Non-BDF identifiers are trimmed and lower-cased.
+[[nodiscard]] std::string NormalizePciBusId(std::string_view raw);
+
+// Result of SelectDevices(): `names` are the ggml device names to hand to
+// llama.cpp (possibly empty = CPU only); `tensor_split` and `main_gpu` are
+// re-indexed onto `names` when duplicate views or unlisted iGPUs are removed;
+// `notes` explain every device that was left out, for logging.
+struct DeviceSelection {
+    std::vector<std::string> names;
+    std::vector<float> tensor_split;
+    std::int32_t main_gpu = 0;
+    std::vector<std::string> notes;
+};
+
+// Pure device-selection policy (no ggml calls; unit-testable with mock lists).
+//  - `allowlist` non-empty: every name must exist in `available` (case-insensitive
+//    match, else kInvalidArgument) and is used even if it is an integrated GPU
+//    or the CPU. Later names that are the same physical GPU as an earlier one
+//    are dropped, and `tensor_split` / `main_gpu` are re-indexed onto `names`.
+//  - `allowlist` empty: all kGpu devices, never kIntegratedGpu. When one
+//    physical GPU appears under several backends the non-Vulkan backend wins.
+//    If no discrete GPU exists, a non-empty `tensor_split` or `main_gpu > 0`
+//    fails with kInvalidArgument. When iGPUs or duplicate views are skipped,
+//    `tensor_split` and `main_gpu` are re-indexed onto the surviving discrete GPUs.
+// Two non-CPU devices are the same physical GPU when their normalized non-empty
+// device_id match, or (when at least one id is unknown) when they come from
+// different backends and have matching description and non-zero total memory.
+[[nodiscard]] Status SelectDevices(const std::vector<DeviceInfo>& available,
+                                   const std::vector<std::string>& allowlist, DeviceSelection* out);
+[[nodiscard]] Status SelectDevices(const std::vector<DeviceInfo>& available,
+                                   const std::vector<std::string>& allowlist,
+                                   const std::vector<float>& tensor_split, std::int32_t main_gpu,
+                                   DeviceSelection* out);
 
 struct ModelInfo {
     std::string description;
@@ -586,6 +738,7 @@ enum class TelemetryKind {
     kPrefillDone,
     kTokenDecoded,
     kGenerationDone,
+    kPrefixCheckpoint,
 };
 
 struct TelemetryEvent {
@@ -597,6 +750,9 @@ struct TelemetryEvent {
 
 using TelemetrySink = std::function<void(const TelemetryEvent&)>;
 
+struct GraphEvalSummary;
+using GraphEvalSink = std::function<void(const GraphEvalSummary&)>;
+
 // Telemetry counters for cold shared-prefix prefill coalescing.
 struct PrefixCoalescerStats {
     std::uint64_t coalesced_groups = 0;
@@ -604,6 +760,22 @@ struct PrefixCoalescerStats {
     std::uint64_t coalesced_tokens_saved = 0;
     std::uint64_t coalesce_fallbacks_timeout = 0;
     std::uint64_t coalesce_fallbacks_producer_failed = 0;
+};
+
+// Telemetry counters for prefix-cache context checkpoints and host-RAM LRU tier.
+struct PrefixCheckpointCounters {
+    std::uint64_t checkpoints_planned = 0;
+    std::uint64_t checkpoints_captured = 0;
+    std::uint64_t captured_bytes = 0;
+    std::uint64_t slot_hits = 0;
+    std::uint64_t host_hits = 0;
+    std::uint64_t misses = 0;
+    std::uint64_t restored_tokens = 0;
+    std::uint64_t host_puts = 0;
+    std::uint64_t host_evictions = 0;
+    std::uint64_t host_rejected = 0;
+    std::uint64_t host_bytes = 0;
+    std::uint64_t host_entries = 0;
 };
 
 // One chat message for chat-template formatting (role: system, user,
@@ -649,6 +821,8 @@ void SetLogSink(LogSink sink) noexcept;
 // hands the text to the sink. Public so tests can drive it without a model.
 void RouteLog(LogLevel level, const char* text);
 
+class KvTelemetry;  // kv_telemetry.hpp
+
 class LlamaCppBackend {
 public:
     LlamaCppBackend();
@@ -665,6 +839,20 @@ public:
     [[nodiscard]] static bool HasMtmdBuildSupport() noexcept;
     // Devices ggml can see in this build (CPU always; CUDA/Vulkan/Metal when compiled in).
     [[nodiscard]] static std::vector<DeviceInfo> EnumerateDevices();
+    // Applies SelectDevices() to EnumerateDevices() and resolves the result.
+    // `resolved` may come back empty on success (CPU only).
+    [[nodiscard]] static Status ResolveModelDevices(const std::vector<std::string>& allowlist,
+                                                    std::vector<void*>* resolved,
+                                                    DeviceSelection* selection = nullptr);
+    // Device the multimodal projector (mtmd/clip) must use for a resolved
+    // device list: the selected main_gpu accelerator in SplitMode::kNone, else
+    // the first non-CPU device, so the projector stays inside the allowlist.
+    // nullptr when the list holds no accelerator (projector on CPU; the caller
+    // must then also disable mtmd's GPU use, since a null device makes clip
+    // pick any GPU, including an integrated one).
+    [[nodiscard]] static void* ProjectorDevice(const std::vector<void*>& resolved,
+                                               SplitMode split_mode = SplitMode::kLayer,
+                                               std::int32_t main_gpu = 0);
     // Checks each ggml device name (non-empty, registered in this build via
     // ggml_backend_dev_by_name, at most llama_max_devices()). On success,
     // `resolved` (if non-null) receives one opaque ggml_backend_dev_t per
@@ -757,7 +945,13 @@ public:
                                 std::size_t max_bytes = kMaxSequenceStateBytes);
 
     void SetTelemetrySink(TelemetrySink sink);
+    // Physical KV telemetry (kv_telemetry.hpp). Set before Load(): the backend
+    // queues kv.pool.configured when the context is created, kv.usage as slots
+    // change and kv.evicted on idle-slot eviction; the owner drains the queue.
+    void SetKvTelemetry(std::shared_ptr<KvTelemetry> kv);
+    void SetGraphEvalSink(GraphEvalSink sink);
     [[nodiscard]] PrefixCoalescerStats GetPrefixCoalescerStats() const noexcept;
+    [[nodiscard]] PrefixCheckpointCounters GetPrefixCheckpointStats() const noexcept;
 
 private:
     struct Impl;

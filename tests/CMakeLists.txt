@@ -8,6 +8,7 @@ sonder_add_module_tests(core
     test_model_architecture.cpp
     test_session.cpp
     test_telemetry.cpp
+    test_text_capture.cpp
     test_diag_log.cpp
     test_c_api.cpp
     test_c_api_chat.cpp
@@ -23,6 +24,7 @@ sonder_add_module_tests(core
     test_cli_repl.cpp
     test_priority_runtime.cpp
     test_device_memory.cpp
+    test_device_diagnostics.cpp
     test_http_client.cpp
     test_recurrent_checkpoints.cpp
     test_speculative_verifier.cpp
@@ -439,7 +441,7 @@ grep -q 'outcome=cancelled' \"$2\" || { echo 'no outcome=cancelled stats line'; 
     # --- sonder-bench -------------------------------------------------------
     if(TARGET sonder-bench)
         set(bench_tool $<TARGET_FILE:sonder-bench>)
-        sonder_cli_test(bench_tool_no_args RC 2 STDERR_REGEX "Usage:\\n  sonder-bench --model NAME"
+        sonder_cli_test(bench_tool_no_args RC 2 STDERR_REGEX "Usage:\\n  sonder-bench --model PATH\\.gguf"
             COMMAND ${bench_tool})
         sonder_cli_test(bench_tool_help RC 0 STDOUT_REGEX "MOCK BACKEND banner.*Exit status: 0 ok"
             COMMAND ${bench_tool} --help)
