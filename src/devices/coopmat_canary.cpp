@@ -2,8 +2,9 @@
 //
 // Design:
 //   - Guards against AMD Windows Vulkan cooperative-matrix init regressions:
-//       * Phase 1 (llama.cpp#22750 / #23508): iGPU (e.g. Radeon 780M) crash during
-//         vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR at backend init.
+//       * Phase 1 (closed, unmerged PR llama.cpp#22750): Radeon 860M (RDNA 3.5)
+//         amdvlk crash during vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR
+//         at backend init.
 //       * Phase 2: generic 16x16x16 FP16->FP32 OpCooperativeMatrixMulAddKHR
 //         compute smoke test over ceil(ubatch/16) tiles (does not reproduce
 //         upstream flash-attention coopmat1 flip-direct shader bugs, which are
@@ -941,6 +942,10 @@ bool needs_amd_windows_coopmat_canary(const GpuDeviceInfo& gpu, bool is_windows)
     const bool is_amd = (gpu.vendor == GpuVendor::amd) || (gpu.vendor_id == kAmdVendorId);
     if (!is_amd) return false;
     if (gpu.matrix_cores == "none") return false;
+    // Mirror ggml_vk_khr_cooperative_matrix_support (ggml-vulkan.cpp:16858-16863):
+    // skip AMD GCN/RDNA1/RDNA2 GPUs that ggml-vulkan will never use for KHR coopmat,
+    // so a failure on an unused iGPU cannot disable coopmat globally on other GPUs.
+    if (gpu.ggml_coopmat_eligible.has_value() && !*gpu.ggml_coopmat_eligible) return false;
     return true;
 }
 
@@ -1380,7 +1385,7 @@ CoopmatCanaryProbeResult run_vulkan_coopmat_canary_in_process(std::uint32_t vend
     }
     res.coopmat_supported = true;
 
-    // Phase 1 (#22750 / #23508): query cooperative-matrix properties.
+    // Phase 1 (PR #22750 entrypoint): query cooperative-matrix properties.
     if (get_coop_props == nullptr) {
         res.reason = "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR entrypoint missing";
         return res;

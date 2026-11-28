@@ -31,4 +31,5 @@ target_link_libraries(sonder_llamacpp_integration PRIVATE
     sonder::inference sonder_backend_llamacpp sonder_doctest)
 sonder_set_warnings(sonder_llamacpp_integration)
 add_test(NAME sonder.llamacpp.integration COMMAND sonder_llamacpp_integration)
-set_tests_properties(sonder.llamacpp.integration PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+set_tests_properties(sonder.llamacpp.integration PROPERTIES
+    SKIP_RETURN_CODE 77 TIMEOUT 600 ENVIRONMENT "SONDER_SKIP_COOPMAT_CANARY=1")

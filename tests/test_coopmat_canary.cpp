@@ -51,11 +51,17 @@ TEST_CASE("NAT-16: eligibility covers AMD Windows discrete 9060 XT and integrate
     const auto rx9060 = make_amd_gpu("gpu:0", "AMD Radeon RX 9060 XT", 0x7590u, false, "26.11.2 (32.0.21045.29003)");
     const auto r780m = make_amd_gpu("gpu:1", "AMD Radeon 780M Graphics", 0x15BFu, true, "26.11.2 (32.0.21045.29003)");
     const auto no_cm = make_amd_gpu("gpu:2", "AMD Old GPU", 0x67DFu, false, "24.1.1", "none");
-    const auto unknown_cm = make_amd_gpu("gpu:3", "AMD Radeon 780M Graphics", 0x15BFu, true, "26.11.2", "");
+    const auto unknown_cm = make_amd_gpu("gpu:3", "AMD Radeon 860M Graphics", 0x15BFu, true, "26.11.2", "");
+    auto rdna2_igpu = make_amd_gpu("gpu:4", "AMD Radeon(TM) Graphics", 0x13C0u, true, "26.11.2", "KHR_coopmat");
+    rdna2_igpu.ggml_coopmat_eligible = false;
+    auto rdna4_dgpu = make_amd_gpu("gpu:5", "AMD Radeon RX 9060 XT", 0x7590u, false, "26.11.2", "KHR_coopmat");
+    rdna4_dgpu.ggml_coopmat_eligible = true;
 
     CHECK(needs_amd_windows_coopmat_canary(rx9060, true));
     CHECK(needs_amd_windows_coopmat_canary(r780m, true));
     CHECK(needs_amd_windows_coopmat_canary(unknown_cm, true));
+    CHECK(needs_amd_windows_coopmat_canary(rdna4_dgpu, true));
+    CHECK_FALSE(needs_amd_windows_coopmat_canary(rdna2_igpu, true));
     CHECK_FALSE(needs_amd_windows_coopmat_canary(no_cm, true));
     CHECK_FALSE(needs_amd_windows_coopmat_canary(rx9060, false));
     CHECK_FALSE(needs_amd_windows_coopmat_canary(r780m, false));
@@ -185,7 +191,7 @@ TEST_CASE("NAT-16: evaluate_amd_coopmat_canary caches by driver build and trigge
     CHECK(d2.records[0].from_cache);
     CHECK(d2.records[1].from_cache);
 
-    // 3. Driver build changes -> cache miss, 780M crashes (#22750) -> automatic fallback.
+    // 3. Driver build changes -> cache miss, iGPU crashes in property query (PR #22750 pattern) -> automatic fallback.
     auto rx9060_v2 = rx9060;
     rx9060_v2.driver_build = "26.11.2 (32.0.21045.29003)";
     auto r780m_v2 = r780m;

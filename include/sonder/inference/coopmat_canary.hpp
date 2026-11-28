@@ -1,7 +1,7 @@
 // Sonder Inference: AMD Windows Vulkan cooperative-matrix child-process canary (NAT-16).
 //
-// Runs VK_KHR_cooperative_matrix property enumeration (#22750/#23508) and a
-// generic 16x16x16 FP16->FP32 cooperative-matrix compute smoke test in an
+// Runs VK_KHR_cooperative_matrix property enumeration (PR #22750 entrypoint)
+// and a generic 16x16x16 FP16->FP32 cooperative-matrix compute smoke test in an
 // isolated child process so driver crashes or hangs never take down the server.
 // Results are cached per (vendor_id, device_id, driver_build, ubatch); any
 // failure activates the automatic GGML_VK_DISABLE_COOPMAT=1 fallback.
@@ -106,8 +106,8 @@ struct CoopmatCanaryOptions {
     CanaryChildRunner child_runner;
 };
 
-// True for AMD GPUs (both discrete e.g. RX 9060 XT and integrated UMA e.g. Radeon 780M)
-// on Windows when Vulkan cooperative matrix is not already known absent ("none").
+// True for AMD GPUs on Windows eligible for ggml-vulkan KHR cooperative matrix
+// (RDNA 3/3.5/4 or unknown architecture, excluding known non-coopmat/RDNA 2 GPUs).
 [[nodiscard]] bool needs_amd_windows_coopmat_canary(const GpuDeviceInfo& gpu, bool is_windows) noexcept;
 
 // Deterministic, sanitized cache key combining vendor_id, device_id, ubatch, and driver_build.
@@ -127,7 +127,7 @@ struct CoopmatCanaryOptions {
                                              const std::vector<CoopmatCanaryRecord>& entries);
 
 // Executes the Vulkan cooperative-matrix canary directly in the CURRENT process:
-//   Phase 1 (#22750/#23508): vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR
+//   Phase 1 (PR #22750 entrypoint): vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR
 //   Phase 2: generic 16x16x16 FP16->FP32 OpCooperativeMatrixMulAddKHR compute
 //            smoke test over ceil(ubatch/16) workgroups with exact result verification.
 //            (Does not reproduce upstream flash-attention coopmat1 flip-direct bugs.)

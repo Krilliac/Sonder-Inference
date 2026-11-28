@@ -190,6 +190,7 @@ if(SONDER_BUILD_CLI)
                     --corpus "${PROJECT_SOURCE_DIR}/bench/corpus/smoke.json"
                     --out "${CMAKE_CURRENT_BINARY_DIR}/cli-bench-md.json" --warmup 0 --runs 1)
         set_tests_properties(sonder.cli.bench_markdown_mock PROPERTIES TIMEOUT 60
+            ENVIRONMENT "SONDER_SKIP_COOPMAT_CANARY=1"
             PASS_REGULAR_EXPRESSION "wrote [^\n]*cli-bench-md\\.md")
     endif()
 
