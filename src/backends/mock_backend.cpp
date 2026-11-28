@@ -443,8 +443,27 @@ public:
         if (cancel.cancelled()) {
             return Status(ErrorCode::cancelled, "cancelled by caller");
         }
-        if (request.inputs.empty()) {
+        if (request.inputs.empty() && request.token_inputs.empty()) {
             return Status(ErrorCode::invalid_argument, "embed inputs must be non-empty");
+        }
+        // Text inputs are keyed by their text; token inputs by their ids (the exact id count is
+        // the accounted usage, as a real backend evaluates token arrays verbatim).
+        struct EmbedItem {
+            std::string key;
+            std::uint64_t tokens;
+        };
+        std::vector<EmbedItem> items;
+        items.reserve(request.inputs.size() + request.token_inputs.size());
+        for (const std::string& input : request.inputs) {
+            items.push_back({input, detail::accounting_tokenize(input).size()});
+        }
+        for (const auto& ids : request.token_inputs) {
+            std::string key = "tokens:";
+            for (const TokenId id : ids) {
+                key += std::to_string(id);
+                key.push_back(',');
+            }
+            items.push_back({std::move(key), static_cast<std::uint64_t>(ids.size())});
         }
         if (request.pooling_type == EmbedPoolingType::rank) {
             return Status(ErrorCode::invalid_argument,
@@ -472,19 +491,18 @@ public:
         }
         const auto t0 = std::chrono::steady_clock::now();
         EmbedResult result;
-        result.embeddings.reserve(request.inputs.size());
+        result.embeddings.reserve(items.size());
         result.dimensions = out_dims;
         result.pooling_type =
             request.pooling_type == EmbedPoolingType::unspecified ? EmbedPoolingType::mean : request.pooling_type;
         result.encoding_format = request.encoding_format.empty() ? std::string("float") : request.encoding_format;
         result.model = descriptor_.name;
-        for (const std::string& input : request.inputs) {
+        for (const EmbedItem& item : items) {
             if (cancel.cancelled()) {
                 return Status(ErrorCode::cancelled, "cancelled by caller");
             }
-            const auto toks = detail::accounting_tokenize(input);
-            result.prompt_tokens += toks.size();
-            std::uint64_t seed = fnv1a(input) ^ fnv1a(descriptor_.name);
+            result.prompt_tokens += item.tokens;
+            std::uint64_t seed = fnv1a(item.key) ^ fnv1a(descriptor_.name);
             std::vector<float> vec(out_dims, 0.0f);
             double norm_sq = 0.0;
             for (std::size_t i = 0; i < out_dims; ++i) {

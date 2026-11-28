@@ -1,7 +1,7 @@
 // Sonder Inference: benchmark harness (docs/BENCHMARK_PLAN.md).
 //
-// Runs a prompt corpus through Engine sessions on any backend (ollama,
-// llamaserver, mock, future native backends) and produces a results document
+// Runs a prompt corpus through Engine sessions on any backend (llamacpp,
+// ollama, llamaserver, mock) and produces a results document
 // (schema sonder.inference.bench/1): per-request rows, per-prompt and global
 // distributions (TTFT, total latency, decode/prompt tokens/sec, errors),
 // agent fan-out batches, and full provenance. render_markdown() turns a
@@ -104,7 +104,10 @@ json::Array gpu_snapshot_to_json(const std::vector<GpuDeviceInfo>& gpus,
 // Parsed command-line arguments for the standalone `sonder-bench` runner.
 struct BenchCliArgs {
     bool help = false;
-    std::string backend = "ollama";
+    std::string backend = "llamacpp";
+    std::uint32_t context_length = 4096;
+    std::int32_t threads = 0;
+    std::int32_t gpu_layers = -1;
     std::string ollama_url;
     std::string llamaserver_url;
     std::string llamaserver_config;
@@ -142,8 +145,9 @@ Result<std::shared_ptr<Backend>> make_llamaserver_bench_backend(const LlamaServe
 std::string render_bench_cli_help();
 
 // Parses `sonder-bench` argv (excluding argv[0]) against its option spec and
-// validates backend combinations and numeric ranges (including --concurrency
-// 1..64, --no-gpu-snapshot, and --llamaserver-url / --llamaserver-config).
+// validates backend combinations and numeric ranges (including native
+// --ctx-size / --threads / --gpu-layers, --concurrency 1..64,
+// --no-gpu-snapshot, and --llamaserver-url / --llamaserver-config).
 // Returns true on success (or when -h/--help is present, setting out.help = true);
 // returns false and writes a diagnostic into `error` on usage errors.
 bool parse_bench_cli_args(const std::vector<std::string>& args, BenchCliArgs& out, std::string& error);
