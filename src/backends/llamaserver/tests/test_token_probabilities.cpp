@@ -12,6 +12,7 @@
 #include "fake_server.hpp"
 #include "sonder/inference/backends/llamaserver.hpp"
 #include "sonder/inference/engine.hpp"
+#include "sonder/inference/text_capture.hpp"
 
 using namespace sonder::inference;
 
@@ -402,5 +403,76 @@ TEST_SUITE("llamaserver_token_probabilities") {
         CHECK(has_sampled[2]);
         CHECK(candidate_counts[2] == 1);
         CHECK(last_id == 4);
+    }
+
+    // Token ids map 1:1 to text (POST /v1/detokenize), so they follow the
+    // output-text capture policy like the "text" fields do.
+    TEST_CASE("backend-probed token ids are output text: policy off and the request opt-out export none") {
+        sonder_test::FakeLlamaServer server;
+        server.set_body(kNativePostSamplingBody);
+        const auto assert_no_ids = [](Harness &h, std::size_t expected_tokens) {
+            h.flush();
+            const auto tokens = read_events(*h.sink, "inference.token.generated");
+            REQUIRE(tokens.size() == expected_tokens);
+            for (const auto &e : tokens) {
+                const auto &a = e.attributes;
+                CHECK(a.find("token_id") == nullptr);
+                CHECK(a.find("text") == nullptr);
+                // The non-identifying measurements stay.
+                CHECK(a.find("index") != nullptr);
+                CHECK(a.find("probability") != nullptr);
+                CHECK(a.find("probability_basis") != nullptr);
+            }
+            const auto candidates = read_events(*h.sink, "inference.sampling.candidates");
+            REQUIRE(candidates.size() == expected_tokens);
+            for (const auto &e : candidates) {
+                const auto &a = e.attributes;
+                CHECK(a.find("sampled_token_id") == nullptr);
+                CHECK(a.find("probability_basis") != nullptr);
+                for (const auto &c : a.find("candidates")->as_array()) {
+                    CHECK(c.find("token_id") == nullptr);
+                    CHECK(c.find("text") == nullptr);
+                    CHECK(c.find("probability") != nullptr);
+                }
+            }
+        };
+        SUBCASE("operator policy off") {
+            TelemetryOptions t;
+            t.text_capture = TextCapturePolicy::off;
+            Harness h(server, t);
+            REQUIRE(h.session->generate("x").ok());
+            assert_no_ids(h, 2);
+        }
+        SUBCASE("operator policy full, request sets no_text_capture") {
+            TelemetryOptions t;
+            t.text_capture = TextCapturePolicy::full;
+            Harness h(server, t);
+            RequestOptions quiet;
+            quiet.no_text_capture = true;
+            REQUIRE(h.session->generate("x", {}, std::nullopt, quiet).ok());
+            assert_no_ids(h, 2);
+        }
+    }
+
+    TEST_CASE("backend-probed token ids are still exported when the policy captures output text") {
+        sonder_test::FakeLlamaServer server;
+        server.set_body(kNativePostSamplingBody);
+        TelemetryOptions t;
+        t.text_capture = TextCapturePolicy::on;
+        Harness h(server, t);
+        REQUIRE(h.session->generate("x").ok());
+        h.flush();
+        const auto tokens = read_events(*h.sink, "inference.token.generated");
+        REQUIRE(tokens.size() == 2);
+        CHECK(tokens[0].attributes.find("token_id")->as_int() == 13);
+        CHECK(tokens[1].attributes.find("token_id")->as_int() == 21);
+        const auto candidates = read_events(*h.sink, "inference.sampling.candidates");
+        REQUIRE(candidates.size() == 2);
+        CHECK(candidates[0].attributes.find("sampled_token_id")->as_int() == 13);
+        CHECK(candidates[1].attributes.find("sampled_token_id")->as_int() == 21);
+        for (const auto &e : candidates) {
+            for (const auto &c : e.attributes.find("candidates")->as_array())
+                CHECK(c.find("token_id") != nullptr);
+        }
     }
 }

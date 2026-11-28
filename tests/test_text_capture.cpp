@@ -281,3 +281,183 @@ TEST_CASE("text capture: chat prompts are captured under full and suppressed by 
     CHECK(attr(started[0], "prompt")->as_string().find("chat marker walrus") != std::string::npos);
     CHECK(attr(started[1], "prompt") == nullptr);
 }
+
+// ---------------------------------------------------------------------------
+// Token ids are output text. docs/TELEMETRY.md: "never carries prompt or
+// generated text unless the operator opts in"; ids map 1:1 to text through
+// POST /v1/detokenize, so they follow the same output-text capture policy.
+// ---------------------------------------------------------------------------
+#if defined(SONDER_HAS_SAMPLER_CHAIN)
+namespace {
+
+// Engine + mock session on the Sonder sampler path (token_logits), standard
+// telemetry, so every token carries a Sonder-sampled id plus top-k candidates.
+struct SonderSampledHarness {
+    std::shared_ptr<MemoryTelemetrySink> sink = std::make_shared<MemoryTelemetrySink>();
+    std::unique_ptr<Engine> engine;
+    std::shared_ptr<Session> session;
+
+    explicit SonderSampledHarness(TextCapturePolicy policy, bool legacy_capture_text = false) {
+        EngineOptions eo;
+        eo.telemetry.level = TelemetryLevel::standard;
+        eo.telemetry.text_capture = policy;
+        eo.telemetry.capture_text = legacy_capture_text;
+        eo.telemetry.token_probability_top_k = 3;
+        eo.telemetry_sinks.push_back(sink);
+        eo.sample_devices_on_start = false;
+        eo.sample_gpu_devices = false;
+        eo.device_sample_interval = std::chrono::milliseconds(0);
+        eo.scheduling.enabled = false;
+        engine = std::make_unique<Engine>(std::move(eo));
+        MockBackendOptions mo;
+        mo.token_logits = true;
+        mo.default_completion_tokens = 4;
+        REQUIRE(engine->register_backend(make_mock_backend(mo)).ok());
+        auto model = engine->load_model(kMockBackendName, ModelLoadOptions{"mock:tiny", "cpu:0"});
+        REQUIRE(model.ok());
+        auto s = engine->create_session(model.value(), {});
+        REQUIRE(s.ok());
+        session = s.value();
+    }
+
+    std::vector<json::Value> events_of(const std::string& type) {
+        engine->telemetry().flush();
+        std::vector<json::Value> out;
+        for (const auto& line : sink->lines()) {
+            auto v = json::parse(line);
+            REQUIRE(v.ok());
+            if (v.value().find("event_type")->as_string() == type) out.push_back(v.value());
+        }
+        return out;
+    }
+
+    // Every id-bearing field of the token and candidates events; empty means none leaked.
+    std::vector<std::string> leaked_id_fields() {
+        std::vector<std::string> leaks;
+        for (const auto& e : events_of("inference.token.generated")) {
+            if (attr(e, "token_id") != nullptr) leaks.push_back("inference.token.generated.token_id");
+        }
+        for (const auto& e : events_of("inference.sampling.candidates")) {
+            if (attr(e, "sampled_token_id") != nullptr) {
+                leaks.push_back("inference.sampling.candidates.sampled_token_id");
+            }
+            const auto* list = attr(e, "candidates");
+            if (list == nullptr) continue;
+            for (const auto& c : list->as_array()) {
+                if (c.find("token_id") != nullptr) {
+                    leaks.push_back("inference.sampling.candidates.candidates[].token_id");
+                }
+            }
+        }
+        return leaks;
+    }
+};
+
+}  // namespace
+
+TEST_CASE("text capture: policy off exports no token ids, only index/count/probability") {
+    SonderSampledHarness h(TextCapturePolicy::off);
+    REQUIRE(h.session->generate(kPrompt, {}, SamplingConfig::greedy(4)).ok());
+    const auto tokens = h.events_of("inference.token.generated");
+    const auto cands = h.events_of("inference.sampling.candidates");
+    REQUIRE(tokens.size() >= 2u);
+    REQUIRE(cands.size() == tokens.size());  // the events still exist: the probabilities are not output text
+    for (const auto& e : tokens) {
+        CHECK(attr(e, "token_id") == nullptr);
+        CHECK(attr(e, "text") == nullptr);
+        CHECK(attr(e, "index") != nullptr);
+        CHECK(attr(e, "bytes") != nullptr);
+        CHECK(attr(e, "count") != nullptr);
+        CHECK(attr(e, "probability") != nullptr);
+        CHECK(attr(e, "probability_basis") != nullptr);
+    }
+    for (const auto& e : cands) {
+        CHECK(attr(e, "sampled_token_id") == nullptr);
+        CHECK(attr(e, "probability_basis") != nullptr);
+        const auto* list = attr(e, "candidates");
+        REQUIRE(list != nullptr);
+        for (const auto& c : list->as_array()) {
+            CHECK(c.find("token_id") == nullptr);
+            CHECK(c.find("text") == nullptr);
+            CHECK(c.find("probability") != nullptr);
+        }
+    }
+    CHECK(h.leaked_id_fields().empty());
+}
+
+TEST_CASE("text capture: the per-request opt-out strips token ids even when the operator captures text") {
+    for (const auto policy : {TextCapturePolicy::on, TextCapturePolicy::full}) {
+        CAPTURE(to_string(policy));
+        SonderSampledHarness h(policy);
+        RequestOptions quiet;
+        quiet.no_text_capture = true;
+        REQUIRE(h.session->generate("opted out", {}, SamplingConfig::greedy(4), quiet).ok());
+        REQUIRE_FALSE(h.events_of("inference.token.generated").empty());
+        CHECK(h.leaked_id_fields().empty());
+        for (const auto& e : h.events_of("inference.token.generated")) CHECK(attr(e, "text") == nullptr);
+    }
+}
+
+TEST_CASE("text capture: the opt-out also strips token ids from chat requests") {
+    SonderSampledHarness h(TextCapturePolicy::full);
+    RequestOptions quiet;
+    quiet.no_text_capture = true;
+    const std::vector<ChatMessage> messages = {{"user", "chat opt out"}};
+    REQUIRE(h.session->chat(messages, {}, SamplingConfig::greedy(4), quiet).ok());
+    REQUIRE_FALSE(h.events_of("inference.token.generated").empty());
+    CHECK(h.leaked_id_fields().empty());
+}
+
+TEST_CASE("text capture: on, full and the legacy flag still export token ids and candidate ids") {
+    struct Case {
+        TextCapturePolicy policy;
+        bool legacy;
+    };
+    for (const Case c : {Case{TextCapturePolicy::on, false}, Case{TextCapturePolicy::full, false},
+                         Case{TextCapturePolicy::off, true}}) {
+        CAPTURE(to_string(c.policy));
+        CAPTURE(c.legacy);
+        SonderSampledHarness h(c.policy, c.legacy);
+        REQUIRE(h.session->generate(kPrompt, {}, SamplingConfig::greedy(4)).ok());
+        const auto tokens = h.events_of("inference.token.generated");
+        const auto cands = h.events_of("inference.sampling.candidates");
+        REQUIRE(tokens.size() >= 2u);
+        REQUIRE(cands.size() == tokens.size());
+        for (std::size_t i = 0; i < tokens.size(); ++i) {
+            REQUIRE(attr(tokens[i], "token_id") != nullptr);
+            REQUIRE(attr(cands[i], "sampled_token_id") != nullptr);
+            CHECK(attr(cands[i], "sampled_token_id")->as_int() == attr(tokens[i], "token_id")->as_int());
+            const auto& list = attr(cands[i], "candidates")->as_array();
+            REQUIRE_FALSE(list.empty());
+            for (const auto& entry : list) CHECK(entry.find("token_id") != nullptr);
+        }
+    }
+}
+
+TEST_CASE("text capture: an opt-out request leaks no ids and the next captured request still has them") {
+    SonderSampledHarness h(TextCapturePolicy::on);
+    RequestOptions quiet;
+    quiet.no_text_capture = true;
+    REQUIRE(h.session->generate("first", {}, SamplingConfig::greedy(4), quiet).ok());
+    REQUIRE(h.session->generate("second", {}, SamplingConfig::greedy(4)).ok());
+    const auto started = h.events_of("request.started");
+    REQUIRE(started.size() == 2);
+    const std::string first_request = started[0].find("request_id")->as_string();
+    std::size_t first_tokens = 0;
+    std::size_t second_tokens_with_id = 0;
+    for (const auto& e : h.events_of("inference.token.generated")) {
+        if (e.find("request_id")->as_string() == first_request) {
+            ++first_tokens;
+            CHECK(attr(e, "token_id") == nullptr);
+        } else if (attr(e, "token_id") != nullptr) {
+            ++second_tokens_with_id;
+        }
+    }
+    CHECK(first_tokens >= 2u);
+    CHECK(second_tokens_with_id == first_tokens);
+    for (const auto& e : h.events_of("inference.sampling.candidates")) {
+        const bool first = e.find("request_id")->as_string() == first_request;
+        CHECK((attr(e, "sampled_token_id") == nullptr) == first);
+    }
+}
+#endif  // SONDER_HAS_SAMPLER_CHAIN
