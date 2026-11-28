@@ -33,14 +33,16 @@ Default CI presets (`ci-windows`, `ci-linux`) keep `SONDER_WITH_LLAMA_CPP=OFF` a
 
 | Preset | Platform | Accelerator | Key flags |
 | --- | --- | --- | --- |
-| `windows-cuda-rtx` | Windows (MSVC + Ninja) | NVIDIA CUDA | `GGML_CUDA=ON`, `CMAKE_CUDA_ARCHITECTURES=86;89;120`, `GGML_CUDA_FA_ALL_QUANTS=ON` |
+| `windows-cuda-blackwell` / `linux-cuda-blackwell` | Windows (MSVC) / Linux (GCC/Clang), `Release` | NVIDIA CUDA (Blackwell) | `GGML_CUDA=ON`, `CMAKE_CUDA_ARCHITECTURES=120a`, `GGML_CUDA_GRAPHS=ON`, `GGML_CUDA_FA_ALL_QUANTS=ON` |
+| `windows-cuda-blackwell-120f` / `linux-cuda-blackwell-120f` | Windows / Linux, `Release` | NVIDIA CUDA (Blackwell `sm_12x` family) | `GGML_CUDA=ON`, `CMAKE_CUDA_ARCHITECTURES=120f`, `GGML_CUDA_GRAPHS=ON`, `GGML_CUDA_FA_ALL_QUANTS=ON` |
+| `windows-cuda-rtx` | Windows (MSVC + Ninja) | NVIDIA CUDA | `GGML_CUDA=ON`, `CMAKE_CUDA_ARCHITECTURES=86;89;120a`, `GGML_CUDA_GRAPHS=ON`, `GGML_CUDA_FA_ALL_QUANTS=ON` |
 | `windows-vulkan-xt` | Windows (MSVC + Ninja) | Vulkan (AMD RX XT / APU / cross-vendor) | `GGML_VULKAN=ON` |
-| `linux-cuda-rtx` | Linux (GCC/Clang + Ninja) | NVIDIA CUDA | `GGML_CUDA=ON`, `CMAKE_CUDA_ARCHITECTURES=86;89;120`, `GGML_CUDA_FA_ALL_QUANTS=ON` |
+| `linux-cuda-rtx` | Linux (GCC/Clang + Ninja) | NVIDIA CUDA | `GGML_CUDA=ON`, `CMAKE_CUDA_ARCHITECTURES=86;89;120a`, `GGML_CUDA_GRAPHS=ON`, `GGML_CUDA_FA_ALL_QUANTS=ON` |
 | `linux-rocm-xt` | Linux (GCC/Clang + Ninja) | AMD ROCm/HIP | `GGML_HIP=ON`, `AMDGPU_TARGETS=gfx1030;gfx1100;gfx1101;gfx1102;gfx1103;gfx1200;gfx1201` |
 | `linux-vulkan-xt` | Linux (GCC/Clang + Ninja) | Vulkan (AMD RX XT / APU / cross-vendor) | `GGML_VULKAN=ON` |
 
 Target coverage:
-- **NVIDIA RTX (`86;89;120`)**: Ampere (RTX 30-series, `sm_86`), Ada Lovelace (RTX 40-series, `sm_89`), and Blackwell (RTX 50-series, `sm_120`). `GGML_CUDA_FA_ALL_QUANTS=ON` compiles Flash Attention kernels for quantized KV cache types (`q8_0`, `q5_0`, `q5_1`, `q4_0`, `q4_1`, `iq4_nl`).
+- **NVIDIA RTX (`86;89;120a`, `120a`, `120f`)**: Ampere (RTX 30-series, `sm_86`), Ada Lovelace (RTX 40-series, `sm_89`), and Blackwell (RTX 50-series, `sm_120a` non-portable cubins or `sm_120f` family-portable cubins). Configure-time checks (`cmake/SonderCudaCheck.cmake`) require CUDA Toolkit `>= 13.4` (`13.5` preferred), reject bare `120` targets (which fail `ptxas` on block-scaled FP4 MMA), and refuse `cuBLAS 13.6.0` (`CUB-10445`); see [GPU_SUPPORT.md](GPU_SUPPORT.md#2-nvidia-rtx-ampere-ada-blackwell). `GGML_CUDA_FA_ALL_QUANTS=ON` compiles Flash Attention kernels for quantized KV cache types (`q8_0`, `q5_0`, `q5_1`, `q4_0`, `q4_1`, `iq4_nl`).
 - **AMD Radeon RX XT & Ryzen APU**: RDNA 2 (`gfx1030`), RDNA 3 discrete (`gfx1100`, `gfx1101`, `gfx1102`), RDNA 3 Ryzen APU UMA (`gfx1103`, e.g. Radeon 780M/890M), and RDNA 4 (`gfx1200`, `gfx1201`). On Linux, `linux-rocm-xt` targets ROCm/HIP directly (`ROCm0`); on Windows (and on Linux hosts without ROCm), `windows-vulkan-xt` / `linux-vulkan-xt` use Vulkan (`Vulkan0`).
 
 ### Single pinned llama.cpp engine and SI patch series

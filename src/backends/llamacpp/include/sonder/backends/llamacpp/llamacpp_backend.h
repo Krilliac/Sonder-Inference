@@ -18,6 +18,7 @@
 #include <utility>
 #include <vector>
 
+#include "sonder/backends/llamacpp/aux_stream_gate.hpp"
 #include "sonder/inference/model_architecture.hpp"
 #include "sonder/inference/request_priority.hpp"
 #include "sonder/inference/speculative_verifier.hpp"
@@ -267,6 +268,12 @@ struct LoadOptions {
     std::uint32_t embed_batch_tokens = kDefaultEmbedBatchTokens;
     // Maximum sequences packed per embedding/rerank forward pass (0 = auto, max kMaxEmbedSequences).
     std::uint32_t embed_max_sequences = kDefaultEmbedMaxSequences;
+    // In-process workload role, CUDA stream priorities, and decode-aware auxiliary gate (NAT-12).
+    WorkloadRole workload_role = WorkloadRole::kMainDecode;
+    StreamPriority main_stream_priority = StreamPriority::kHigh;
+    StreamPriority aux_stream_priority = StreamPriority::kLow;
+    AuxGateConfig aux_gate{};
+    std::shared_ptr<DecodeAwareAuxGate> shared_aux_gate = nullptr;
     // Opt-in startup greedy smoke test (default off): after a successful load
     // Load() decodes a short fixed prompt greedily and fails the load with
     // kLoadFailed when logits are non-finite/uniform, step 0 emits an immediate
@@ -434,6 +441,14 @@ struct SamplingParams {
     std::vector<Token> grammar_prefill;
     bool compute_logprobs = false;     // compute exact log-softmax logprob for each emitted token
     std::int32_t top_logprobs = 0;     // number of top alternative logprobs (0..kMaxTopLogprobs)
+    // Telemetry-only probability probe (0..kMaxTopLogprobs; 0 = off). Computes
+    // sampled token probability + top-K alternatives for TokenEvent without
+    // populating caller logprobs unless compute_logprobs is true. Stride and
+    // max_events let the backend skip candidate extraction on strided or capped
+    // tokens while still reporting the sampled token's scalar probability.
+    std::int32_t telemetry_top_k = 0;
+    std::uint32_t telemetry_candidates_stride = 1;      // 0 treated as 1
+    std::uint32_t telemetry_candidates_max_events = 0;  // 0 = uncapped
 };
 
 [[nodiscard]] Status Validate(const SamplingParams& params);
@@ -549,6 +564,12 @@ struct TokenEvent {
     bool has_logprob = false;
     float logprob = 0.0F;
     std::vector<std::pair<Token, float>> top_logprobs{};
+    // Telemetry-only sampled token probability and top-K alternatives
+    // (populated when SamplingParams::telemetry_top_k > 0).
+    bool has_sampled_probability = false;
+    float sampled_probability = 0.0F;
+    bool sampled_probability_post_sampling = false;
+    std::vector<std::pair<Token, float>> sampled_candidates{};
 };
 
 // Return false to stop generation (treated as cancellation).
@@ -617,6 +638,10 @@ struct GenerateResult {
     // Opt-in stage timing breakdown (enabled == false unless requested).
     GenerateStageTimings stage_timings{};
 
+    // True when llama.cpp backend sampling (`llama_set_sampler`) was bound for
+    // this request's target sampler chain.
+    bool backend_sampling_active = false;
+
     [[nodiscard]] double decode_tokens_per_second() const noexcept;
     [[nodiscard]] double prefill_tokens_per_second() const noexcept;
     [[nodiscard]] double spec_accept_rate() const noexcept;
@@ -662,6 +687,8 @@ struct EmbedOutput {
     std::size_t dimensions = 0;
     PoolingType pooling = PoolingType::kUnspecified;
     std::size_t batches_executed = 0;
+    std::size_t gated_slices = 0;
+    double gate_wait_ms = 0.0;
 };
 
 struct ScoreOutput {
@@ -669,6 +696,8 @@ struct ScoreOutput {
     std::int32_t prompt_tokens = 0;
     double eval_ms = 0.0;
     std::size_t batches_executed = 0;
+    std::size_t gated_slices = 0;
+    double gate_wait_ms = 0.0;
 };
 
 enum class DeviceKind { kCpu, kGpu, kIntegratedGpu, kAccelerator, kOther };
@@ -951,6 +980,8 @@ public:
     void SetKvTelemetry(std::shared_ptr<KvTelemetry> kv);
     void SetGraphEvalSink(GraphEvalSink sink);
     [[nodiscard]] PrefixCoalescerStats GetPrefixCoalescerStats() const noexcept;
+    [[nodiscard]] std::shared_ptr<DecodeAwareAuxGate> GetAuxGate() const noexcept;
+    [[nodiscard]] std::string GetAuxExecutionDomain() const;
     [[nodiscard]] PrefixCheckpointCounters GetPrefixCheckpointStats() const noexcept;
 
 private:
@@ -982,11 +1013,27 @@ private:
 // Length of the longest common prefix between two token spans.
 [[nodiscard]] std::size_t LongestCommonPrefix(std::span<const Token> a, std::span<const Token> b) noexcept;
 
+// Telemetry-only sampled token probability and top-K alternatives (prob in [0, 1]).
+struct SampledProbInfo {
+    bool valid = false;
+    float probability = 0.0F;
+    bool post_sampling = false;
+    std::vector<std::pair<Token, float>> candidates;
+};
+
+// Pure mirror of llama_token_data for header-free probability helpers.
+struct CandidateLogitProb {
+    Token id = -1;
+    float logit = 0.0F;
+    float p = 0.0F;
+};
+
 // Per-token exact log-softmax probability and top-K alternatives.
 struct TokenLogprobInfo {
     bool valid = false;
     float logprob = 0.0F;
     std::vector<std::pair<Token, float>> top_logprobs;
+    SampledProbInfo sampled_prob{};
 };
 
 // Computes exact log-softmax logprob for `chosen_token` and up to `top_k`
@@ -994,6 +1041,29 @@ struct TokenLogprobInfo {
 // by smaller token id) using numerically stable max-subtraction.
 [[nodiscard]] TokenLogprobInfo ComputeTokenLogprobs(std::span<const float> logits, Token chosen_token,
                                                     std::int32_t top_k);
+
+// Converts exact pre-sampling log-softmax info into telemetry SampledProbInfo
+// (post_sampling = false), keeping at most `top_k` entries sorted by
+// probability descending then token id ascending. When `collect_candidates` is
+// false, populates only the sampled token's scalar probability.
+[[nodiscard]] SampledProbInfo BuildPreSamplingProbInfo(const TokenLogprobInfo& lp, Token chosen_token,
+                                                       std::int32_t top_k, bool collect_candidates = true);
+
+// Extracts post-sampling telemetry probability and top-K alternatives from
+// surviving sampler candidates (post_sampling = true). When `has_probs` is
+// true, reads `c.p`; otherwise runs numerically stable softmax over `c.logit`.
+// When `collect_candidates` is false, populates only the sampled token's
+// scalar probability without collecting or sorting top-K alternatives.
+[[nodiscard]] SampledProbInfo ComputePostSamplingProbInfo(std::span<const CandidateLogitProb> candidates,
+                                                          bool has_probs, Token chosen_token, std::int32_t top_k,
+                                                          bool collect_candidates = true);
+
+// Extracts post-sampling telemetry probability and top-K alternatives directly
+// from a dense vocab-indexed probability vector (index == token id) in O(K)
+// memory without copying the full vocabulary into scratch storage.
+[[nodiscard]] SampledProbInfo ComputePostSamplingProbInfoFromDenseProbs(std::span<const double> probs,
+                                                                        Token chosen_token, std::int32_t top_k,
+                                                                        bool collect_candidates = true);
 
 // Validates multimodal media payloads against kMaxMediaImages (8) and
 // kMaxMediaBlobBytes (16 MiB per image), rejecting empty blobs.

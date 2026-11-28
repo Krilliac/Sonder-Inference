@@ -22,8 +22,9 @@
 # FetchContent still verifies the manifest SHA-256 and applies all patches.
 #
 # Opt-in GPU presets live in CMakePresets.json: windows-cuda-blackwell,
-# windows-cuda-rtx, windows-rocm-xt, windows-vulkan-xt, linux-llamacpp,
-# linux-cuda-blackwell, linux-cuda-rtx, linux-rocm-xt, and linux-vulkan-xt.
+# windows-cuda-blackwell-120f, windows-cuda-rtx, windows-rocm-xt,
+# windows-vulkan-xt, linux-llamacpp, linux-cuda-blackwell,
+# linux-cuda-blackwell-120f, linux-cuda-rtx, linux-rocm-xt, and linux-vulkan-xt.
 
 # Optional llguidance structured-output path (see the llguidance block below). OFF by default: the
 # default build, CI and every existing test are unchanged. Needs the Rust toolchain (cargo) and git
@@ -51,6 +52,11 @@ endif()
 # Pin it off in the cache as well, so a pre-populated CMakeCache.txt cannot
 # turn GGML_RPC back on: option() leaves an existing cache entry alone.
 set(GGML_RPC OFF CACHE BOOL "ggml: use RPC (refused for the in-process llamacpp backend)" FORCE)
+
+if(GGML_CUDA)
+    include(SonderCudaCheck)
+    sonder_check_cuda_config()
+endif()
 
 include(FetchContent)
 
@@ -241,6 +247,13 @@ endif()
 # the static archives be linked into a shared sonder_inference.
 set(BUILD_SHARED_LIBS OFF)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+if(GGML_BACKEND_DL)
+    message(WARNING
+        "GGML_BACKEND_DL=ON requested, but the in-process llamacpp backend links static archives and shares "
+        "thread-local CUDA stream priority state across sonder_backend_llamacpp and ggml-cuda; forcing GGML_BACKEND_DL=OFF.")
+endif()
+set(GGML_BACKEND_DL OFF CACHE BOOL
+    "ggml: build backends as dynamic libraries (forced OFF for static in-process llamacpp linkage)" FORCE)
 
 if(CMAKE_VERSION VERSION_GREATER_EQUAL "3.24")
     cmake_policy(SET CMP0135 NEW)
@@ -303,6 +316,22 @@ foreach(sonder_llamacpp_upstream_target IN ITEMS llama)
             CXX_STANDARD_REQUIRED ON)
     endif()
 endforeach()
+
+# Thread-scoped CUDA stream priority state shared by sonder_backend_llamacpp and
+# ggml-cuda (placed downstream of both static archives in link order).
+add_library(sonder_cuda_prio_state STATIC sonder_cuda_prio_state.cpp)
+target_compile_features(sonder_cuda_prio_state PRIVATE cxx_std_17)
+set_target_properties(sonder_cuda_prio_state PROPERTIES POSITION_INDEPENDENT_CODE ON)
+if(COMMAND sonder_set_warnings)
+    sonder_set_warnings(sonder_cuda_prio_state)
+endif()
+set(_sonder_llamacpp_cuda_prio_hook OFF)
+if(TARGET ggml-cuda AND NOT GGML_HIP AND NOT GGML_MUSA AND NOT GGML_BACKEND_DL)
+    target_compile_options(ggml-cuda PRIVATE
+        "$<$<COMPILE_LANGUAGE:CUDA>:--pre-include=${CMAKE_CURRENT_SOURCE_DIR}/sonder_ggml_cuda_stream_priority.cuh>")
+    target_link_libraries(ggml-cuda PRIVATE sonder_cuda_prio_state)
+    set(_sonder_llamacpp_cuda_prio_hook ON)
+endif()
 
 # Feature auto-detection against the resolved llama.cpp / ggml headers on the
 # pinned mainline archive + SI's third_party/ggml-patches/ series.
@@ -596,6 +625,7 @@ endif()
 # --- llguidance end ---
 
 add_library(sonder_backend_llamacpp STATIC
+    aux_stream_gate.cpp
     device_health.cpp
     gguf_compat.cpp
     kv_policy.cpp
@@ -620,7 +650,7 @@ target_include_directories(sonder_backend_llamacpp
 )
 target_compile_features(sonder_backend_llamacpp PUBLIC cxx_std_20)
 # llama.h stays private: nothing outside this directory sees llama.cpp types.
-target_link_libraries(sonder_backend_llamacpp PRIVATE llama ggml ${SONDER_LLAMACPP_EXTRA_LIBS} ${SONDER_LLGUIDANCE_LINK_LIBS})
+target_link_libraries(sonder_backend_llamacpp PRIVATE llama ggml ${SONDER_LLAMACPP_EXTRA_LIBS} sonder_cuda_prio_state ${SONDER_LLGUIDANCE_LINK_LIBS})
 if(SONDER_WITH_LLGUIDANCE)
     add_dependencies(sonder_backend_llamacpp sonder_llguidance_ext)
 endif()
@@ -628,6 +658,9 @@ target_compile_definitions(sonder_backend_llamacpp
     PUBLIC  ${SONDER_LLAMACPP_FEATURE_DEFS}
     PRIVATE SONDER_LLAMACPP_TAG_STRING="${SONDER_LLAMACPP_RESOLVED_TAG}"
 )
+if(_sonder_llamacpp_cuda_prio_hook)
+    target_compile_definitions(sonder_backend_llamacpp PUBLIC SONDER_LLAMACPP_CUDA_PRIO_HOOK=1)
+endif()
 if(COMMAND sonder_set_warnings)
     sonder_set_warnings(sonder_backend_llamacpp)
 endif()

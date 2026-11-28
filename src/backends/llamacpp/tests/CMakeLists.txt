@@ -7,6 +7,7 @@
 #                             reported as Skipped (exit 77) when unset.
 
 sonder_add_module_tests(llamacpp
+    test_aux_stream_gate.cpp
     test_gguf_compat.cpp
     test_kv_policy.cpp
     test_llamacpp_util.cpp
@@ -45,3 +46,8 @@ target_include_directories(sonder_llamacpp_integration PRIVATE "${CMAKE_CURRENT_
 sonder_set_warnings(sonder_llamacpp_integration)
 add_test(NAME sonder.llamacpp.integration COMMAND sonder_llamacpp_integration)
 set_tests_properties(sonder.llamacpp.integration PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+
+if(GGML_CUDA AND TARGET ggml-cuda)
+    include(SonderCudaCheck)
+    sonder_register_cuda_sass_test(ggml-cuda)
+endif()
