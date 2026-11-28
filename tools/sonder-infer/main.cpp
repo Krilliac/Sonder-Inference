@@ -19,6 +19,7 @@
 #include "../../src/worker/remote_backend.hpp"
 #endif
 #include "sonder/inference.hpp"
+#include "sonder/inference/coopmat_canary.hpp"
 #include "sonder_inference.h"
 // Header-only CLI helpers (option specs, checked values, environment, chat
 // files and the chat loop); shared with the unit tests (tests/test_cli_*.cpp).
@@ -114,7 +115,7 @@ std::string format_reading_mib(const si::MemoryReading& reading) {
 }
 
 si::json::Object gpu_to_json(const si::GpuDeviceInfo& g) {
-    return si::json::Object{
+    si::json::Object obj{
         {"id", g.id},
         {"name", g.name},
         {"vendor", si::to_string(g.vendor)},
@@ -128,6 +129,43 @@ si::json::Object gpu_to_json(const si::GpuDeviceInfo& g) {
         {"is_integrated_uma", g.is_integrated_uma},
         {"backend_hint", g.backend_hint},
         {"source", g.source}};
+    si::append_gpu_device_telemetry_json(obj, g);
+    return obj;
+}
+
+void print_gpu_line(const si::GpuDeviceInfo& g) {
+    std::cout << g.id << "  kind=gpu  vendor=" << si::to_string(g.vendor) << "  name=\"" << g.name << "\""
+              << "  dedicated_total_mib=" << format_reading_mib(g.dedicated_total)
+              << "  dedicated_free_mib=" << format_reading_mib(g.dedicated_free)
+              << "  shared_total_mib=" << format_reading_mib(g.shared_total)
+              << "  uma=" << (g.is_integrated_uma ? "true" : "false")
+              << "  backend_hint=" << (g.backend_hint.empty() ? "none" : g.backend_hint)
+              << "  source=" << (g.source.empty() ? "unknown" : g.source);
+    if (!g.driver_build.empty()) {
+        std::cout << "  driver_build=\"" << g.driver_build << "\"";
+    }
+    if (g.rebar.has_value()) {
+        std::cout << "  rebar=" << (*g.rebar ? "true" : "false");
+    }
+    if (!g.matrix_cores.empty()) {
+        std::cout << "  matrix_cores=" << g.matrix_cores;
+    }
+    if (g.pcie.current_gen.has_value() || g.pcie.current_width.has_value()) {
+        std::cout << "  pcie=";
+        if (g.pcie.current_gen.has_value()) {
+            std::cout << "gen" << *g.pcie.current_gen;
+        }
+        if (g.pcie.current_width.has_value()) {
+            std::cout << "x" << *g.pcie.current_width;
+        }
+    }
+    if (!g.pcie.aspm_state.empty()) {
+        std::cout << "  aspm=" << g.pcie.aspm_state;
+    }
+    if (!g.vulkan_heaps.empty()) {
+        std::cout << "  vk_heaps=" << g.vulkan_heaps.size();
+    }
+    std::cout << "\n";
 }
 
 int cmd_devices(const Args& a) {
@@ -161,13 +199,7 @@ int cmd_devices(const Args& a) {
                   << "  available_memory_mib=" << (d.available_memory_bytes >> 20) << "\n";
     }
     for (const auto& g : gpus) {
-        std::cout << g.id << "  kind=gpu  vendor=" << si::to_string(g.vendor) << "  name=\"" << g.name << "\""
-                  << "  dedicated_total_mib=" << format_reading_mib(g.dedicated_total)
-                  << "  dedicated_free_mib=" << format_reading_mib(g.dedicated_free)
-                  << "  shared_total_mib=" << format_reading_mib(g.shared_total)
-                  << "  uma=" << (g.is_integrated_uma ? "true" : "false")
-                  << "  backend_hint=" << (g.backend_hint.empty() ? "none" : g.backend_hint)
-                  << "  source=" << (g.source.empty() ? "unknown" : g.source) << "\n";
+        print_gpu_line(g);
     }
     std::cout << "platform=" << si::host_platform() << "\n";
     return cli::kExitOk;
@@ -252,13 +284,7 @@ int cmd_node(const Args& a) {
                   << "  available_memory_mib=" << (d.available_memory_bytes >> 20) << "\n";
     }
     for (const auto& g : gpus) {
-        std::cout << g.id << "  kind=gpu  vendor=" << si::to_string(g.vendor) << "  name=\"" << g.name << "\""
-                  << "  dedicated_total_mib=" << format_reading_mib(g.dedicated_total)
-                  << "  dedicated_free_mib=" << format_reading_mib(g.dedicated_free)
-                  << "  shared_total_mib=" << format_reading_mib(g.shared_total)
-                  << "  uma=" << (g.is_integrated_uma ? "true" : "false")
-                  << "  backend_hint=" << (g.backend_hint.empty() ? "none" : g.backend_hint)
-                  << "  source=" << (g.source.empty() ? "unknown" : g.source) << "\n";
+        print_gpu_line(g);
     }
     std::cout << "backends:";
     for (const auto& n : backend_names) std::cout << " " << n;
@@ -1014,6 +1040,80 @@ int cmd_serve(const std::vector<std::string>& args) {
 #endif
 }
 
+int cmd_coopmat_canary(const Args& a) {
+    auto parse_u32_id = [](std::string_view raw, std::uint32_t& out) -> bool {
+        if (raw.empty()) return false;
+        int base = 10;
+        std::string_view digits = raw;
+        if (raw.size() > 2 && raw[0] == '0' && (raw[1] == 'x' || raw[1] == 'X')) {
+            base = 16;
+            digits = raw.substr(2);
+        }
+        if (digits.empty()) return false;
+        std::uint64_t val = 0;
+        for (const char c : digits) {
+            unsigned d = 0;
+            if (c >= '0' && c <= '9') {
+                d = static_cast<unsigned>(c - '0');
+            } else if (base == 16 && c >= 'a' && c <= 'f') {
+                d = static_cast<unsigned>(10 + (c - 'a'));
+            } else if (base == 16 && c >= 'A' && c <= 'F') {
+                d = static_cast<unsigned>(10 + (c - 'A'));
+            } else {
+                return false;
+            }
+            val = val * static_cast<std::uint64_t>(base) + d;
+            if (val > 0xFFFFFFFFull) return false;
+        }
+        out = static_cast<std::uint32_t>(val);
+        return true;
+    };
+
+    const auto vendor_raw = a.get("vendor-id");
+    const auto device_raw = a.get("device-id");
+    if (!vendor_raw || vendor_raw->empty()) {
+        return usage_error("coopmat-canary", "--vendor-id is required");
+    }
+    if (!device_raw || device_raw->empty()) {
+        return usage_error("coopmat-canary", "--device-id is required");
+    }
+    std::uint32_t vendor_id = 0;
+    std::uint32_t device_id = 0;
+    if (!parse_u32_id(*vendor_raw, vendor_id) || vendor_id == 0u) {
+        return usage_error("coopmat-canary", "invalid value '" + *vendor_raw + "' for --vendor-id");
+    }
+    if (!parse_u32_id(*device_raw, device_id) || device_id == 0u) {
+        return usage_error("coopmat-canary", "invalid value '" + *device_raw + "' for --device-id");
+    }
+
+    std::uint32_t ubatch = 64u;
+    if (const auto ub_raw = a.get("ubatch")) {
+        std::uint32_t parsed_ub = 0;
+        if (!parse_u32_id(*ub_raw, parsed_ub) || parsed_ub < 16u || parsed_ub > 4096u) {
+            return usage_error("coopmat-canary", "value '" + *ub_raw + "' for --ubatch is out of range (16 to 4096)");
+        }
+        ubatch = parsed_ub;
+    }
+
+    const auto result = si::run_vulkan_coopmat_canary_in_process(vendor_id, device_id, ubatch);
+    if (a.has("json")) {
+        const si::json::Object doc{{"vendor_id", vendor_id},
+                                   {"device_id", device_id},
+                                   {"ubatch_tested", result.ubatch_tested},
+                                   {"ok", result.ok},
+                                   {"coopmat_supported", result.coopmat_supported},
+                                   {"shapes_found", result.shapes_found},
+                                   {"reason", result.reason}};
+        std::cout << si::json::Value(doc).dump() << "\n";
+    } else if (!a.has("quiet")) {
+        std::cout << "coopmat-canary ok=" << (result.ok ? "true" : "false")
+                  << " coopmat_supported=" << (result.coopmat_supported ? "true" : "false")
+                  << " shapes=" << result.shapes_found << " ubatch=" << result.ubatch_tested
+                  << " reason=\"" << result.reason << "\"\n";
+    }
+    return result.ok ? cli::kExitOk : cli::kExitFailure;
+}
+
 int cmd_reblock_pq2(const Args& a) {
     const auto in_opt = a.get("input");
     if (!in_opt || in_opt->empty()) {
@@ -1199,6 +1299,7 @@ int main(int argc, char** argv) {
 
     if (cmd == "version") return cmd_version(a);
     if (cmd == "devices") return cmd_devices(a);
+    if (cmd == "coopmat-canary") return cmd_coopmat_canary(a);
     if (cmd == "node") return cmd_node(a);
     if (cmd == "plan") return cmd_plan(a);
     if (cmd == "reblock-pq2") return cmd_reblock_pq2(a);

@@ -1,5 +1,6 @@
 #include "health_features.hpp"
 #include "json_schema_gbnf.hpp"
+#include "sonder/inference/engine.hpp"
 
 #include <cstdint>
 #include <optional>
@@ -222,7 +223,7 @@ json::Array gpu_inventory_json(const std::vector<GpuDeviceInfo>& gpus) {
     json::Array list;
     list.reserve(gpus.size());
     for (const auto& g : gpus) {
-        list.emplace_back(json::Object{
+        json::Object entry{
             {"id", g.id},
             {"name", g.name},
             {"vendor", to_string(g.vendor)},
@@ -235,7 +236,9 @@ json::Array gpu_inventory_json(const std::vector<GpuDeviceInfo>& gpus) {
             {"effective_free_vram_mib", optional_u64_json(gpu_effective_vram_mib(g, true))},
             {"is_integrated_uma", g.is_integrated_uma},
             {"backend_hint", g.backend_hint},
-            {"source", g.source}});
+            {"source", g.source}};
+        append_gpu_device_telemetry_json(entry, g);
+        list.emplace_back(std::move(entry));
     }
     return list;
 }

@@ -50,6 +50,7 @@ add_library(sonder_inference
     src/common/sha256.cpp
     src/engine/sampling_config.cpp
     src/devices/device.cpp
+    src/devices/coopmat_canary.cpp
     src/devices/gpu_memory.cpp
     src/devices/log_diagnostics.cpp
     src/telemetry/telemetry.cpp

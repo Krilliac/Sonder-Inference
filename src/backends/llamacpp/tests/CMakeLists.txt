@@ -45,7 +45,8 @@ target_link_libraries(sonder_llamacpp_integration PRIVATE
 target_include_directories(sonder_llamacpp_integration PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/..")
 sonder_set_warnings(sonder_llamacpp_integration)
 add_test(NAME sonder.llamacpp.integration COMMAND sonder_llamacpp_integration)
-set_tests_properties(sonder.llamacpp.integration PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+set_tests_properties(sonder.llamacpp.integration PROPERTIES
+    SKIP_RETURN_CODE 77 TIMEOUT 600 ENVIRONMENT "SONDER_SKIP_COOPMAT_CANARY=1")
 
 if(GGML_CUDA AND TARGET ggml-cuda)
     include(SonderCudaCheck)

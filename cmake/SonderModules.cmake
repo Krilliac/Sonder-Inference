@@ -35,5 +35,6 @@ function(sonder_add_module_tests name)
     target_link_libraries(${target} PRIVATE sonder::inference sonder_doctest_main)
     target_include_directories(${target} PRIVATE "${PROJECT_SOURCE_DIR}/src" "${PROJECT_SOURCE_DIR}/tests")
     sonder_set_warnings(${target})
-    doctest_discover_tests(${target} TEST_PREFIX "sonder.${name}." PROPERTIES TIMEOUT 120)
+    doctest_discover_tests(${target} TEST_PREFIX "sonder.${name}."
+        PROPERTIES TIMEOUT 120 ENVIRONMENT "SONDER_SKIP_COOPMAT_CANARY=1")
 endfunction()

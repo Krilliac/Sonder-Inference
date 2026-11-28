@@ -23,6 +23,7 @@ The HTTP server started by `sonder-infer serve` has its own reference:
 | `models` | List the models a backend can serve; `models import-ollama [DIR]` lists what an existing Ollama models directory would serve through the native engine (read-only, in place; see [model store](integration/model-store.md)). |
 | `backends` | Probe the backends compiled into this build. |
 | `devices` | List host devices (CPU, memory and GPU inventory). |
+| `coopmat-canary` | Run the isolated AMD Windows Vulkan cooperative-matrix canary probe (`--vendor-id`, `--device-id`, `--ubatch`, `--json`). |
 | `node` | Print unified local hardware, GPU, backend and capability snapshot (`sonder.inference.node/1`). |
 | `plan` | Plan hardware placement and validated launch profile(s) for one or more GGUF models (repeatable `--model` for co-residency planning; header-only, no weights loaded). |
 | `version` | Print version, commit, C ABI and HTTP API versions. |
@@ -295,6 +296,13 @@ without the server module.
  "effective_vram_mib":15995,"effective_free_vram_mib":11985,"is_integrated_uma":false,
  "backend_hint":"cuda","source":"dxgi"}]}
 ```
+
+When available on the host, each GPU object in `devices --json` and `node --json`
+also carries additive device telemetry fields: `pci_bus_id`, `driver_name`,
+`driver_build`, `rebar`, `shared_memory_bytes`, `warp_size`, `matrix_cores`,
+`pcie` (`current_gen`, `current_width`, `max_gen`, `max_width`, `aspm_state`,
+`aspm_source`), `vulkan_heaps` (per-heap `VK_EXT_memory_budget` readings), and
+`ggml_device` (parsed ggml capability line). Unobserved fields are omitted.
 
 `node --json`:
 

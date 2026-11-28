@@ -130,6 +130,12 @@ struct EngineOptions {
 // testing of discrete and integrated UMA GPU telemetry payloads.
 [[nodiscard]] json::Object gpu_memory_sample_attributes(const GpuDeviceInfo& gpu);
 
+// Appends additive NAT-08 GPU device telemetry fields (driver build, ReBAR,
+// shared memory, matrix cores, PCIe gen/width, ASPM state, per-heap
+// VK_EXT_memory_budget, parsed ggml device line) onto `out` when present.
+// Leaves `out` unchanged when none of those fields are populated.
+void append_gpu_device_telemetry_json(json::Object& out, const GpuDeviceInfo& gpu);
+
 class Engine {
 public:
     explicit Engine(EngineOptions options = {});

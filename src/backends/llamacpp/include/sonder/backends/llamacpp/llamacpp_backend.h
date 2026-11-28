@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "sonder/backends/llamacpp/aux_stream_gate.hpp"
+#include "sonder/inference/device.hpp"
 #include "sonder/inference/model_architecture.hpp"
 #include "sonder/inference/request_priority.hpp"
 #include "sonder/inference/speculative_verifier.hpp"
@@ -708,6 +709,7 @@ struct DeviceInfo {
     DeviceKind kind = DeviceKind::kOther;
     std::uint64_t memory_free_bytes = 0;
     std::uint64_t memory_total_bytes = 0;
+    std::optional<sonder::inference::GgmlDeviceTelemetry> telemetry;
     // Lower-case PCI bus id ("0000:c1:00.0") when the ggml backend reports one;
     // empty when unknown. Equal non-empty ids are the same physical device.
     std::string device_id;
@@ -868,6 +870,10 @@ public:
     [[nodiscard]] static bool HasMtmdBuildSupport() noexcept;
     // Devices ggml can see in this build (CPU always; CUDA/Vulkan/Metal when compiled in).
     [[nodiscard]] static std::vector<DeviceInfo> EnumerateDevices();
+    // Parsed ggml device capability lines captured from llama.cpp/ggml log output
+    // (including DEBUG-level `ggml_vulkan:` lines when SONDER_LLAMACPP_VERBOSE is unset).
+    [[nodiscard]] static std::vector<sonder::inference::GgmlDeviceTelemetry> CapturedGgmlDevices();
+    static void ClearCapturedGgmlDevices() noexcept;
     // Applies SelectDevices() to EnumerateDevices() and resolves the result.
     // `resolved` may come back empty on success (CPU only).
     [[nodiscard]] static Status ResolveModelDevices(const std::vector<std::string>& allowlist,
