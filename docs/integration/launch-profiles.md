@@ -152,6 +152,7 @@ to about 1 tok/s at 72k. For long context, keep Q3_K_XL at 100k.
 | `image_max_tokens` | `--image-max-tokens` | rejected | 1-65536 |
 | `ctx_size` | `--ctx-size` | `context_length` | 0 to 4194304 (`llamacpp`); 0 to 16777216 (`llamaserver`); `0` = model maximum |
 | `n_gpu_layers` | `--n-gpu-layers` (`-1` is `all`) | `gpu_layers`; sets `--device gpu:0` when none is given, refuses a cpu device | -1 to 100000 |
+| `devices` | rejected (`llamaserver` uses `device`) | per-model `ModelLoadOptions::devices` allowlist; sets `--device gpu:0` when none is given, refuses `n_gpu_layers: 0` or a cpu device | array of 1-16 single ggml device names (e.g. `["CUDA0"]`, `["Vulkan1"]`) |
 | `batch_size` | `--batch-size` | `batch_size` * | 1 to 4194304 |
 | `ubatch_size` | `--ubatch-size` | `ubatch_size` * | at most `batch_size` (upstream default: 2048 for llama-server, 512 for llamacpp) |
 | `parallel` | `--parallel` | `slots` (1-16) | 1-256 (`llamaserver`), 1-16 (`llamacpp`); unset on `llamaserver` = automatic default (`-np -1`, 4 slots with unified KV) |

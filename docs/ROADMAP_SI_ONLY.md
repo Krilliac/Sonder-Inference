@@ -35,14 +35,65 @@ Statuses below are checked against `git log origin/main` (at `df2fb11`,
 | --- | --- | --- | --- |
 | **RET-01** | Native backend as sole local engine on CUDA (`cuda-blackwell`) and Vulkan (`vulkan-xt`) | in progress | Direct `llamacpp` backend, CUDA/Vulkan presets, continuous batching, L2 radix cache, speculation, tool chat (`#124`), lazy grammar (`#128`, `#130`), `<think>` splitter (`#129`), and the `v1.0.0` upstream pin move (`#134`, see RET-01a below) are on `origin/main`. Live `cuda-blackwell` and `vulkan-xt` parity qualification remain. See [GPU_SUPPORT.md](GPU_SUPPORT.md) and [integration/llamacpp.md](integration/llamacpp.md). |
 | **RET-01a (NAT-01)** | Move `llama.cpp` upstream pin past `b11195` to `v1.0.0` | merged | Merged on `origin/main` (`df2fb11`, `#134`). Pin moved to `v1.0.0` (commit `b1b770d`) via `cmake/llamacpp-pin.json` with configure-time `expected_features` enforcement; `b11195` survives only as a legacy tag in `src/backends/llamacpp/CMakeLists.txt`. |
-| **RET-02** | Ollama Cloud provider over HTTPS | in progress | Not merged on `origin/main`. Opt-in direct HTTPS client to Ollama Cloud with no local daemon, building on optional `src/net` TLS ([integration/tls.md](integration/tls.md)). |
+| **RET-02** | Ollama Cloud provider over HTTPS | merged | #136. The `ollama_cloud` backend: opt-in direct HTTPS client to Ollama Cloud with no local daemon, on optional `src/net` TLS ([integration/tls.md](integration/tls.md), [integration/ollama-cloud.md](integration/ollama-cloud.md)). TLS EOF-without-close_notify hardening is a follow-up. |
 | **RET-03** | Native embeddings endpoint | in progress | `POST /v1/embeddings` and batched direct `llamacpp` embeddings (`src/backends/llamacpp/embed_batch_planner.hpp`, plus `/v1/rerank` and `/v1/score`) are on `origin/main` (`46c8a3e`, `#121`; [SERVER.md](SERVER.md#post-v1embeddings)). Low-priority stream gating and cutover of Runtime's embedding model to native GGUF remain. |
 | **RET-04** | Model store importing an existing Ollama library in place | planned | Not on `origin/main`. Resolves existing Ollama manifests and blobs into an SI registry in place (no weight copies). |
 | **RET-05** | Sonder-runtime migration off local Ollama | planned | Cross-repo migration in Sonder Runtime (embeddings, residency, cloud routing, training LoRA deployment, config); depends on RET-01 through RET-04 and RET-06. Worker contract: [integration/federation-worker-contract.md](integration/federation-worker-contract.md). |
 | **RET-06** | LoRA adapters in the native backend | planned | Not on `origin/main` (`Capability::lora` is declared in `include/sonder/inference/backend.hpp`, not yet implemented in `src/backends/llamacpp`). Required by Runtime's training path in RET-05. |
-| **RET-07** | Removal of the `ollama` and `llamaserver` backends | planned | Both backends are marked deprecated in [README.md](../README.md) and [src/backends/README.md](../src/backends/README.md). Code removal follows RET-01 through RET-06, keeping only the RET-02 cloud provider. |
+| **RET-07** | Removal of the `ollama` and `llamaserver` backends | in progress (PR-1: helper extraction) | Both backends are marked deprecated in [README.md](../README.md) and [src/backends/README.md](../src/backends/README.md). Code removal follows RET-01 through RET-06, keeping only the RET-02 cloud provider. |
 | **RET-08** | Cutover and bring-up | planned | Final operational cutover to native SI across main and secondary hosts, disabling local Ollama and verifying all Observatory inference panels ([OBSERVATORY_CONTRACT.md](OBSERVATORY_CONTRACT.md), [TELEMETRY.md](TELEMETRY.md)). |
 | **RET-09** | One vendored, pinned `ggml`/`llama.cpp` tree with SI's own patch series; no separate forks or binaries; stock `Q2_0` preferred for Bonsai if it reaches parity, otherwise `PQ2_0` kernels carried as SI patches | planned | Current state on `origin/main`: FetchContent of `v1.0.0` (commit `b1b770d`, `#134`) via the pin manifest (`cmake/llamacpp-pin.json`), with `b11195` surviving only as a legacy tag in `src/backends/llamacpp/CMakeLists.txt`. Replaces standalone fork/server binaries with one SI-owned vendored tree and patch series; licensing review and owner approval are tracked as pending in [LICENSE_REVIEW.md](LICENSE_REVIEW.md). |
+
+## RET-07 — helper extraction and retirement
+
+PR-1 is helper extraction only. Keep the placement planner's default backend
+as `llamaserver` (`src/server/src/placement_planner.cpp:978`); defer the
+`llamacpp` default flip until the native profile mapping below is supported
+and tested.
+
+### Follow-up: native profile mapping before the default flip
+
+A backend-name-only change produces profiles that the native loader rejects.
+The blocking findings, verified against the PR-1 source at `df2fb11`, are:
+
+- **Fit:** the planner always assigns `profile.fit = false`
+  (`src/server/src/placement_planner.cpp:997`).
+  `apply_llamacpp_profile` rejects any engaged `fit` optional, including
+  `false` (`src/server/src/launch_profile.cpp:820`).
+- **Device and split:** the planner emits `device`, `split_mode`,
+  `tensor_split`, and sometimes `main_gpu`
+  (`src/server/src/placement_planner.cpp:1385`,
+  `src/server/src/placement_planner.cpp:1387`,
+  `src/server/src/placement_planner.cpp:1392`,
+  `src/server/src/placement_planner.cpp:1395`).
+  The native loader rejects these fields
+  (`src/server/src/launch_profile.cpp:793`,
+  `src/server/src/launch_profile.cpp:794`,
+  `src/server/src/launch_profile.cpp:795`,
+  `src/server/src/launch_profile.cpp:796`).
+- **Loading and repacking:** planner paths set `load_mode` and `no_repack`
+  (`src/server/src/placement_planner.cpp:1111`,
+  `src/server/src/placement_planner.cpp:1274`,
+  `src/server/src/placement_planner.cpp:2233`).
+  The native loader rejects both
+  (`src/server/src/launch_profile.cpp:797`,
+  `src/server/src/launch_profile.cpp:798`).
+- **MoE placement and cache:** the planner emits `--n-cpu-moe` in
+  `extra_args` and sets `moe_cache_mib` / `moe_cache_cpu_share`
+  (`src/server/src/placement_planner.cpp:916`,
+  `src/server/src/placement_planner.cpp:2210`,
+  `src/server/src/placement_planner.cpp:2211`).
+  The native loader rejects the cache fields and non-empty `extra_args`
+  (`src/server/src/launch_profile.cpp:799`,
+  `src/server/src/launch_profile.cpp:800`,
+  `src/server/src/launch_profile.cpp:836`).
+
+Before changing the default, implement equivalent native mappings or make
+profile generation backend-aware without silently dropping placement or
+memory-policy semantics. Add coverage that passes generated profiles directly
+to `apply_llamacpp_profile`, including CPU, single-GPU, multi-GPU, and MoE
+cases. Converting a copy back to `llamaserver` for argv checks does not prove
+native compatibility.
 
 ## Sequencing
 

@@ -9,6 +9,7 @@ sonder_module_sources(
     src/backend_setup.cpp
     src/chat_handler.cpp
     src/coresidency_planner.cpp
+    src/embeddings_route.cpp
     src/gguf_header.cpp
     src/http.cpp
     src/health_features.cpp
@@ -46,10 +47,12 @@ sonder_add_module_tests(server
     tests/test_server_units.cpp
     tests/test_server_http.cpp
     tests/test_server_rerank_embed.cpp
+    tests/test_embeddings_route.cpp
     tests/test_server_chat.cpp
     tests/test_server_features.cpp
     tests/test_grammar_cache.cpp
     tests/test_server_telemetry.cpp
+    tests/test_server_text_capture.cpp
     tests/test_server_lifecycle.cpp
     tests/test_serve_main.cpp
     tests/test_server_faults.cpp

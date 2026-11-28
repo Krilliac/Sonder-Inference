@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "sonder/backends/llamacpp/llamacpp_backend.h"
+#include "kv_telemetry.hpp"
 #include "sonder/inference/backends/llamacpp.hpp"
 #include "sonder/inference/engine.hpp"
 
@@ -1130,6 +1131,56 @@ TEST_CASE("llamacpp integration: L2 host-RAM state cache snapshot, restore, and 
                 div_mid.result.cached_tokens, div_mid.result.prompt_tokens, prompt_div_mid.size());
 
     l2_be.Unload();
+}
+
+TEST_CASE("llamacpp integration: physical KV telemetry events from a real context") {
+    const char* path = ModelPath();
+    LlamaCppBackend be;
+    auto kv = std::make_shared<KvTelemetry>();
+    be.SetKvTelemetry(kv);
+    REQUIRE(be.Load(MakeLoadOptions(path)).ok());
+    const ModelInfo info = be.GetModelInfo();
+
+    const auto find_event = [](const std::vector<KvEvent>& evs, std::string_view type) -> const KvEvent* {
+        for (const auto& e : evs) {
+            if (e.type == type) return &e;
+        }
+        return nullptr;
+    };
+    const auto as_int = [](const KvEvent& e, std::string_view key) -> std::int64_t {
+        const KvAttrValue* v = e.Find(key);
+        REQUIRE(v != nullptr);
+        const auto* p = std::get_if<std::int64_t>(v);
+        REQUIRE(p != nullptr);
+        return *p;
+    };
+
+    // Context creation queued kv.pool.configured.
+    const auto loaded = kv->Drain();
+    const KvEvent* pool = find_event(loaded, "kv.pool.configured");
+    REQUIRE(pool != nullptr);
+    CHECK(as_int(*pool, "n_ctx") == static_cast<std::int64_t>(info.n_ctx));
+    CHECK(as_int(*pool, "n_seq") >= 1);
+    CHECK(std::get<std::string>(*pool->Find("scope")) == "physical");
+    CHECK(!std::get<std::string>(*pool->Find("type_k")).empty());
+    const std::string source = std::get<std::string>(*pool->Find("bytes_per_token_source"));
+    if (source != "unavailable") CHECK(as_int(*pool, "bytes_per_token") > 0);
+    std::printf("[llamacpp_integration] kv pool: n_ctx=%lld bytes_per_token=%lld (%s)\n",
+                static_cast<long long>(as_int(*pool, "n_ctx")), static_cast<long long>(as_int(*pool, "bytes_per_token")),
+                source.c_str());
+
+    // A generation leaves the newest usage observation for the next drain.
+    std::vector<Token> prompt;
+    REQUIRE(be.Tokenize("Once upon a time, there was a little", true, prompt).ok());
+    const RunOutput out = Run(be, prompt, 8);
+    REQUIRE(out.result.status.ok());
+    const auto after = kv->Drain();
+    const KvEvent* usage = find_event(after, "kv.usage");
+    REQUIRE(usage != nullptr);
+    CHECK(as_int(*usage, "cells_total") == static_cast<std::int64_t>(info.n_ctx));
+    CHECK(as_int(*usage, "cells_used") >= static_cast<std::int64_t>(prompt.size()));
+    CHECK(as_int(*usage, "cells_used") <= as_int(*usage, "cells_total"));
+    be.Unload();
 }
 
 int main(int argc, char** argv) {

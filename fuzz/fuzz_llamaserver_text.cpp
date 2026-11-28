@@ -26,9 +26,9 @@
 #include <vector>
 
 #include "backends/llamaserver/child_metrics.hpp"
-#include "backends/llamaserver/gpu_memory.hpp"
+#include "backends/llamaserver/spill_guard.hpp"
 #include "backends/llamaserver/llamaserver_protocol.hpp"
-#include "backends/llamaserver/log_diagnostics.hpp"
+#include "devices/log_diagnostics.hpp"
 #include "fuzz_common.hpp"
 
 namespace ls = sonder::inference::llamaserver;

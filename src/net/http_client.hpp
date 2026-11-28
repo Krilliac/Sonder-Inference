@@ -107,6 +107,11 @@ struct HttpRequest {
     // otherwise the request fails with ErrorCode::protocol_error. Needs progress_counter.
     std::chrono::milliseconds progress_stall_timeout{0};
     std::function<void(std::chrono::milliseconds)> on_progress_stall;
+    // Cap on every byte received for the response (status line, headers,
+    // chunk framing, trailers and body), counted as read from the socket or
+    // TLS stream. Exceeding it fails the request with protocol_error and
+    // closes the connection. Zero = no cap (the historical behaviour).
+    std::uint64_t max_response_bytes = 0;
 };
 
 // Checks HttpRequest::headers as described above. Never echoes a value.

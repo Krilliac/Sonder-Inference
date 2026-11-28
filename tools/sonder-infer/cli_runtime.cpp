@@ -251,6 +251,11 @@ bool resolve_backend(std::string_view command, const cli::Args& a, const cli::En
             return false;
         }
         if (!check_backend_name(command, out.backend, rc)) return false;
+        if (out.backend == "ollama_cloud") {
+            rc = usage_error(command, "the ollama_cloud backend is served only through 'sonder-infer serve --backend "
+                                      "ollama_cloud --ollama-cloud-config PATH' (docs/integration/ollama-cloud.md)");
+            return false;
+        }
     }
     if (need_model && out.model.empty()) {
         if (is_mock_backend(out.backend)) {
@@ -275,6 +280,8 @@ void register_backends(si::Engine& engine, const BackendChoice& choice) {
 #if defined(SONDER_HAS_SERVER)
     // Shared construction with `sonder-infer serve` (backend_setup.hpp).
     for (const auto& name : si::available_backend_names()) {
+        // Opt-in remote provider: configured only by `serve --ollama-cloud-config`.
+        if (name == "ollama_cloud") continue;
         if (name == "remote-mock" && choice.backend != name) continue;
         si::BackendSetup setup;
         setup.backend = name;

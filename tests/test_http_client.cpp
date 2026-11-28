@@ -280,3 +280,72 @@ TEST_CASE("http_client: rejects TE plus CL response over live loopback socket") 
     CHECK(res.status().code() == ErrorCode::protocol_error);
     CHECK(body.empty());
 }
+
+TEST_CASE("http_client: max_response_bytes caps every received byte, framing and trailers included") {
+    // One body byte, then ~200 KB of chunked trailer lines: payload-only
+    // counting would see 1 byte; the wire cap must stop it.
+    std::string raw = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\na\r\n0\r\n";
+    for (int i = 0; i < 200; ++i) {
+        raw += "X-Trailer-" + std::to_string(i) + ": " + std::string(1000, 't') + "\r\n";
+    }
+    raw += "\r\n";
+    {
+        RawLoopbackResponder srv(raw);
+        net::HttpRequest req;
+        req.host = "127.0.0.1";
+        req.port = srv.port();
+        req.target = "/probe";
+        req.max_response_bytes = 64 * 1024;
+        std::string body;
+        auto res = net::http_request(req, [&](std::string_view chunk) {
+            body.append(chunk);
+            return true;
+        });
+        REQUIRE_FALSE(res.ok());
+        CHECK(res.status().code() == ErrorCode::protocol_error);
+        CHECK(res.status().message().find("response exceeds") != std::string::npos);
+        CHECK(body.size() <= 1u);
+    }
+    {
+        // Zero keeps the historical behaviour (no cap): the same response completes.
+        RawLoopbackResponder srv(raw);
+        net::HttpRequest req;
+        req.host = "127.0.0.1";
+        req.port = srv.port();
+        req.target = "/probe";
+        std::string body;
+        auto res = net::http_request(req, [&](std::string_view chunk) {
+            body.append(chunk);
+            return true;
+        });
+        REQUIRE_MESSAGE(res.ok(), res.status().to_string());
+        CHECK(body == "a");
+    }
+    {
+        // A response within the cap is unaffected; the head counts toward it.
+        const std::string small = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+        RawLoopbackResponder srv(small);
+        net::HttpRequest req;
+        req.host = "127.0.0.1";
+        req.port = srv.port();
+        req.target = "/probe";
+        req.max_response_bytes = small.size();
+        std::string body;
+        auto res = net::http_request(req, [&](std::string_view chunk) {
+            body.append(chunk);
+            return true;
+        });
+        REQUIRE_MESSAGE(res.ok(), res.status().to_string());
+        CHECK(body == "hello");
+    }
+    {
+        RawLoopbackResponder srv("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello");
+        net::HttpRequest req;
+        req.host = "127.0.0.1";
+        req.port = srv.port();
+        req.target = "/probe";
+        req.max_response_bytes = 10;  // smaller than the head alone
+        auto res = net::http_request(req, {});
+        CHECK(res.status().code() == ErrorCode::protocol_error);
+    }
+}

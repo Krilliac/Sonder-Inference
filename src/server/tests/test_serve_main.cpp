@@ -414,7 +414,8 @@ TEST_CASE("serve_main: llama.cpp KV cache, flash attention and batch flags") {
     std::string out;
     std::string err;
     CHECK(run({"--help"}, out, err) == 0);
-    for (const char* flag : {"--batch-size", "--ubatch-size", "--cache-type-k", "--cache-type-v", "--flash-attn"}) {
+    for (const char* flag : {"--batch-size", "--ubatch-size", "--cache-type-k", "--cache-type-v",
+                             "--allow-q4-k-cache", "--flash-attn"}) {
         CAPTURE(flag);
         CHECK(out.find(flag) != std::string::npos);
     }
@@ -447,6 +448,18 @@ TEST_CASE("serve_main: llama.cpp KV cache, flash attention and batch flags") {
     CHECK(err.find("requires flash attention") != std::string::npos);
     CHECK(run({"--backend", "llamacpp", "--model", "x", "--port", "0", "--cache-type-k", "q4_k"}, out, err) == 2);
     CHECK(err.find("unknown K cache type 'q4_k'") != std::string::npos);
+    CHECK(run({"--backend", "llamacpp", "--model", "x", "--port", "0", "--cache-type-k", "q4_0"}, out, err) == 2);
+    CHECK(err.find("--allow-q4-k-cache") != std::string::npos);
+    CHECK(run({"--backend", "llamacpp", "--model", "x", "--port", "0", "--cache-type-k", "q4_0", "--allow-q4-k-cache",
+               "--max-connections", "0"},
+              out, err) == 2);
+    CHECK(err.find("--max-connections") != std::string::npos);
+    CHECK(run({"--backend", "llamacpp", "--model", "x", "--port", "0", "--flash-attn", "off", "--max-connections",
+               "0"},
+              out, err) == 2);
+    CHECK(err.find("--max-connections") != std::string::npos);
+    CHECK(run({"--backend", "mock", "--model", "x", "--allow-q4-k-cache", "--max-connections", "0"}, out, err) == 2);
+    CHECK(err.find("option --allow-q4-k-cache applies only to --backend llamacpp") != std::string::npos);
     CHECK(run({"--backend", "llamacpp", "--model", "x", "--port", "0", "--batch-size", "256", "--ubatch-size", "512"},
               out, err) == 2);
     CHECK(err.find("n_ubatch (512) must be <= n_batch (256)") != std::string::npos);
@@ -1319,4 +1332,287 @@ TEST_CASE("serve_main: multi-profile llamacpp merges and conflicts on direct par
     std::error_code ec;
     fs::remove(g_path, ec);
     fs::remove(profiles, ec);
+}
+
+TEST_CASE("NAT-07 serve_main: multi-profile llamacpp binds distinct per-model devices and rejects n_gpu_layers 0 conflict") {
+    namespace det = sonder::inference::server::detail;
+    const auto g_path = temp_path("nat07-tiny.gguf");
+    {
+        std::ofstream(g_path, std::ios::binary) << minimal_gguf_header();
+    }
+    const std::string g_str = g_path.generic_string();
+    const auto profiles = temp_path("nat07-profiles.json");
+    {
+        std::ofstream(profiles) << R"({"profiles":[
+            {"name":"main-dgpu","backend":"llamacpp","model":")" << g_str << R"(","devices":["CUDA0"]},
+            {"name":"aux-igpu","backend":"llamacpp","model":")" << g_str << R"(","devices":["Vulkan1"]},
+            {"name":"cpu-zero","backend":"llamacpp","model":")" << g_str << R"(","n_gpu_layers":0}
+        ]})";
+    }
+    const std::string pf = profiles.string();
+
+    std::string err;
+    det::ServeCliConfig cfg;
+    const int rc = build_cli({"--profiles", pf, "--profile", "main-dgpu", "--profile", "aux-igpu",
+                              "--vram-budget-mib", "16384", "--max-connections", "0"},
+                             cfg, err);
+    CHECK(rc == 2);
+    CHECK(err.find("--max-connections must be from 1 to 100000") != std::string::npos);
+    CHECK(cfg.options.device == "gpu:0");
+    REQUIRE(cfg.options.profile_bindings.size() == 2u);
+    CHECK(cfg.options.profile_bindings[0].devices == std::vector<std::string>{"CUDA0"});
+    CHECK(cfg.options.profile_bindings[1].devices == std::vector<std::string>{"Vulkan1"});
+
+    std::string out;
+    err.clear();
+    CHECK(run({"--profiles", pf, "--profile", "cpu-zero", "--profile", "main-dgpu"}, out, err) == 2);
+    CHECK(err.find("alongside 'n_gpu_layers' 0") != std::string::npos);
+
+    std::error_code ec;
+    fs::remove(g_path, ec);
+    fs::remove(profiles, ec);
+}
+
+TEST_CASE("serve_main: --startup-smoke-test flag parses, enforces backend/profile rules, and merges across profiles") {
+    std::string out;
+    std::string err;
+    CHECK(run({"--help"}, out, err) == 0);
+    CHECK(out.find("--startup-smoke-test") != std::string::npos);
+
+    // Accepted on --backend llamacpp and populates BackendSetup::llamacpp_startup_smoke_test.
+    {
+        det::ServeCliConfig cli_cfg;
+        std::string cli_err;
+        CHECK(build_cli({"--backend", "llamacpp", "--model", "x", "--startup-smoke-test", "--max-connections", "0"},
+                        cli_cfg, cli_err) == 2);
+        CHECK(cli_err.find("applies only to --backend llamacpp") == std::string::npos);
+        CHECK(cli_err.find("--max-connections must be from 1 to 100000") != std::string::npos);
+        CHECK(cli_cfg.options.backend.llamacpp_startup_smoke_test == std::optional<bool>(true));
+    }
+
+    // Takes no value.
+    CHECK(run({"--backend", "llamacpp", "--model", "x", "--startup-smoke-test=1"}, out, err) == 2);
+    CHECK(err.find("--startup-smoke-test takes no value") != std::string::npos);
+
+    // Refused on non-llamacpp backends.
+    for (const std::string backend : {"mock", "ollama", "llamaserver"}) {
+        CAPTURE(backend);
+        CHECK(run({"--backend", backend, "--model", "x", "--startup-smoke-test", "--max-connections", "0"}, out, err) ==
+              2);
+        CHECK(err.find("option --startup-smoke-test applies only to --backend llamacpp") != std::string::npos);
+    }
+
+    // Conflicts with --profile, and merges/conflicts across multi-profile llamacpp.
+    const auto g_path = temp_path("smoke-direct.gguf");
+    {
+        std::ofstream(g_path, std::ios::binary) << minimal_gguf_header();
+    }
+    const std::string g_str = g_path.generic_string();
+    const auto profiles = temp_path("smoke-profiles.json");
+    {
+        std::ofstream(profiles) << R"({"profiles":[
+            {"name":"smoke-on","backend":"llamacpp","model":")" << g_str
+                                << R"(","n_gpu_layers":0,"startup_smoke_test":true},
+            {"name":"smoke-unset","backend":"llamacpp","model":")" << g_str << R"(","n_gpu_layers":0},
+            {"name":"smoke-off","backend":"llamacpp","model":")" << g_str
+                                << R"(","n_gpu_layers":0,"startup_smoke_test":false}
+        ]})";
+    }
+    const std::string pf = profiles.string();
+
+    CHECK(run({"--profiles", pf, "--profile", "smoke-on", "--startup-smoke-test", "--max-connections", "0"}, out, err) ==
+          2);
+    CHECK(err.find("--startup-smoke-test conflicts with --profile") != std::string::npos);
+
+    CHECK(run({"--profiles", pf, "--profile", "smoke-on", "--profile", "smoke-off", "--max-connections", "0"}, out,
+              err) == 2);
+    CHECK(err.find("conflicts with 'smoke-on' on shared llamacpp option 'startup_smoke_test'") != std::string::npos);
+
+    det::ServeCliConfig cfg;
+    const int rc =
+        build_cli({"--profiles", pf, "--profile", "smoke-on", "--profile", "smoke-unset", "--max-connections", "0"},
+                  cfg, err);
+    CHECK(rc == 2);
+    CHECK(err.find("--max-connections must be from 1 to 100000") != std::string::npos);
+    CHECK(cfg.options.backend.llamacpp_startup_smoke_test == std::optional<bool>(true));
+    REQUIRE(cfg.options.profile_bindings.size() == 2u);
+    REQUIRE(cfg.options.profile_bindings[1].metadata.find("startup_smoke_test") != nullptr);
+    CHECK(cfg.options.profile_bindings[1].metadata.find("startup_smoke_test")->as_bool() == true);
+    bool has_resolved = false;
+    for (const auto& note : cfg.profile_notes) {
+        if (note.find("llamacpp resolved settings:") != std::string::npos &&
+            note.find("startup_smoke_test=true") != std::string::npos) {
+            has_resolved = true;
+        }
+    }
+    CHECK(has_resolved);
+
+    std::error_code ec;
+    fs::remove(g_path, ec);
+    fs::remove(profiles, ec);
+}
+
+TEST_CASE("serve_main: ollama_cloud config is strict, never takes an inline key, and seeds the model list") {
+    const auto key_file = temp_path("cloud.key");
+    std::ofstream(key_file, std::ios::binary) << "sk-FAKE-serve-test-key\n";
+    const auto config = temp_path("cloud.json");
+    {
+        std::ofstream out(config, std::ios::binary);
+        out << R"({"base_url": "https://ollama.com", "api_key_file": )" << json::Value(key_file.string()).dump()
+            << R"(, "models": ["gpt-oss:120b", "qwen3-coder:480b"], "request_timeout_ms": 120000,
+                 "idle_timeout_ms": 0})";
+    }
+    si::BackendSetup setup;
+    REQUIRE(si::load_ollama_cloud_config(config.string(), setup).ok());
+    CHECK(setup.ollama_cloud_base_url == "https://ollama.com");
+    CHECK(setup.ollama_cloud_api_key_file == key_file.string());
+    CHECK(setup.ollama_cloud_api_key_env.empty());
+    REQUIRE(setup.ollama_cloud_models.size() == 2u);
+    CHECK(setup.ollama_cloud_request_timeout_ms == 120000u);
+    CHECK(setup.ollama_cloud_idle_timeout_ms == 0u);
+    CHECK(setup.ollama_cloud_connect_timeout_ms == 10000u);
+
+    det::ServeCliConfig cfg;
+    std::string err;
+    CHECK(build_cli({"--backend", "ollama_cloud", "--ollama-cloud-config", config.string()}, cfg, err) == 0);
+    CHECK(cfg.options.backend.backend == "ollama_cloud");
+    CHECK(err.find("remote provider (https://ollama.com)") != std::string::npos);
+    CHECK(err.find("sk-FAKE") == std::string::npos);
+    REQUIRE(cfg.options.models.size() == 2u);
+    CHECK(cfg.options.models[0] == "gpt-oss:120b");
+    det::ServeCliConfig only_one;
+    CHECK(build_cli({"--backend", "ollama_cloud", "--ollama-cloud-config", config.string(), "--model",
+                     "qwen3-coder:480b"},
+                    only_one, err) == 0);
+    CHECK(only_one.options.models == std::vector<std::string>{"qwen3-coder:480b"});
+    det::ServeCliConfig missing;
+    CHECK(build_cli({"--backend", "ollama_cloud", "--model", "gpt-oss:120b"}, missing, err) == 2);
+    CHECK(err.find("--ollama-cloud-config") != std::string::npos);
+    det::ServeCliConfig wrong_backend;
+    CHECK(build_cli({"--backend", "mock", "--ollama-cloud-config", config.string()}, wrong_backend, err) == 2);
+#if defined(SONDER_HAS_OLLAMA_CLOUD_BACKEND)
+    auto made = si::make_backend(cfg.options.backend);
+    REQUIRE_MESSAGE(made.ok(), made.status().to_string());
+    CHECK(made.value()->name() == "ollama_cloud");
+    CHECK(made.value()->description().find("sk-FAKE") == std::string::npos);
+#endif
+
+    const std::string inline_key = "sk-FAKE-inline-do-not-echo";
+    const std::vector<std::string> bad_documents = {
+        R"({"api_key": ")" + inline_key + R"(", "models": ["m"]})",
+        R"({"api_key_env": "OLLAMA_API_KEY", "api_key_file": "k", "models": ["m"]})",
+        R"({"models": ["m"]})",
+        R"({"api_key_env": "OLLAMA_API_KEY", "models": []})",
+        R"({"api_key_env": "OLLAMA_API_KEY", "models": ["m"], "insecure_skip_verify": true})",
+        R"({"api_key_env": "OLLAMA_API_KEY", "models": ["m"], "connect_timeout_ms": 0})",
+        R"({"api_key_env": "OLLAMA_API_KEY", "models": [")" + inline_key + "\"]",  // malformed JSON
+        // base_url is checked before anything logs it; messages never quote it.
+        R"({"base_url": "https://)" + inline_key + R"(@ollama.com", "api_key_env": "OLLAMA_API_KEY", "models": ["m"]})",
+        R"({"base_url": "https://user:)" + inline_key + R"(@ollama.com/x", "api_key_env": "OLLAMA_API_KEY", "models": ["m"]})",
+        R"({"base_url": "http://ollama.com/)" + inline_key + R"(", "api_key_env": "OLLAMA_API_KEY", "models": ["m"]})",
+        R"({"base_url": "https://ollama.com/?t=)" + inline_key + R"(", "api_key_env": "OLLAMA_API_KEY", "models": ["m"]})",
+        R"({"base_url": "https://ollama.com/ )" + inline_key + R"(", "api_key_env": "OLLAMA_API_KEY", "models": ["m"]})",
+    };
+    for (std::size_t i = 0; i < bad_documents.size(); ++i) {
+        CAPTURE(i);
+        const auto bad = temp_path("bad-cloud-" + std::to_string(i) + ".json");
+        std::ofstream(bad, std::ios::binary) << bad_documents[i];
+        si::BackendSetup s;
+        const auto st = si::load_ollama_cloud_config(bad.string(), s);
+        CHECK_FALSE(st.ok());
+        CHECK(st.message().find(inline_key) == std::string::npos);
+        // Through the CLI as well: the remote-provider warning must not run first.
+        det::ServeCliConfig rejected;
+        std::string cli_err;
+        CHECK(build_cli({"--backend", "ollama_cloud", "--ollama-cloud-config", bad.string()}, rejected, cli_err) == 2);
+        CHECK(cli_err.find(inline_key) == std::string::npos);
+        std::error_code ec;
+        fs::remove(bad, ec);
+    }
+    std::error_code ec;
+    fs::remove(config, ec);
+    fs::remove(key_file, ec);
+}
+
+TEST_CASE("serve_main: ollama_cloud base_url off the Ollama Cloud origin needs allow_custom_endpoint") {
+    const std::string marker = "attacker-marker";
+    const auto write = [](const std::string& name, const std::string& text) {
+        const auto p = temp_path(name);
+        std::ofstream(p, std::ios::binary) << text;
+        return p;
+    };
+    const std::string tail = R"(, "api_key_env": "OLLAMA_API_KEY", "models": ["gpt-oss:120b"]})";
+    // Canonical origin spellings load without the opt-in.
+    for (const std::string& url : {std::string("https://ollama.com"), std::string("https://OLLAMA.com:443/"),
+                                  std::string("https://ollama.com/")}) {
+        CAPTURE(url);
+        const auto p = write("cloud-canonical.json", R"({"base_url": ")" + url + "\"" + tail);
+        si::BackendSetup s;
+        const auto st = si::load_ollama_cloud_config(p.string(), s);
+        CHECK_MESSAGE(st.ok(), st.to_string());
+        CHECK_FALSE(s.ollama_cloud_allow_custom_endpoint);
+        std::error_code ec;
+        fs::remove(p, ec);
+    }
+    const std::vector<std::string> foreign = {"https://" + marker + ".example", "https://ollama.com:8443",
+                                              "https://ollama.com." + marker, "https://api.ollama.com"};
+    for (const std::string& url : foreign) {
+        CAPTURE(url);
+        const auto refused = write("cloud-custom.json", R"({"base_url": ")" + url + "\"" + tail);
+        si::BackendSetup s;
+        const auto st = si::load_ollama_cloud_config(refused.string(), s);
+        REQUIRE_FALSE(st.ok());
+        CHECK(st.message().find("allow_custom_endpoint") != std::string::npos);
+        CHECK(st.message().find(marker) == std::string::npos);
+        CHECK(st.message().find("8443") == std::string::npos);
+        // The CLI fails before the remote-provider warning prints the URL.
+        det::ServeCliConfig cfg;
+        std::string err;
+        CHECK(build_cli({"--backend", "ollama_cloud", "--ollama-cloud-config", refused.string()}, cfg, err) == 2);
+        CHECK(err.find(marker) == std::string::npos);
+
+        const auto allowed =
+            write("cloud-custom-ok.json", R"({"base_url": ")" + url + R"(", "allow_custom_endpoint": true)" + tail);
+        si::BackendSetup a;
+        const auto ok = si::load_ollama_cloud_config(allowed.string(), a);
+        CHECK_MESSAGE(ok.ok(), ok.to_string());
+        CHECK(a.ollama_cloud_allow_custom_endpoint);
+#if defined(SONDER_HAS_OLLAMA_CLOUD_BACKEND)
+        // make_backend forwards the opt-in; without it the backend refuses too.
+        a.backend = "ollama_cloud";
+        auto made = si::make_backend(a);
+        if (!made.ok()) {
+            // Only the key lookup may fail here (OLLAMA_API_KEY unset), never the endpoint.
+            CHECK(made.status().message().find("allow_custom_endpoint") == std::string::npos);
+        }
+        a.ollama_cloud_allow_custom_endpoint = false;
+        auto refused_backend = si::make_backend(a);
+        REQUIRE_FALSE(refused_backend.ok());
+        CHECK(refused_backend.status().message().find("allow_custom_endpoint") != std::string::npos);
+        CHECK(refused_backend.status().message().find(marker) == std::string::npos);
+#endif
+        std::error_code ec;
+        fs::remove(refused, ec);
+        fs::remove(allowed, ec);
+    }
+    // Strict types and bounds for the new fields.
+    for (const std::string& extra :
+         {std::string(R"("allow_custom_endpoint": "yes")"), std::string(R"("allow_custom_endpoint": 1)"),
+          std::string(R"("max_response_bytes": 0)"), std::string(R"("max_response_bytes": 67108865)"),
+          std::string(R"("max_response_bytes": "1")")}) {
+        CAPTURE(extra);
+        const auto p = write("cloud-bad-field.json", "{" + extra + tail);
+        si::BackendSetup s;
+        CHECK_FALSE(si::load_ollama_cloud_config(p.string(), s).ok());
+        std::error_code ec;
+        fs::remove(p, ec);
+    }
+    const auto lower = write("cloud-cap.json", R"({"max_response_bytes": 1048576)" + tail);
+    si::BackendSetup s;
+    REQUIRE(si::load_ollama_cloud_config(lower.string(), s).ok());
+    CHECK(s.ollama_cloud_max_response_bytes == 1048576u);
+    si::BackendSetup d;
+    CHECK(d.ollama_cloud_max_response_bytes == (std::uint64_t{64} << 20));
+    std::error_code ec;
+    fs::remove(lower, ec);
 }
