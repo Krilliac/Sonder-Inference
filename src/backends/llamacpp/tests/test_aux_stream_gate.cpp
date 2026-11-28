@@ -737,19 +737,20 @@ TEST_CASE("NAT-12: DecodeAwareAuxGate DRR accounting enforces zero overlap and c
     g_mock_cuda = nullptr;
 }
 
-TEST_CASE("AuxGate: decode step admitted after hold timeout is counted as an overlap") {
+TEST_CASE("NAT-12: decode step admitted after hold timeout is counted as an overlap") {
     AuxGateConfig cfg;
     cfg.enabled = true;
     cfg.max_decode_hold_ms = 5;
     DecodeAwareAuxGate gate(cfg);
 
+    // Idle fast path: no decode session exists yet, so the slice is admitted at once and stays in flight.
+    auto slice = gate.AcquireAuxSlice("gpu:0");
+    REQUIRE(slice.acquired());
+    CHECK(slice.status() == AuxAcquireStatus::kAcquiredIdle);
+
     auto session = gate.EnterDecodeSession("gpu:0");
     {
-        // Idle fast path: no decode step is in flight yet, so the slice is admitted and stays in flight.
-        auto slice = gate.AcquireAuxSlice("gpu:0");
-        REQUIRE(slice.acquired());
-
-        // The decode step waits at most max_decode_hold_ms for the slice, then is admitted anyway.
+        // The decode step waits at most max_decode_hold_ms for the in-flight slice, then is admitted anyway.
         auto step = gate.EnterDecodeStep("gpu:0");
         const AuxGateStats stats = gate.GetStats("gpu:0");
         CHECK(stats.decode_hold_timeouts == 1u);
