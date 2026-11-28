@@ -25,7 +25,8 @@ SamplerChain::SamplerChain(const SamplerChain& other)
       stop_tokens_(other.stop_tokens_),
       selector_(other.selector_),
       rng_(other.rng_),
-      cur_(other.cur_) {
+      cur_(other.cur_),
+      has_last_distribution_(other.has_last_distribution_) {
     stages_.reserve(other.stages_.size());
     for (const auto& s : other.stages_) {
         stages_.push_back(s->clone());
@@ -56,6 +57,7 @@ void SamplerChain::set_stop_tokens(std::vector<TokenId> tokens) {
 
 SampleResult SamplerChain::sample(std::span<const float> logits) {
     SampleResult result;
+    has_last_distribution_ = false;
     if (logits.empty()) {
         cur_.data.clear();
         result.status = SampleStatus::EmptyLogits;
@@ -107,6 +109,7 @@ SampleResult SamplerChain::sample(std::span<const float> logits) {
     result.status = SampleStatus::Ok;
     result.token = cur_.data[pick].id;
     result.probability = cur_.data[pick].p;
+    has_last_distribution_ = true;
     return result;
 }
 
@@ -136,6 +139,7 @@ void SamplerChain::reset() {
     }
     cur_.data.clear();
     cur_.sorted = false;
+    has_last_distribution_ = false;
 }
 
 SamplerChain::StateSnapshot SamplerChain::snapshot_state() const {
@@ -169,10 +173,38 @@ bool SamplerChain::restore_state(const StateSnapshot& state) {
     }
     cur_.data.clear();
     cur_.sorted = false;
+    has_last_distribution_ = false;
     return true;
 }
 
 bool SamplerChain::is_stop_token(TokenId token) const { return stop_tokens_.count(token) != 0; }
+
+std::vector<TokenData> SamplerChain::top_candidates(std::size_t max_k) const {
+    std::vector<TokenData> out;
+    if (!has_last_distribution_ || max_k == 0 || cur_.data.empty()) {
+        return out;
+    }
+    out.reserve(std::min(max_k, cur_.data.size()));
+    for (const TokenData& t : cur_.data) {
+        if (out.size() >= max_k) {
+            break;
+        }
+        if (t.id < 0) {
+            continue;
+        }
+        // cur_.data is canonically sorted (logit desc, p non-increasing), so
+        // the first non-viable entry ends the viable prefix.
+        if (t.logit == kNegInf || !std::isfinite(t.p) || t.p <= 0.0f) {
+            break;
+        }
+        TokenData entry = t;
+        if (entry.p > 1.0f) {
+            entry.p = 1.0f;
+        }
+        out.push_back(entry);
+    }
+    return out;
+}
 
 std::vector<std::string_view> SamplerChain::stage_names() const {
     std::vector<std::string_view> names;

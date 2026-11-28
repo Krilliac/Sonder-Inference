@@ -26,7 +26,10 @@ from typing import Any, Iterable
 
 def percentile(values: Iterable[float], p: float) -> float | None:
     """Linear-interpolated percentile (numpy's default 'linear' method)."""
-    xs = sorted(v for v in values if v is not None)
+    xs = sorted(
+        float(v) for v in values
+        if v is not None and not isinstance(v, bool) and isinstance(v, (int, float)) and math.isfinite(v)
+    )
     if not xs:
         return None
     if len(xs) == 1:
@@ -40,13 +43,17 @@ def percentile(values: Iterable[float], p: float) -> float | None:
 
 
 def summarize(values: Iterable[float | None]) -> dict[str, Any]:
-    xs = [v for v in values if v is not None]
+    xs = [
+        float(v) for v in values
+        if v is not None and not isinstance(v, bool) and isinstance(v, (int, float)) and math.isfinite(v)
+    ]
     if not xs:
         return {"n": 0}
     return {
         "n": len(xs),
         "mean": sum(xs) / len(xs),
         "p50": percentile(xs, 50),
+        "p90": percentile(xs, 90),
         "p95": percentile(xs, 95),
         "p99": percentile(xs, 99),
         "min": min(xs),
@@ -86,18 +93,38 @@ def _num(x: Any) -> float | None:
     if isinstance(x, bool) or x is None:
         return None
     if isinstance(x, (int, float)):
-        return float(x)
+        val = float(x)
+        return val if math.isfinite(val) else None
     return None
+
+
+def _sonder_timings(usage: dict | None) -> dict | None:
+    if not isinstance(usage, dict):
+        return None
+    sonder = usage.get("sonder")
+    if not isinstance(sonder, dict):
+        return None
+    nested = sonder.get("timings")
+    return nested if isinstance(nested, dict) else None
 
 
 def cached_tokens(usage: dict | None, timings: dict | None) -> tuple[int | None, str | None]:
     """Cached prompt tokens and where the number came from; (None, None) when unreported."""
-    if timings and _num(timings.get("cache_n")) is not None:
-        return int(timings["cache_n"]), "timings.cache_n"
+    if timings:
+        v = _num(timings.get("cache_n"))
+        if v is not None and v >= 0:
+            return int(v), "timings.cache_n"
     if usage:
         det = usage.get("prompt_tokens_details")
-        if isinstance(det, dict) and _num(det.get("cached_tokens")) is not None:
-            return int(det["cached_tokens"]), "usage.prompt_tokens_details.cached_tokens"
+        if isinstance(det, dict):
+            v = _num(det.get("cached_tokens"))
+            if v is not None and v >= 0:
+                return int(v), "usage.prompt_tokens_details.cached_tokens"
+        st = _sonder_timings(usage)
+        if st:
+            v = _num(st.get("cache_n"))
+            if v is not None and v >= 0:
+                return int(v), "usage.sonder.timings.cache_n"
     return None, None
 
 
@@ -114,6 +141,9 @@ def prompt_tokens(usage: dict | None, timings: dict | None, extra: dict | None =
         cands.append(int(usage["prompt_tokens"]))
     if timings and _num(timings.get("prompt_n")) is not None:
         cands.append(int(timings["prompt_n"]) + int(_num(timings.get("cache_n")) or 0))
+    st = _sonder_timings(usage)
+    if st and _num(st.get("prompt_n")) is not None:
+        cands.append(int(st["prompt_n"]) + int(_num(st.get("cache_n")) or 0))
     if extra and _num(extra.get("tokens_evaluated")) is not None:
         cands.append(int(extra["tokens_evaluated"]))
     return max(cands) if cands else None
@@ -201,7 +231,12 @@ def derive(trace: StreamTrace) -> dict[str, Any]:
         if processed > 0:
             prefill_client = processed / ttft
 
-    t = trace.timings or {}
+    t: dict[str, Any] = {}
+    nested_t = _sonder_timings(trace.usage)
+    if nested_t:
+        t.update(nested_t)
+    if trace.timings:
+        t.update(trace.timings)
     cache_n = _num(t.get("cache_n"))
     prompt_n = _num(t.get("prompt_n"))
     draft_n = _num(t.get("draft_n"))
@@ -267,6 +302,7 @@ def derive(trace: StreamTrace) -> dict[str, Any]:
         "prefill_tps_server": _num(t.get("prompt_per_second")),
         "decode_tps_client": decode_client,
         "decode_tps_server": _num(t.get("predicted_per_second")),
+        "output_tps_per_user": decode_client,
         "draft_n": proposed_draft_tokens,
         "draft_accepted": accepted_draft_tokens,
         "draft_acceptance": acceptance,
@@ -316,6 +352,39 @@ def group_summary(reqs: list[dict[str, Any]]) -> dict[str, Any]:
     proposed_vals = [v for v in (_proposed_tokens(r) for r in ok) if v is not None]
     accepted_vals = [v for v in (_accepted_tokens(r) for r in ok) if v is not None]
 
+    per_user_vals: list[float | None] = []
+    by_session: dict[str, list[float]] = {}
+    cached_sum = 0
+    prompt_sum = 0
+    realized_n = 0
+    for r in ok:
+        u_tps = _num(r.get("output_tps_per_user"))
+        if u_tps is None:
+            u_tps = _num(r.get("decode_tps_client"))
+        per_user_vals.append(u_tps)
+        sid = r.get("session_id")
+        if isinstance(sid, str) and sid and u_tps is not None:
+            by_session.setdefault(sid, []).append(u_tps)
+        c_val = _num(r.get("cached_tokens"))
+        if c_val is None:
+            c_val = _num(r.get("cache_n"))
+        p_val = _num(r.get("prompt_tokens"))
+        if c_val is not None and c_val >= 0 and p_val is not None and p_val > 0:
+            cached_sum += int(c_val)
+            prompt_sum += int(p_val)
+            realized_n += 1
+
+    output_tps_per_user = summarize(per_user_vals)
+    session_means = [sum(vs) / len(vs) for vs in by_session.values() if vs]
+    realized_prefix_hit_rate = min(cached_sum / prompt_sum, 1.0) if realized_n > 0 and prompt_sum > 0 else None
+    itl_ms_summary = summarize(x * 1000.0 for x in itl)
+    itl_ms_p90 = itl_ms_summary.get("p90")
+    itl_ms_p50 = itl_ms_summary.get("p50")
+    # AgentX headline interactivity is the SLOW tail derived from pooled ITL p90:
+    # 1000 / itl_ms.p90 (higher ITL -> lower interactivity tok/s).
+    p90_interactivity_tps = (1000.0 / itl_ms_p90) if (itl_ms_p90 is not None and itl_ms_p90 > 0.0) else None
+    p50_interactivity_tps = (1000.0 / itl_ms_p50) if (itl_ms_p50 is not None and itl_ms_p50 > 0.0) else None
+
     return {
         "requests": len(reqs),
         "ok": len(ok),
@@ -325,7 +394,7 @@ def group_summary(reqs: list[dict[str, Any]]) -> dict[str, Any]:
         "e2e_s": summarize(r.get("e2e_s") for r in ok),
         "client_observed_ms": {
             "ttft_ms": summarize(r["ttft_s"] * 1000.0 for r in ok if r.get("ttft_s") is not None),
-            "itl_ms": summarize(x * 1000.0 for x in itl),
+            "itl_ms": itl_ms_summary,
             "e2e_ms": summarize(r["e2e_s"] * 1000.0 for r in ok if r.get("e2e_s") is not None),
         },
         "backend_compute_ms": {
@@ -346,9 +415,19 @@ def group_summary(reqs: list[dict[str, Any]]) -> dict[str, Any]:
         "prefill_tps_server": summarize(r.get("prefill_tps_server") for r in ok),
         "decode_tps_client": summarize(r.get("decode_tps_client") for r in ok),
         "decode_tps_server": summarize(r.get("decode_tps_server") for r in ok),
+        # Headline slow-tail interactivity derived from pooled ITL p90/p50.
+        "p90_interactivity_tps": p90_interactivity_tps,
+        "p50_interactivity_tps": p50_interactivity_tps,
+        # Secondary per-request decode rate distribution (its p90 is the fast tail).
+        "output_tps_per_user": output_tps_per_user,
+        "output_tps_per_user_p90": output_tps_per_user.get("p90"),
+        "output_tps_by_session": summarize(session_means),
         # None when no request reported cached tokens: unknown, not zero.
         "prefix_hit": summarize(hits) if hits else None,
         "prefix_hit_known": len(hits),
+        "cached_tokens_total": cached_sum if realized_n > 0 else None,
+        "prefix_hit_prompt_tokens_total": prompt_sum if realized_n > 0 else None,
+        "realized_prefix_hit_rate": realized_prefix_hit_rate,
         "recall": (sum(1 for x in recall if x) / len(recall)) if recall else None,
         "recall_n": len(recall),
         "draft_acceptance": summarize(r.get("draft_acceptance") for r in ok if r.get("draft_acceptance") is not None),

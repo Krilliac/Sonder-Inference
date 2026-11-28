@@ -310,49 +310,78 @@ optional.
 | Event | Level | Attributes |
 | --- | --- | --- |
 | `inference.decode.started` | metrics | `ttft_ms` num (at the first streamed chunk) |
-| `inference.token.generated` | standard | one per delivered chunk: `index` int, `bytes` int, `elapsed_ms` num, `unit` str. `unit: "token"` means one sampled token and adds `count` int (= 1), `token_id` int, `probability` num: always for Sonder's sampler, and for a backend-sampled token whose probability the backend reported (llamaserver, see [Backend-sampled token probabilities](#backend-sampled-token-probabilities)), which also adds `probability_basis` str (`post_sampling` / `pre_sampling`). `unit: "chunk"` (other backend-sampled streams) means the token count per chunk is unknown; use `request.completed.completion_tokens`. Optional `text` str (only when the [text capture policy](#text-capture-policy) is `on` or `full` for the request) |
+| `inference.token.generated` | standard | one per delivered chunk: `index` int, `bytes` int, `elapsed_ms` num, `unit` str. `unit: "token"` means one sampled token and adds `count` int (= 1), `token_id` int, `probability` num, `probability_basis` str (`post_sampling` / `pre_sampling`): always for Sonder's sampler (`post_sampling`), and for a backend-sampled token whose probability the backend reported (native `llamacpp` and deprecated `llamaserver`, see [Token probabilities and top alternatives](#token-probabilities-and-top-alternatives)). `unit: "chunk"` (other backend-sampled streams) means the token count per chunk is unknown; use `request.completed.completion_tokens`. Optional `text` str (only when the [text capture policy](#text-capture-policy) is `on` or `full` for the request) |
 | `inference.prefill.completed` | metrics | once per completed request, emitted at request end: `prompt_tokens` int, `token_counts_from_backend` bool, `ttft_ms` num; optional `backend_prompt_eval_ms` num (backend-reported), `reused_prompt_tokens` int (scheduled requests) |
 | `inference.decode.completed` | metrics | once per completed request: `completion_tokens` int, `chunks` int, `decode_wall_ms` num; optional `backend_eval_ms`, `backend_tokens_per_sec`, `backend_prompt_eval_ms` num |
 
-### Backend-sampled token probabilities
+### Token probabilities and top alternatives
 
-The llamaserver backend can report the probability of each token llama-server
-samples, so Observatory's "Token probabilities" and "Top alternatives"
-panels work without Sonder's sampler. It applies when `standard` events are
-recorded (a sink is attached and the level is `standard` or `deep`) and
-`TelemetryOptions::token_probability_top_k` (default 5, clamped to 10) is not
-0:
+Observatory's "Token probabilities" and "Top alternatives" panels consume
+`inference.token.generated` (`unit: "token"`, `probability`) and
+`inference.sampling.candidates`. Candidate emission is active when `standard`
+events are recorded (a sink is attached and the level is `standard` or `deep`)
+and `TelemetryOptions::token_probability_top_k` (default 5, clamped to 10) is
+not 0:
 
-- **Probe.** Against llama.cpp (`native_completion`, the default) a request
-  whose caller did not ask for logprobs gets `"n_probs": K` and
-  `"post_sampling_probs": true` (native `/completion`, and the OpenAI chat
-  endpoint, which passes both through). The probabilities never reach the
-  caller: `TokenChunk::logprob` / `top_logprobs` and
-  `GenerationResult::logprobs` stay empty, as without the probe. A caller
-  that asked for logprobs gets its request unchanged, and telemetry reuses
-  that data (`probability_basis: "pre_sampling"`, the softmax of the raw
-  logits). No probe is added for chat with tools (llama-server refuses
-  logprobs with tools and streaming) or for a generic OpenAI upstream
-  (`native_completion = false`); those requests keep `unit: "chunk"` events
-  unless the caller's own logprobs carry token ids.
-- **Events.** Each delivered chunk whose llama-server frame carried a
-  probability entry with a token `id` emits `inference.token.generated` with
-  `unit: "token"`, `count` 1, `token_id`, `probability` and
-  `probability_basis` (`post_sampling`: after llama-server's sampler chain,
-  the same basis as Sonder's sampler). Frames without one stay
-  `unit: "chunk"`. A llama-server frame is one sampled token, but its text can
-  hold several tokens when llama-server held text back (a partial stop-string
-  match, or the chat parser waiting on a tag); `probability` is then the last
-  token's. Tokens that produce no visible chunk (hidden reasoning) emit
-  nothing, so authoritative counts still come from `request.completed`.
-- **Cost.** The upstream computes the probabilities for every token of the
-  request. Post-sampling probabilities reuse the sampler's candidate list;
-  pre-sampling ones (the caller's logprobs) cost a pass over the vocabulary
-  per token and turn off llama-server backend sampling.
+- **Sonder's sampler (`token_logits` backends).** `Session` emits
+  `inference.token.generated` with `unit: "token"`, `token_id`, `probability`,
+  and `probability_basis: "post_sampling"`, and emits
+  `inference.sampling.candidates` from `SamplerChain::top_candidates()`
+  (bounded by `token_probability_top_k`, `token_candidates_stride`, and
+  `token_candidates_max_events`). Setting `token_probability_top_k` to 0
+  disables `inference.sampling.candidates` while keeping per-token
+  `probability` on `inference.token.generated`.
+
+#### Backend-sampled token probabilities
+
+- **Native `llamacpp` backend (opt-in probe).** To preserve GPU backend
+  sampling (`llama_set_sampler`) on the default serving path, the native
+  `llamacpp` post-sampling probe is **opt-in**: it activates when
+  `token_probability_top_k > 0` and either
+  `TelemetryOptions::native_token_probabilities` is `true` or the telemetry
+  level is `deep` (e.g. `sonder-infer serve --telemetry-level deep`). When
+  enabled and the caller did not request logprobs, `LlamaCppBackend` reads the
+  post-sampling distribution (`probability_basis: "post_sampling"`) directly
+  from its in-process llama.cpp sampler chain (without populating caller
+  `TokenChunk::logprob` / `top_logprobs` or `GenerationResult::logprobs`). When
+  the caller explicitly requested `sampling.logprobs`, telemetry always reuses
+  the pre-sampling log-softmax (`probability_basis: "pre_sampling"`) at
+  `standard` or `deep` without altering the caller's `top_logprobs`. Stride
+  (`token_candidates_stride`), per-request cap (`token_candidates_max_events`),
+  and text-capture (`capture_text`) are forwarded to the backend so skipped or
+  capped tokens avoid candidate extraction and `TokenToPiece` detokenization.
+  With default `TelemetryOptions` (`standard`, `native_token_probabilities = false`)
+  and no caller `logprobs`, the probe stays off and GPU backend sampling
+  (`llama_set_sampler`) remains active.
+- **Legacy `llamaserver` probe (deprecated).** Against llama.cpp
+  (`native_completion`, the default) a request whose caller did not ask for
+  logprobs gets `"n_probs": K` and `"post_sampling_probs": true` (native
+  `/completion`, and the OpenAI chat endpoint, which passes both through). The
+  probabilities never reach the caller: `TokenChunk::logprob` / `top_logprobs`
+  and `GenerationResult::logprobs` stay empty, as without the probe. A caller
+  that asked for logprobs gets its request unchanged, and telemetry reuses that
+  data (`probability_basis: "pre_sampling"`, the softmax of the raw logits). No
+  probe is added for chat with tools (llama-server refuses logprobs with tools
+  and streaming) or for a generic OpenAI upstream (`native_completion = false`);
+  those requests keep `unit: "chunk"` events unless the caller's own logprobs
+  carry token ids.
+- **Events.** Each delivered chunk carrying a sampled probability emits
+  `inference.token.generated` with `unit: "token"`, `count` 1, `token_id`,
+  `probability` and `probability_basis` (`post_sampling` after the sampler
+  chain, or `pre_sampling` from raw logits). Frames without one stay
+  `unit: "chunk"`. Hidden reasoning tokens produce no visible text chunk, so
+  authoritative counts still come from `request.completed`.
+- **Cost.** Post-sampling probabilities reuse the sampler's candidate list;
+  pre-sampling ones (the caller's logprobs) cost a pass over the vocabulary per
+  token. On native `llamacpp`, opting in to the probe
+  (`native_token_probabilities = true` or `TelemetryLevel::deep`) keeps logits
+  readable on CPU instead of binding GPU backend sampling (`llama_set_sampler`),
+  while skipping candidate sorting and `TokenToPiece` work on stride-skipped or
+  capped tokens and when `capture_text` is off.
 
 | Event | Level | Attributes |
 | --- | --- | --- |
-| `inference.sampling.candidates` | standard | per backend-sampled token with a reported probability and at least one alternative, bounded per request (below): `index` int (the `inference.token.generated` `index` of the same token), `sampled_token_id` int, `probability_basis` str (`post_sampling` / `pre_sampling`), `candidates` arr of `{token_id` int, `probability` num, optional `text` str (only when the [text capture policy](#text-capture-policy) is `on` or `full` for the request)`}`, most probable first, at most `token_probability_top_k` entries. Alternatives without a token id are left out |
+| `inference.sampling.candidates` | standard | per sampled token (Sonder's sampler, native `llamacpp`, or `llamaserver`) with a reported probability and at least one candidate, bounded per request (below): `index` int (the `inference.token.generated` `index` of the same token), `sampled_token_id` int, `probability_basis` str (`post_sampling` / `pre_sampling`), `candidates` arr of `{token_id` int, `probability` num, optional `text` str (only when the [text capture policy](#text-capture-policy) is `on` or `full` for the request)`}`, most probable first, at most `token_probability_top_k` entries. Alternatives without a token id are left out |
 
 Volume bounds (`TelemetryOptions`): `token_candidates_stride` (default 1;
 emit for every n-th probability-bearing token of the request, counting from
@@ -361,8 +390,7 @@ request; 0 = no cap). The shape follows Observatory's proposal in its
 `docs/TELEMETRY_PROTOCOL.md` ("3D Inference: reserved and proposed events"),
 with two differences: it is emitted at `standard` rather than `deep` (the
 bounds above keep the volume down, and the panels then work at the default
-level), and it adds `probability_basis`. Sonder's own sampler does not emit it
-yet.
+level), and it adds `probability_basis`.
 
 The Ollama timing helper (`ollama::emit_timing_events`) never reuses these
 names. It emits `backend.model.load.reported` (`backend`, `model`,

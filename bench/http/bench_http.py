@@ -13,18 +13,27 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import math
 import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from httpbench import __version__  # noqa: E402
+from httpbench.agentx import (DEFAULT_IDLE_GAP_CAP_S, DEFAULT_MAX_CONTEXT_LENGTH,  # noqa: E402
+                              DEFAULT_TRACE_FIT, TRACE_FIT_MODES)
 from httpbench.client import Target, parse_header  # noqa: E402
 from httpbench.gpumem import GpuSampler, expected_clean_shared  # noqa: E402
 from httpbench.observation import validate_sha256_hex  # noqa: E402
 from httpbench.report import compare, render_markdown  # noqa: E402
-from httpbench.runner import (ACCEPTANCE_MATRIX_SCENARIOS, BUILTIN_SCENARIOS, Runner,  # noqa: E402
-                              default_out_prefix, load_config)
+from httpbench.runner import (ACCEPTANCE_MATRIX_SCENARIOS, AGENTX_SCENARIOS, BUILTIN_SCENARIOS, Runner,  # noqa: E402
+                              default_out_prefix, load_config, validate_config)
+
+
+class _TrackExplicit(argparse.Action):
+    def __call__(self, parser, namespace, values, option_string=None):
+        setattr(namespace, self.dest, values)
+        setattr(namespace, f"_{self.dest}_explicit", True)
 
 
 def _csv_ints(s: str) -> list[int]:
@@ -73,6 +82,24 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--long-sizes", type=_csv_ints, help="override long_context sizes, e.g. 8192,16384")
     r.add_argument("--max-tokens", type=int, help="override max_tokens for every scenario")
     r.add_argument("--ctx-size", type=int, help="server context size (default: from /props or Sonder identity)")
+    ax = r.add_argument_group("AgentX trace replay (semianalysisai/cc-traces-weka-062126)")
+    ax.add_argument("--trace-file", metavar="PATH",
+                    help="local Weka trace JSON/JSONL file or directory; without --scenarios runs agentx_trace")
+    ax.add_argument("--max-context-length", type=int, default=DEFAULT_MAX_CONTEXT_LENGTH,
+                    action=_TrackExplicit,
+                    help=f"maximum request context (in+out tokens) for trace replay (default: {DEFAULT_MAX_CONTEXT_LENGTH})")
+    ax.add_argument("--trace-fit", choices=list(TRACE_FIT_MODES), default=DEFAULT_TRACE_FIT,
+                    action=_TrackExplicit,
+                    help=f"how to handle traces exceeding --max-context-length: 'scale' shrinks proportionally "
+                         f"(default: {DEFAULT_TRACE_FIT}); 'drop' skips whole traces (AIPerf parity)")
+    ax.add_argument("--max-traces", type=int,
+                    help="maximum fitted traces to load while streaming a trace file (default: max concurrency * sessions)")
+    ax.add_argument("--concurrency-levels", type=_csv_ints,
+                    help="override concurrency levels for trace replay / sweep, e.g. 1,2,4,8")
+    ax.add_argument("--idle-gap-cap", type=float,
+                    help=f"cap inter-turn idle gaps in seconds (default: {DEFAULT_IDLE_GAP_CAP_S:g})")
+    ax.add_argument("--idle-time-scale", type=float,
+                    help="scale factor applied to capped idle gaps during replay (default: 1.0; 0 skips sleeps)")
     r.add_argument("--no-think", action="store_true",
                    help='send chat_template_kwargs {"enable_thinking": false} (Qwen3-style templates)')
     r.add_argument("--extra-body", help="JSON object merged into every request body")
@@ -116,18 +143,40 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--json", action="store_true", help="print rows as JSON instead of markdown")
 
     sc_cmd = sub.add_parser("scenarios", help="print the built-in scenario config as JSON")
-    sc_cmd.add_argument("--preset", choices=["all", "acceptance"], default="all",
+    sc_cmd.add_argument("--preset", choices=["all", "acceptance", "agentx"], default="all",
                         help="scenario preset to print (default: all)")
     return ap
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    try:
-        cfg = load_config(args.scenarios)
-    except (OSError, ValueError) as e:
-        print(f"error: {e}", file=sys.stderr)
+    if args.max_context_length is None or args.max_context_length <= 0:
+        print("error: --max-context-length must be a positive integer", file=sys.stderr)
         return 2
-    cfg = copy.deepcopy(cfg)
+    if args.max_traces is not None and args.max_traces <= 0:
+        print("error: --max-traces must be a positive integer", file=sys.stderr)
+        return 2
+    if args.concurrency_levels is not None and (not args.concurrency_levels or any(x <= 0 for x in args.concurrency_levels)):
+        print("error: --concurrency-levels must be positive integers", file=sys.stderr)
+        return 2
+    if args.idle_gap_cap is not None and (not math.isfinite(args.idle_gap_cap) or args.idle_gap_cap < 0):
+        print("error: --idle-gap-cap must be finite and >= 0", file=sys.stderr)
+        return 2
+    if args.idle_time_scale is not None and (not math.isfinite(args.idle_time_scale) or args.idle_time_scale < 0):
+        print("error: --idle-time-scale must be finite and >= 0", file=sys.stderr)
+        return 2
+    if args.trace_file and not os.path.exists(args.trace_file):
+        print(f"error: --trace-file does not exist: {args.trace_file}", file=sys.stderr)
+        return 2
+    if args.trace_file and not args.scenarios:
+        cfg = copy.deepcopy(AGENTX_SCENARIOS)
+        cfg["scenarios"][0]["trace_path"] = args.trace_file
+    else:
+        try:
+            cfg = load_config(args.scenarios)
+        except (OSError, ValueError) as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 2
+        cfg = copy.deepcopy(cfg)
     if args.only:
         want = {x.strip() for x in args.only.split(",") if x.strip()}
         cfg["scenarios"] = [s for s in cfg["scenarios"] if (s.get("name") or s["kind"]) in want]
@@ -135,6 +184,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         if missing:
             print(f"error: unknown scenario(s) {sorted(missing)}", file=sys.stderr)
             return 2
+    max_ctx_explicit = bool(getattr(args, "_max_context_length_explicit", False))
+    trace_fit_explicit = bool(getattr(args, "_trace_fit_explicit", False))
     for s in cfg["scenarios"]:
         if args.api:
             s["api"] = args.api
@@ -143,6 +194,27 @@ def cmd_run(args: argparse.Namespace) -> int:
             s["_max_tokens_explicit"] = True
         if args.long_sizes and s["kind"] == "long_context":
             s["sizes"] = args.long_sizes
+        if s["kind"] == "agentx_trace":
+            if args.trace_file:
+                s["trace_path"] = args.trace_file
+            if max_ctx_explicit or "max_context_length" not in s:
+                s["max_context_length"] = args.max_context_length
+            if trace_fit_explicit or "trace_fit" not in s:
+                s["trace_fit"] = args.trace_fit
+            if args.max_traces is not None:
+                s["max_traces"] = args.max_traces
+            if args.concurrency_levels:
+                s["levels"] = list(args.concurrency_levels)
+            if args.idle_gap_cap is not None:
+                s["idle_gap_cap_s"] = args.idle_gap_cap
+            if args.idle_time_scale is not None:
+                s["idle_time_scale"] = args.idle_time_scale
+        elif args.concurrency_levels and s["kind"] == "concurrency_sweep":
+            s["levels"] = list(args.concurrency_levels)
+    cfg_errs = validate_config(cfg)
+    if cfg_errs:
+        print("error: invalid scenario config: " + "; ".join(cfg_errs), file=sys.stderr)
+        return 2
     extra: dict = {}
     if args.extra_body:
         try:
@@ -265,7 +337,9 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_run(args)
     if args.cmd == "compare":
         return cmd_compare(args)
-    preset = ACCEPTANCE_MATRIX_SCENARIOS if getattr(args, "preset", "all") == "acceptance" else BUILTIN_SCENARIOS
+    preset_name = getattr(args, "preset", "all")
+    preset = (ACCEPTANCE_MATRIX_SCENARIOS if preset_name == "acceptance"
+              else (AGENTX_SCENARIOS if preset_name == "agentx" else BUILTIN_SCENARIOS))
     print(json.dumps(preset, indent=1))
     return 0
 

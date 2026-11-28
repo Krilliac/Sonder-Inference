@@ -470,6 +470,11 @@ Status Validate(const SamplingParams& params) {
     if (params.top_logprobs > 0 && !params.compute_logprobs) {
         return Status::Error(ErrorCode::kInvalidArgument, "top_logprobs > 0 requires compute_logprobs = true");
     }
+    if (params.telemetry_top_k < 0 || params.telemetry_top_k > kMaxTopLogprobs) {
+        return Status::Error(ErrorCode::kInvalidArgument,
+                             "telemetry_top_k (" + std::to_string(params.telemetry_top_k) + ") must be in [0, " +
+                                 std::to_string(kMaxTopLogprobs) + "]");
+    }
     return Status::Ok();
 }
 
@@ -895,6 +900,21 @@ Status ValidateContextOptions(const LoadOptions& options) {
                              "embed_max_sequences (" + std::to_string(options.embed_max_sequences) +
                                  ") must be <= " + std::to_string(kMaxEmbedSequences));
     }
+    if (ToString(options.workload_role) == "unknown") {
+        return Status::Error(ErrorCode::kInvalidArgument,
+                             "unknown workload_role (expected main_decode or auxiliary)");
+    }
+    if (ToString(options.main_stream_priority) == "unknown") {
+        return Status::Error(ErrorCode::kInvalidArgument,
+                             "unknown main_stream_priority (expected default, high or low)");
+    }
+    if (ToString(options.aux_stream_priority) == "unknown") {
+        return Status::Error(ErrorCode::kInvalidArgument,
+                             "unknown aux_stream_priority (expected default, high or low)");
+    }
+    if (Status s = ValidateAuxGateConfig(options.aux_gate); !s.ok()) {
+        return s;
+    }
     // n_batch == 0 keeps its own, older error in Load().
     if (options.n_batch > 0 && options.n_ubatch > options.n_batch) {
         return Status::Error(ErrorCode::kInvalidArgument,
@@ -1049,6 +1069,255 @@ TokenLogprobInfo ComputeTokenLogprobs(std::span<const float> logits, Token chose
         info.top_logprobs.emplace_back(tok, static_cast<float>(static_cast<double>(raw) - log_z));
     }
     return info;
+}
+
+SampledProbInfo BuildPreSamplingProbInfo(const TokenLogprobInfo& lp, Token chosen_token, std::int32_t top_k,
+                                         bool collect_candidates) {
+    SampledProbInfo out;
+    if (!lp.valid || chosen_token < 0 || top_k <= 0) {
+        return out;
+    }
+    if (std::isnan(lp.logprob) || (std::isinf(lp.logprob) && lp.logprob > 0.0F)) {
+        return out;
+    }
+    const float chosen_p =
+        std::isinf(lp.logprob) ? 0.0F : std::clamp(static_cast<float>(std::exp(static_cast<double>(lp.logprob))), 0.0F, 1.0F);
+    if (collect_candidates) {
+        const std::size_t k = static_cast<std::size_t>(std::min(top_k, kMaxTopLogprobs));
+        out.candidates.reserve(std::min(k, lp.top_logprobs.size()));
+        for (const auto& [tok, tok_lp] : lp.top_logprobs) {
+            if (tok < 0 || std::isnan(tok_lp) || (std::isinf(tok_lp) && tok_lp > 0.0F)) {
+                continue;
+            }
+            const float p = std::isinf(tok_lp)
+                                ? 0.0F
+                                : std::clamp(static_cast<float>(std::exp(static_cast<double>(tok_lp))), 0.0F, 1.0F);
+            if (p <= 0.0F) {
+                continue;
+            }
+            out.candidates.emplace_back(tok, p);
+        }
+        std::sort(out.candidates.begin(), out.candidates.end(), [](const auto& a, const auto& b) {
+            if (a.second != b.second) return a.second > b.second;
+            return a.first < b.first;
+        });
+        if (out.candidates.size() > k) {
+            out.candidates.resize(k);
+        }
+    }
+    out.valid = true;
+    out.probability = chosen_p;
+    out.post_sampling = false;
+    return out;
+}
+
+SampledProbInfo ComputePostSamplingProbInfo(std::span<const CandidateLogitProb> candidates, bool has_probs,
+                                            Token chosen_token, std::int32_t top_k, bool collect_candidates) {
+    SampledProbInfo out;
+    if (candidates.empty() || chosen_token < 0 || top_k <= 0) {
+        return out;
+    }
+    const std::size_t k =
+        collect_candidates
+            ? std::min<std::size_t>(static_cast<std::size_t>(std::min(top_k, kMaxTopLogprobs)), candidates.size())
+            : 0u;
+
+    auto insert_top = [&](std::vector<std::pair<Token, float>>& best, Token tok, float score) {
+        if (k == 0u) return;
+        if (best.size() < k) {
+            best.emplace_back(tok, score);
+            std::size_t j = best.size() - 1;
+            while (j > 0 && (best[j].second > best[j - 1].second ||
+                             (best[j].second == best[j - 1].second && best[j].first < best[j - 1].first))) {
+                std::swap(best[j], best[j - 1]);
+                --j;
+            }
+        } else if (score > best.back().second || (score == best.back().second && tok < best.back().first)) {
+            best.back() = {tok, score};
+            std::size_t j = k - 1;
+            while (j > 0 && (best[j].second > best[j - 1].second ||
+                             (best[j].second == best[j - 1].second && best[j].first < best[j - 1].first))) {
+                std::swap(best[j], best[j - 1]);
+                --j;
+            }
+        }
+    };
+
+    if (has_probs) {
+        bool found_chosen = false;
+        float chosen_p = 0.0F;
+        std::vector<std::pair<Token, float>> best;
+        if (k > 0u) {
+            best.reserve(k);
+        }
+        for (const CandidateLogitProb& c : candidates) {
+            if (c.id < 0 || !std::isfinite(c.p) || c.p < 0.0F) {
+                continue;
+            }
+            const float clamped = std::clamp(c.p, 0.0F, 1.0F);
+            if (c.id == chosen_token && !found_chosen) {
+                found_chosen = true;
+                chosen_p = clamped;
+                if (k == 0u) {
+                    break;
+                }
+            }
+            if (k > 0u && clamped > 0.0F) {
+                insert_top(best, c.id, clamped);
+            }
+        }
+        if (!found_chosen) {
+            return out;
+        }
+        out.valid = true;
+        out.probability = chosen_p;
+        out.post_sampling = true;
+        out.candidates = std::move(best);
+        return out;
+    }
+
+    // Softmax over finite/+inf post-processor logits (e.g. greedy path).
+    float max_logit = -std::numeric_limits<float>::infinity();
+    bool any_finite = false;
+    std::size_t pos_inf_count = 0;
+    bool found_chosen = false;
+    float chosen_logit = -std::numeric_limits<float>::infinity();
+    for (const CandidateLogitProb& c : candidates) {
+        if (c.id < 0 || std::isnan(c.logit)) {
+            continue;
+        }
+        if (std::isinf(c.logit)) {
+            if (c.logit > 0.0F) {
+                ++pos_inf_count;
+                if (c.id == chosen_token && !found_chosen) {
+                    found_chosen = true;
+                    chosen_logit = c.logit;
+                }
+            }
+            continue;
+        }
+        if (!any_finite || c.logit > max_logit) {
+            max_logit = c.logit;
+            any_finite = true;
+        }
+        if (c.id == chosen_token && !found_chosen) {
+            found_chosen = true;
+            chosen_logit = c.logit;
+        }
+    }
+    if (!found_chosen) {
+        return out;
+    }
+
+    if (pos_inf_count > 0u) {
+        const float share = std::clamp(1.0F / static_cast<float>(pos_inf_count), 0.0F, 1.0F);
+        std::vector<std::pair<Token, float>> best;
+        if (k > 0u) {
+            best.reserve(k);
+            for (const CandidateLogitProb& c : candidates) {
+                if (c.id >= 0 && std::isinf(c.logit) && c.logit > 0.0F) {
+                    insert_top(best, c.id, share);
+                }
+            }
+        }
+        out.valid = true;
+        out.probability = (std::isinf(chosen_logit) && chosen_logit > 0.0F) ? share : 0.0F;
+        out.post_sampling = true;
+        out.candidates = std::move(best);
+        return out;
+    }
+
+    if (!any_finite || !std::isfinite(chosen_logit)) {
+        return out;
+    }
+
+    std::vector<std::pair<Token, float>> best_logits;
+    if (k > 0u) {
+        best_logits.reserve(k);
+    }
+    double sum_exp = 0.0;
+    for (const CandidateLogitProb& c : candidates) {
+        if (c.id < 0 || !std::isfinite(c.logit)) {
+            continue;
+        }
+        sum_exp += std::exp(static_cast<double>(c.logit) - static_cast<double>(max_logit));
+        if (k > 0u) {
+            insert_top(best_logits, c.id, c.logit);
+        }
+    }
+    if (!(sum_exp > 0.0) || !std::isfinite(sum_exp)) {
+        return out;
+    }
+
+    out.valid = true;
+    out.probability = std::clamp(
+        static_cast<float>(std::exp(static_cast<double>(chosen_logit) - static_cast<double>(max_logit)) / sum_exp),
+        0.0F, 1.0F);
+    out.post_sampling = true;
+    if (k > 0u) {
+        out.candidates.reserve(best_logits.size());
+        for (const auto& [tok, raw_l] : best_logits) {
+            const float p = std::clamp(
+                static_cast<float>(std::exp(static_cast<double>(raw_l) - static_cast<double>(max_logit)) / sum_exp),
+                0.0F, 1.0F);
+            if (p > 0.0F) {
+                out.candidates.emplace_back(tok, p);
+            }
+        }
+    }
+    return out;
+}
+
+SampledProbInfo ComputePostSamplingProbInfoFromDenseProbs(std::span<const double> probs, Token chosen_token,
+                                                          std::int32_t top_k, bool collect_candidates) {
+    SampledProbInfo out;
+    if (probs.empty() || chosen_token < 0 || static_cast<std::size_t>(chosen_token) >= probs.size() || top_k <= 0) {
+        return out;
+    }
+    const double chosen_raw = probs[static_cast<std::size_t>(chosen_token)];
+    if (!std::isfinite(chosen_raw) || chosen_raw < 0.0) {
+        return out;
+    }
+    out.valid = true;
+    out.probability = std::clamp(static_cast<float>(chosen_raw), 0.0F, 1.0F);
+    out.post_sampling = true;
+    if (!collect_candidates) {
+        return out;
+    }
+    const std::size_t k = std::min<std::size_t>(static_cast<std::size_t>(std::min(top_k, kMaxTopLogprobs)), probs.size());
+    out.candidates.reserve(k);
+    for (std::size_t v = 0; v < probs.size(); ++v) {
+        const double raw = probs[v];
+        if (!std::isfinite(raw) || raw <= 0.0) {
+            continue;
+        }
+        const float p = std::clamp(static_cast<float>(raw), 0.0F, 1.0F);
+        if (p <= 0.0F) {
+            continue;
+        }
+        const Token tok = static_cast<Token>(v);
+        if (out.candidates.size() < k) {
+            out.candidates.emplace_back(tok, p);
+            std::size_t j = out.candidates.size() - 1;
+            while (j > 0 && (out.candidates[j].second > out.candidates[j - 1].second ||
+                             (out.candidates[j].second == out.candidates[j - 1].second &&
+                              out.candidates[j].first < out.candidates[j - 1].first))) {
+                std::swap(out.candidates[j], out.candidates[j - 1]);
+                --j;
+            }
+        } else if (p > out.candidates.back().second ||
+                   (p == out.candidates.back().second && tok < out.candidates.back().first)) {
+            out.candidates.back() = {tok, p};
+            std::size_t j = k - 1;
+            while (j > 0 && (out.candidates[j].second > out.candidates[j - 1].second ||
+                             (out.candidates[j].second == out.candidates[j - 1].second &&
+                              out.candidates[j].first < out.candidates[j - 1].first))) {
+                std::swap(out.candidates[j], out.candidates[j - 1]);
+                --j;
+            }
+        }
+    }
+    return out;
 }
 
 Status ValidateMediaBlobs(const std::vector<std::vector<std::uint8_t>>& media_blobs) {
