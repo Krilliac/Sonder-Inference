@@ -324,8 +324,9 @@ and `TelemetryOptions::token_probability_top_k` (default 5, clamped to 10) is
 not 0:
 
 - **Sonder's sampler (`token_logits` backends).** `Session` emits
-  `inference.token.generated` with `unit: "token"`, `token_id`, `probability`,
-  and `probability_basis: "post_sampling"`, and emits
+  `inference.token.generated` with `unit: "token"`, `token_id` (only when the
+  text capture policy captures output text), `probability`, and
+  `probability_basis: "post_sampling"`, and emits
   `inference.sampling.candidates` from `SamplerChain::top_candidates()`
   (bounded by `token_probability_top_k`, `token_candidates_stride`, and
   `token_candidates_max_events`). Setting `token_probability_top_k` to 0
@@ -366,8 +367,8 @@ not 0:
   those requests keep `unit: "chunk"` events unless the caller's own logprobs
   carry token ids.
 - **Events.** Each delivered chunk carrying a sampled probability emits
-  `inference.token.generated` with `unit: "token"`, `count` 1, `token_id`,
-  `probability` and `probability_basis` (`post_sampling` after the sampler
+  `inference.token.generated` with `unit: "token"`, `count` 1, `token_id`
+  (only when the text capture policy captures output text), `probability` and `probability_basis` (`post_sampling` after the sampler
   chain, or `pre_sampling` from raw logits). Frames without one stay
   `unit: "chunk"`. Hidden reasoning tokens produce no visible text chunk, so
   authoritative counts still come from `request.completed`.

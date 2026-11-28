@@ -730,24 +730,57 @@ TEST_CASE("VIS-03: native llamacpp emits token probabilities and inference.sampl
             CHECK(cands[i].find("sampling")->find("level")->as_string() == "standard");
             CHECK(ta.find("unit")->as_string() == "token");
             CHECK(ta.find("count")->as_int() == 1);
-            CHECK(ta.find("token_id")->as_int() == 1);
+            // Text capture policy is off (default): token ids are output text and stay out.
+            CHECK(ta.find("token_id") == nullptr);
             CHECK(ta.find("probability")->as_double() == doctest::Approx(p1).epsilon(1e-4));
             CHECK(ta.find("probability_basis")->as_string() == "post_sampling");
             CHECK(ta.find("text") == nullptr);
 
             CHECK(ca.find("index")->as_int() == ta.find("index")->as_int());
-            CHECK(ca.find("sampled_token_id")->as_int() == 1);
+            CHECK(ca.find("sampled_token_id") == nullptr);
             CHECK(ca.find("probability_basis")->as_string() == "post_sampling");
             const auto& list = ca.find("candidates")->as_array();
             REQUIRE(list.size() == 3u);  // token 0 banned (-inf) -> excluded
-            CHECK(list[0].find("token_id")->as_int() == 1);
             CHECK(list[0].find("probability")->as_double() == doctest::Approx(p1).epsilon(1e-4));
-            CHECK(list[1].find("token_id")->as_int() == 2);
             CHECK(list[1].find("probability")->as_double() == doctest::Approx(p2).epsilon(1e-4));
-            CHECK(list[2].find("token_id")->as_int() == 3);
             CHECK(list[2].find("probability")->as_double() == doctest::Approx(p3).epsilon(1e-4));
             for (const auto& entry : list) {
+                CHECK(entry.find("token_id") == nullptr);
                 CHECK(entry.find("text") == nullptr);
+            }
+        }
+    }
+
+    SUBCASE("native_token_probabilities with text capture on emits token ids in tokens and candidates") {
+        si::TelemetryOptions t;
+        t.native_token_probabilities = true;
+        t.text_capture = si::TextCapturePolicy::on;  // token ids are output text
+        si::SamplingConfig sc = si::SamplingConfig::greedy(3);
+        sc.logit_bias = {{0, -std::numeric_limits<float>::infinity()}, {1, 2.0f}, {2, 1.0f}, {3, 0.0f}};
+        auto [res, events] = run_native(t, sc, 1u);
+        CHECK(res.text == "aaa");
+
+        const auto tokens = filter_events(events, "inference.token.generated");
+        const auto cands = filter_events(events, "inference.sampling.candidates");
+        REQUIRE(tokens.size() == 3u);
+        REQUIRE(cands.size() == 3u);
+        for (std::size_t i = 0; i < 3u; ++i) {
+            const auto& ta = *tokens[i].find("attributes");
+            const auto& ca = *cands[i].find("attributes");
+            REQUIRE(ta.find("token_id") != nullptr);
+            CHECK(ta.find("token_id")->as_int() == 1);
+            REQUIRE(ta.find("text") != nullptr);
+            CHECK(ta.find("text")->as_string() == "a");
+            CHECK(ta.find("probability")->as_double() == doctest::Approx(p1).epsilon(1e-4));
+            CHECK(ta.find("probability_basis")->as_string() == "post_sampling");
+
+            REQUIRE(ca.find("sampled_token_id") != nullptr);
+            CHECK(ca.find("sampled_token_id")->as_int() == 1);
+            const auto& list = ca.find("candidates")->as_array();
+            REQUIRE(list.size() == 3u);
+            for (std::size_t j = 0; j < 3u; ++j) {
+                REQUIRE(list[j].find("token_id") != nullptr);
+                CHECK(list[j].find("token_id")->as_int() == static_cast<std::int64_t>(j + 1));
             }
         }
     }
@@ -792,7 +825,9 @@ TEST_CASE("VIS-03: native llamacpp emits token probabilities and inference.sampl
         CHECK(ca.find("probability_basis")->as_string() == "post_sampling");
         const auto& list = ca.find("candidates")->as_array();
         REQUIRE(list.size() == 2u);
+        REQUIRE(list[0].find("token_id") != nullptr);
         CHECK(list[0].find("token_id")->as_int() == 1);
+        REQUIRE(list[1].find("token_id") != nullptr);
         CHECK(list[1].find("token_id")->as_int() == 2);
         REQUIRE(list[0].find("text") != nullptr);
         CHECK(list[0].find("text")->as_string() == "a");
