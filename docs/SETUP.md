@@ -122,7 +122,7 @@ passed on the same command line (`src/backends/llamacpp/CMakeLists.txt:~34-36`):
 
 | Goal | Extra options | Needs installed first |
 | --- | --- | --- |
-| NVIDIA GPU | `-DGGML_CUDA=ON` | CUDA Toolkit |
+| NVIDIA GPU | `-DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120a` (or presets `windows-cuda-blackwell`, `windows-cuda-rtx`, `linux-cuda-blackwell`, `linux-cuda-rtx`; see [GPU_SUPPORT.md](GPU_SUPPORT.md#2-nvidia-rtx-ampere-ada-blackwell)) | CUDA Toolkit `>= 13.4` (`13.5` preferred) |
 | Any Vulkan GPU | `-DGGML_VULKAN=ON` | Vulkan SDK |
 
 `-DGGML_NATIVE=OFF` builds for a generic CPU instead of the build machine's

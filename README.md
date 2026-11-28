@@ -102,8 +102,10 @@ Configure, build and test presets are defined in
 | `ci-windows`, `ci-linux` | as above | RelWithDebInfo, warnings as errors |
 
 Opt-in direct `llamacpp` CPU and GPU presets (`windows-cuda-blackwell`,
-`windows-cuda-rtx`, `windows-rocm-xt`, `windows-vulkan-xt`, `linux-llamacpp`,
-`linux-cuda-blackwell`, `linux-cuda-rtx`, `linux-rocm-xt`, `linux-vulkan-xt`)
+`windows-cuda-blackwell-120f`, `windows-cuda-rtx`, `windows-rocm-xt`,
+`windows-vulkan-xt`, `linux-llamacpp`, `linux-cuda-blackwell`,
+`linux-cuda-blackwell-120f`, `linux-cuda-rtx`, `linux-rocm-xt`,
+`linux-vulkan-xt`)
 are also defined in [CMakePresets.json](CMakePresets.json); see
 [docs/GPU_SUPPORT.md](docs/GPU_SUPPORT.md).
 

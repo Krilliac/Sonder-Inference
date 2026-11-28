@@ -86,10 +86,10 @@ The `llamaserver` backend requires no `llama.cpp` compile-time linkage: point `-
 
 | Host OS | Accelerator | Preset (`CMakePresets.json`) | Runtime / Toolchain | Supported Bonsai GGUF Families |
 | --- | --- | --- | --- | --- |
-| Windows 11 | NVIDIA Blackwell (`sm_120`, RTX 50-series) | `windows-cuda-blackwell` | CUDA 12.8+ / 13.x + MSVC (`GGML_CUDA_GRAPHS=ON`, `GGML_CUDA_FA_ALL_QUANTS=ON`) | Bonsai-1 (`Q1_0`), Bonsai (`Q2_0`), Bonsai-2 (`PQ2_0`, `PTQ1_0`, `draft-mtp` via PrismML tree) |
-| Windows 11 | NVIDIA RTX (`sm_86;89;120`, RTX 30/40/50) | `windows-cuda-rtx` | CUDA 12.8+ / 13.x + MSVC (`GGML_CUDA_GRAPHS=ON`, `GGML_CUDA_FA_ALL_QUANTS=ON`) | Bonsai-1 (`Q1_0`), Bonsai (`Q2_0`), Bonsai-2 (`PQ2_0`, `PTQ1_0`, `draft-mtp`) |
-| Linux / WSL2 | NVIDIA Blackwell (`sm_120`, RTX 50-series) | `linux-cuda-blackwell` | CUDA 12.8+ / 13.x + GCC/Clang (`GGML_CUDA_GRAPHS=ON`, `GGML_CUDA_FA_ALL_QUANTS=ON`) | Bonsai-1 (`Q1_0`), Bonsai (`Q2_0`), Bonsai-2 (`PQ2_0`, `PTQ1_0`, `draft-mtp`) |
-| Linux / WSL2 | NVIDIA RTX (`sm_86;89;120`, RTX 30/40/50) | `linux-cuda-rtx` | CUDA 12.8+ / 13.x + GCC/Clang (`GGML_CUDA_GRAPHS=ON`, `GGML_CUDA_FA_ALL_QUANTS=ON`) | Bonsai-1 (`Q1_0`), Bonsai (`Q2_0`), Bonsai-2 (`PQ2_0`, `PTQ1_0`, `draft-mtp`) |
+| Windows 11 | NVIDIA Blackwell (`sm_120a` / `sm_120f`, RTX 50-series) | `windows-cuda-blackwell` / `windows-cuda-blackwell-120f` | CUDA `>= 13.4` (`13.5` preferred) + MSVC (`GGML_CUDA_GRAPHS=ON`, `GGML_CUDA_FA_ALL_QUANTS=ON`) | Bonsai-1 (`Q1_0`), Bonsai (`Q2_0`), Bonsai-2 (`PQ2_0`, `PTQ1_0`, `draft-mtp` via PrismML tree) |
+| Windows 11 | NVIDIA RTX (`sm_86;89;120a`, RTX 30/40/50) | `windows-cuda-rtx` | CUDA `>= 13.4` (`13.5` preferred) + MSVC (`GGML_CUDA_GRAPHS=ON`, `GGML_CUDA_FA_ALL_QUANTS=ON`) | Bonsai-1 (`Q1_0`), Bonsai (`Q2_0`), Bonsai-2 (`PQ2_0`, `PTQ1_0`, `draft-mtp`) |
+| Linux / WSL2 | NVIDIA Blackwell (`sm_120a` / `sm_120f`, RTX 50-series) | `linux-cuda-blackwell` / `linux-cuda-blackwell-120f` | CUDA `>= 13.4` (`13.5` preferred) + GCC/Clang (`GGML_CUDA_GRAPHS=ON`, `GGML_CUDA_FA_ALL_QUANTS=ON`) | Bonsai-1 (`Q1_0`), Bonsai (`Q2_0`), Bonsai-2 (`PQ2_0`, `PTQ1_0`, `draft-mtp`) |
+| Linux / WSL2 | NVIDIA RTX (`sm_86;89;120a`, RTX 30/40/50) | `linux-cuda-rtx` | CUDA `>= 13.4` (`13.5` preferred) + GCC/Clang (`GGML_CUDA_GRAPHS=ON`, `GGML_CUDA_FA_ALL_QUANTS=ON`) | Bonsai-1 (`Q1_0`), Bonsai (`Q2_0`), Bonsai-2 (`PQ2_0`, `PTQ1_0`, `draft-mtp`) |
 | Windows 11 | AMD Radeon RX XT (RDNA 2/3/4) & Ryzen APU | `windows-rocm-xt` | AMD HIP SDK (`HIP_PATH`, `GGML_HIP=ON`, `GGML_HIP_GRAPHS=ON`, `GGML_HIP_ROCWMMA_FATTN=ON`) | Bonsai-1 (`Q1_0`), Bonsai (`Q2_0`), Bonsai-2 (with matching `llama.cpp` tree) |
 | Linux | AMD Radeon RX XT (RDNA 2/3/4) & Ryzen APU | `linux-rocm-xt` | ROCm 6.x+ (`/dev/kfd`, `GGML_HIP=ON`, `GGML_HIP_GRAPHS=ON`, `GGML_HIP_ROCWMMA_FATTN=ON`) | Bonsai-1 (`Q1_0`), Bonsai (`Q2_0`), Bonsai-2 (with matching `llama.cpp` tree) |
 | Windows / Linux | AMD RX XT, Ryzen APU UMA, Intel, Cross-Vendor | `windows-vulkan-xt` / `linux-vulkan-xt` | Vulkan SDK (`GGML_VULKAN=ON`) | Cross-vendor Vulkan compute (including systems without `/dev/kfd` or HIP SDK) |
@@ -103,14 +103,49 @@ The `llamaserver` backend requires no `llama.cpp` compile-time linkage: point `-
 
 | Preset | Platform | Flags |
 | --- | --- | --- |
-| `windows-cuda-blackwell` | Windows (MSVC + Ninja, `Release`) | `SONDER_WITH_LLAMA_CPP=ON`, `GGML_CUDA=ON`, `CMAKE_CUDA_ARCHITECTURES=120`, `GGML_CUDA_FA_ALL_QUANTS=ON`, `GGML_CUDA_GRAPHS=ON` |
-| `linux-cuda-blackwell` | Linux / WSL2 (GCC/Clang + Ninja, `Release`) | `SONDER_WITH_LLAMA_CPP=ON`, `GGML_CUDA=ON`, `CMAKE_CUDA_ARCHITECTURES=120`, `GGML_CUDA_FA_ALL_QUANTS=ON`, `GGML_CUDA_GRAPHS=ON` |
-| `windows-cuda-rtx` | Windows (MSVC + Ninja, `RelWithDebInfo`) | `SONDER_WITH_LLAMA_CPP=ON`, `GGML_CUDA=ON`, `CMAKE_CUDA_ARCHITECTURES=86;89;120`, `GGML_CUDA_FA_ALL_QUANTS=ON`, `GGML_CUDA_GRAPHS=ON` |
-| `linux-cuda-rtx` | Linux / WSL2 (GCC/Clang + Ninja, `RelWithDebInfo`) | `SONDER_WITH_LLAMA_CPP=ON`, `GGML_CUDA=ON`, `CMAKE_CUDA_ARCHITECTURES=86;89;120`, `GGML_CUDA_FA_ALL_QUANTS=ON`, `GGML_CUDA_GRAPHS=ON` |
+| `windows-cuda-blackwell` | Windows (MSVC + Ninja, `Release`) | `SONDER_WITH_LLAMA_CPP=ON`, `GGML_CUDA=ON`, `CMAKE_CUDA_ARCHITECTURES=120a`, `GGML_CUDA_FA_ALL_QUANTS=ON`, `GGML_CUDA_GRAPHS=ON` |
+| `linux-cuda-blackwell` | Linux / WSL2 (GCC/Clang + Ninja, `Release`) | `SONDER_WITH_LLAMA_CPP=ON`, `GGML_CUDA=ON`, `CMAKE_CUDA_ARCHITECTURES=120a`, `GGML_CUDA_FA_ALL_QUANTS=ON`, `GGML_CUDA_GRAPHS=ON` |
+| `windows-cuda-blackwell-120f` | Windows (MSVC + Ninja, `Release`) | Inherits `windows-cuda-blackwell` with `CMAKE_CUDA_ARCHITECTURES=120f` (`sm_12x` family target) |
+| `linux-cuda-blackwell-120f` | Linux / WSL2 (GCC/Clang + Ninja, `Release`) | Inherits `linux-cuda-blackwell` with `CMAKE_CUDA_ARCHITECTURES=120f` (`sm_12x` family target) |
+| `windows-cuda-rtx` | Windows (MSVC + Ninja, `RelWithDebInfo`) | `SONDER_WITH_LLAMA_CPP=ON`, `GGML_CUDA=ON`, `CMAKE_CUDA_ARCHITECTURES=86;89;120a`, `GGML_CUDA_FA_ALL_QUANTS=ON`, `GGML_CUDA_GRAPHS=ON` |
+| `linux-cuda-rtx` | Linux / WSL2 (GCC/Clang + Ninja, `RelWithDebInfo`) | `SONDER_WITH_LLAMA_CPP=ON`, `GGML_CUDA=ON`, `CMAKE_CUDA_ARCHITECTURES=86;89;120a`, `GGML_CUDA_FA_ALL_QUANTS=ON`, `GGML_CUDA_GRAPHS=ON` |
 
-- `windows-cuda-blackwell` and `linux-cuda-blackwell` target RTX 50-series Blackwell (`sm_120`, such as RTX 5070 Ti, RTX 5080, RTX 5090) in pure `Release` mode (requiring CUDA Toolkit 12.8+ or 13.x), cutting multi-arch NVCC compile time while enabling `GGML_CUDA_GRAPHS=ON` for low-overhead single-token decode launches.
-- `86;89;120` in `*-cuda-rtx` covers RTX 30-series (Ampere `sm_86`), RTX 40-series (Ada `sm_89`), and RTX 50-series (Blackwell `sm_120`) in one portable binary.
+- `windows-cuda-blackwell` and `linux-cuda-blackwell` target RTX 50-series Blackwell (`sm_120a`, such as RTX 5070 Ti, RTX 5080, RTX 5090) in pure `Release` mode, cutting multi-arch NVCC compile time while enabling `GGML_CUDA_GRAPHS=ON` for low-overhead single-token and speculative-verify decode launches.
+- `86;89;120a` in `*-cuda-rtx` covers RTX 30-series (Ampere `sm_86`), RTX 40-series (Ada `sm_89`), and RTX 50-series (Blackwell `sm_120a`) in one binary.
 - `GGML_CUDA_FA_ALL_QUANTS=ON` compiles CUDA FlashAttention kernels for quantized KV pairs (`q8_0`, `q5_0`, `q5_1`, `q4_0`, `q4_1`, `iq4_nl`) so `llama.cpp` does not silently dequantize K/V back to `f16` at runtime.
+
+### CUDA Toolkit Floor, `120a` vs `120f`, `CUB-10445`, and SASS Verification (`cmake/SonderCudaCheck.cmake`)
+
+When `SONDER_WITH_LLAMA_CPP=ON` and `GGML_CUDA=ON`, `src/backends/llamacpp/CMakeLists.txt` runs `sonder_check_cuda_config()` (`cmake/SonderCudaCheck.cmake`) before `FetchContent_MakeAvailable(llamacpp)` enables the CUDA language:
+
+1. **CUDA Toolkit `>= 13.4` (`13.5` preferred)**:
+   - Configure requires CUDA Toolkit `>= 13.4` by default (cuBLAS's `cc 12.x` `NVFP4` + `CUBLASLT_EPILOGUE_BIAS` fix `CUB-10222` and the general `cublasLtMatmulAlgoGetHeuristic` CUDA-graph-capture fix landed in CUDA 13.4; upstream `llama.cpp v1.0.0` official CUDA 13 builds use CUDA 13.5).
+   - Driver branch mapping: CUDA `13.4` -> `R615`, CUDA `13.5` -> `R620` (for example GeForce `621.40` WHQL exposes the CUDA 13.5 driver API). Any CUDA `13.x` application binary runs on NVIDIA drivers `>= 580` via minor-version compatibility; `R620` is needed only for new CUDA 13.5 driver features.
+   - Pass `-DSONDER_ALLOW_LEGACY_CUDA=ON` only when intentionally building on a pre-`13.4` toolkit. Hardware/ISA floors (`>= 12.8` for `120a`, `>= 12.9` for `120f`, and no `SM < 75` under CUDA `>= 13.0`) always remain enforced.
+2. **Architecture-specific `120a` vs family-specific `120f` (deliberate bare-`120` refusal)**:
+   - Blackwell dense NVFP4/MXFP4 block-scaled tensor-core MMA (`mma.sync.aligned.kind::mxf4*` in `ggml-cuda/mma.cuh`) fails raw `nvcc`/`ptxas` assembly on plain `sm_120` (`Instruction 'mma with block scale' not supported on .target 'sm_120'`). Although upstream `v1.0.0` `ggml/src/ggml-cuda/CMakeLists.txt` currently rewrites `12X` -> `12Xa` after `enable_language(CUDA)` as an interim fallback ("until Rubin is released"), `SonderCudaCheck.cmake` deliberately rejects bare `120`/`121` entries in `CMAKE_CUDA_ARCHITECTURES` up front (before `enable_language(CUDA)`) so builds explicitly choose between non-portable `120a` cubins and `sm_12x` family-portable `120f` cubins.
+   - **`120a`** (`windows-cuda-blackwell`, `linux-cuda-blackwell`, `*-cuda-rtx`): emits architecture-specific `sm_120a` cubins. Works with `nvcc >= 12.8` and all CMake `>= 3.23` (including Visual Studio 2022's bundled CMake `3.31.6`). Trade-off: `120a` cubins are non-portable outside `sm_120` GPUs.
+   - **`120f`** (`windows-cuda-blackwell-120f`, `linux-cuda-blackwell-120f`): emits family-specific cubins portable across `sm_12x` (`sm_120` and `sm_121`). Requires `nvcc >= 12.9` (PTX ISA 8.8) **and** CMake `>= 3.31.8` (`< 4.0.0`) or `>= 4.0.2`; CMake `< 3.31.8` and `4.0.0..4.0.1` reject the `f` suffix in `CMakeCUDAArchitecturesValidate.cmake` and are caught up front by `SonderCudaCheck.cmake`.
+3. **`CUB-10445` (`cuBLAS 13.6.0`) refusal**:
+   - NVIDIA bug `CUB-10445` caused wrong transposed GEMV results on `cc 12.0`/`12.1` (when non-accumulation dimension `> 3,145,680` and `beta != 0`). It was introduced in CUDA `13.3 Update 1` (`cuBLAS 13.6.0`) and **fixed in cuBLAS patch `13.6.1`** (and is absent in CUDA `13.4` (`cuBLAS 13.7.0`), `13.4 Update 1`, and `13.5` (`cuBLAS 13.10.0`)).
+   - Because `cuBLAS` ships with the application (`CUDA_PATH\bin\x64\cublas64_13.dll` on Windows CUDA 13; `libcublas.so.13` on Linux) rather than the display driver, `SonderCudaCheck.cmake` inspects both `cublas_api.h` (`CUBLAS_VER_MAJOR/MINOR/PATCH`) and toolkit `version.json` (`libcublas.version`) and fails closed on `13.6.0`. On Windows, inspect the toolkit's `version.json` for exact patch numbers (`6,14,11,1360` in the DLL's PE `FileVersion` encodes only `major`/`minor` `13.6`, so it covers both affected `13.6.0` and fixed `13.6.1`, whereas `6,14,11,1370`+ confirms `>= 13.7`):
+
+     ```powershell
+     (Get-Content "$env:CUDA_PATH\version.json" -Raw | ConvertFrom-Json).libcublas
+     (Get-Item "$env:CUDA_PATH\bin\x64\cublas64_13.dll", "$env:CUDA_PATH\bin\x64\cublasLt64_13.dll").VersionInfo |
+       Select-Object FileName, FileVersion
+     ```
+
+4. **Post-build native Blackwell SASS verification (`cuobjdump`)**:
+   - Confirm that a built `sonder-infer` binary, `ggml-cuda` archive, or `.obj`/`.cubin` contains native Blackwell SASS (`code for sm_120a` on `120a` builds, `code for sm_120` on `120f` builds) and block-scaled FP4 MMA instructions (`OMMA.SF.16864.F32.E2M1.E2M1`):
+
+     ```powershell
+     cmake -DSONDER_CUDA_VERIFY_SASS=ON `
+       -DTARGET_BINARY=build/windows-cuda-blackwell/sonder-infer.exe `
+       -P cmake/SonderCudaCheck.cmake
+     ```
+
+     Pass `-DREQUIRE_FP4_MMA=OFF` when inspecting an individual translation unit that does not instantiate FP4 MMQ kernels. When `SONDER_BUILD_TESTS=ON` and `CMAKE_CUDA_ARCHITECTURES` includes a real Blackwell target (`120a` or `120f`), `src/backends/llamacpp/tests/CMakeLists.txt` also registers this check automatically in CTest as `sonder.llamacpp.cuda_blackwell_sass` against `ggml-cuda`.
 
 ### VRAM Discovery and Process Telemetry
 

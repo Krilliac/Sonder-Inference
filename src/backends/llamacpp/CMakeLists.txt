@@ -28,8 +28,10 @@
 # optionally SONDER_LLAMACPP_URL) together; configure fails when the tag differs
 # but the SHA-256 does not, and SHA-256 verification fails closed on mismatch.
 #
-# Opt-in GPU presets live in CMakePresets.json: windows-cuda-rtx,
-# windows-vulkan-xt, linux-cuda-rtx, linux-rocm-xt, and linux-vulkan-xt.
+# Opt-in GPU presets live in CMakePresets.json: windows-cuda-blackwell,
+# windows-cuda-blackwell-120f, windows-cuda-rtx, windows-rocm-xt,
+# windows-vulkan-xt, linux-cuda-blackwell, linux-cuda-blackwell-120f,
+# linux-cuda-rtx, linux-rocm-xt, and linux-vulkan-xt.
 
 # Optional llguidance structured-output path (see the llguidance block below). OFF by default: the
 # default build, CI and every existing test are unchanged. Needs the Rust toolchain (cargo) and git
@@ -58,6 +60,11 @@ endif()
 # whose ggml declares GGML_RPC with a default of ON cannot turn it back on:
 # option() leaves an existing cache entry alone.
 set(GGML_RPC OFF CACHE BOOL "ggml: use RPC (refused for the in-process llamacpp backend)" FORCE)
+
+if(GGML_CUDA)
+    include(SonderCudaCheck)
+    sonder_check_cuda_config()
+endif()
 
 include(FetchContent)
 

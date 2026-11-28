@@ -87,6 +87,14 @@ add_test(NAME sonder.meta.test_names_have_no_semicolons
     COMMAND ${CMAKE_COMMAND} -DSOURCE_DIR=${PROJECT_SOURCE_DIR} -P ${PROJECT_SOURCE_DIR}/cmake/CheckTestNames.cmake)
 set_tests_properties(sonder.meta.test_names_have_no_semicolons PROPERTIES TIMEOUT 60)
 
+# Verifies CUDA build matrix presets, configure-time CUDA / CUB-10445 / arch
+# guards, llamacpp CMake wiring, and cuobjdump SASS verification mode (MAIN-03).
+add_test(NAME sonder.meta.cuda_build_matrix
+    COMMAND "${CMAKE_COMMAND}" -DSOURCE_DIR=${PROJECT_SOURCE_DIR}
+            -DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/cuda_build_matrix_check
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/cuda_build_matrix_check.cmake")
+set_tests_properties(sonder.meta.cuda_build_matrix PROPERTIES TIMEOUT 90)
+
 if(SONDER_BUILD_CLI)
     # Optional modules compiled into this build (their feature macros).
     get_target_property(sonder_defs sonder_inference INTERFACE_COMPILE_DEFINITIONS)
