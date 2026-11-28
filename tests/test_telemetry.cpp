@@ -2170,18 +2170,20 @@ TEST_CASE("VIS-03: Sonder sampler emits inference.sampling.candidates with bound
             CHECK(ta.find("unit")->as_string() == "token");
             CHECK(ta.find("probability_basis")->as_string() == "post_sampling");
             CHECK(ca.find("index")->as_int() == ta.find("index")->as_int());
-            CHECK(ca.find("sampled_token_id")->as_int() == ta.find("token_id")->as_int());
+            // Default policy off: token ids are output text, so none are exported.
+            CHECK(ta.find("token_id") == nullptr);
+            CHECK(ca.find("sampled_token_id") == nullptr);
             CHECK(ca.find("probability_basis")->as_string() == "post_sampling");
             const auto& list = ca.find("candidates")->as_array();
             REQUIRE(list.size() == 5u);
-            // Greedy selects argmax: candidate[0] matches the sampled token and probability.
-            CHECK(list[0].find("token_id")->as_int() == ta.find("token_id")->as_int());
+            // Greedy selects argmax: candidate[0] matches the sampled token's probability.
             CHECK(list[0].find("probability")->as_double() ==
                   doctest::Approx(ta.find("probability")->as_double()).epsilon(1e-6));
             for (std::size_t j = 0; j < list.size(); ++j) {
                 const double p = list[j].find("probability")->as_double();
                 CHECK(p > 0.0);
                 CHECK(p <= 1.0);
+                CHECK(list[j].find("token_id") == nullptr);
                 CHECK(list[j].find("text") == nullptr);
                 if (j > 0) {
                     CHECK(list[j - 1].find("probability")->as_double() >= p);
@@ -2193,6 +2195,7 @@ TEST_CASE("VIS-03: Sonder sampler emits inference.sampling.candidates with bound
     SUBCASE("stochastic chain respects top_k truncation and logit_bias bans in candidates") {
         TelemetryOptions t;
         t.token_probability_top_k = 10;
+        t.text_capture = TextCapturePolicy::on;  // candidate token ids are output text
         SamplingConfig sc;
         sc.max_tokens = 3;
         sc.temperature = 0.8f;
@@ -2210,6 +2213,7 @@ TEST_CASE("VIS-03: Sonder sampler emits inference.sampling.candidates with bound
             CHECK(list.size() <= 3u);
             double sum = 0.0;
             for (const auto& entry : list) {
+                REQUIRE(entry.find("token_id") != nullptr);
                 CHECK(entry.find("token_id")->as_int() != 0);
                 sum += entry.find("probability")->as_double();
             }
