@@ -51,7 +51,7 @@ TEST_CASE("NAT-16: eligibility covers AMD Windows discrete 9060 XT and integrate
     const auto rx9060 = make_amd_gpu("gpu:0", "AMD Radeon RX 9060 XT", 0x7590u, false, "26.11.2 (32.0.21045.29003)");
     const auto r780m = make_amd_gpu("gpu:1", "AMD Radeon 780M Graphics", 0x15BFu, true, "26.11.2 (32.0.21045.29003)");
     const auto no_cm = make_amd_gpu("gpu:2", "AMD Old GPU", 0x67DFu, false, "24.1.1", "none");
-    const auto unknown_cm = make_amd_gpu("gpu:3", "AMD Radeon 860M Graphics", 0x15BFu, true, "26.11.2", "");
+    const auto unknown_cm = make_amd_gpu("gpu:3", "AMD Radeon 780M Graphics", 0x15BFu, true, "26.11.2", "");
     auto rdna2_igpu = make_amd_gpu("gpu:4", "AMD Radeon(TM) Graphics", 0x13C0u, true, "26.11.2", "KHR_coopmat");
     rdna2_igpu.ggml_coopmat_eligible = false;
     auto rdna4_dgpu = make_amd_gpu("gpu:5", "AMD Radeon RX 9060 XT", 0x7590u, false, "26.11.2", "KHR_coopmat");

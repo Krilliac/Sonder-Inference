@@ -86,5 +86,5 @@ if(SONDER_SCHEDULER_BUILD_TESTS)
     target_link_libraries(sonder_scheduler_tests PRIVATE sonder::scheduler)
     sonder_scheduler_warnings(sonder_scheduler_tests)
     doctest_discover_tests(sonder_scheduler_tests TEST_PREFIX "sonder.scheduler."
-                           PROPERTIES TIMEOUT 120)
+                           PROPERTIES TIMEOUT 120 ENVIRONMENT "SONDER_SKIP_COOPMAT_CANARY=1")
 endif()

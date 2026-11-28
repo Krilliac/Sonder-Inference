@@ -21,7 +21,7 @@ if(SONDER_BUILD_TESTS AND TARGET sonder-infer)
         COMMAND sonder-infer bench --backend mock --model mock:tiny
                 --corpus "${CMAKE_CURRENT_SOURCE_DIR}/corpus/smoke.json"
                 --out "${CMAKE_CURRENT_BINARY_DIR}/bench-mock.json" --warmup 0 --runs 1)
-    set_tests_properties(sonder.bench.cli_mock PROPERTIES TIMEOUT 60)
+    set_tests_properties(sonder.bench.cli_mock PROPERTIES TIMEOUT 60 ENVIRONMENT "SONDER_SKIP_COOPMAT_CANARY=1")
 endif()
 
 if(SONDER_BUILD_TESTS)
@@ -30,5 +30,5 @@ if(SONDER_BUILD_TESTS)
                 --corpus "${CMAKE_CURRENT_SOURCE_DIR}/corpus/baseline.json"
                 --out-dir "${CMAKE_CURRENT_BINARY_DIR}/bench-results" --stem tool-mock
                 --warmup 0 --runs 1 --hardware "CI runner")
-    set_tests_properties(sonder.bench.tool_mock PROPERTIES TIMEOUT 60)
+    set_tests_properties(sonder.bench.tool_mock PROPERTIES TIMEOUT 60 ENVIRONMENT "SONDER_SKIP_COOPMAT_CANARY=1")
 endif()
