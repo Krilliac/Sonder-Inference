@@ -737,6 +737,29 @@ TEST_CASE("NAT-12: DecodeAwareAuxGate DRR accounting enforces zero overlap and c
     g_mock_cuda = nullptr;
 }
 
+TEST_CASE("NAT-12: decode step admitted after hold timeout is counted as an overlap") {
+    AuxGateConfig cfg;
+    cfg.enabled = true;
+    cfg.max_decode_hold_ms = 5;
+    DecodeAwareAuxGate gate(cfg);
+
+    // Idle fast path: no decode session exists yet, so the slice is admitted at once and stays in flight.
+    auto slice = gate.AcquireAuxSlice("gpu:0");
+    REQUIRE(slice.acquired());
+    CHECK(slice.status() == AuxAcquireStatus::kAcquiredIdle);
+
+    auto session = gate.EnterDecodeSession("gpu:0");
+    {
+        // The decode step waits at most max_decode_hold_ms for the in-flight slice, then is admitted anyway.
+        auto step = gate.EnterDecodeStep("gpu:0");
+        const AuxGateStats stats = gate.GetStats("gpu:0");
+        CHECK(stats.decode_hold_timeouts == 1u);
+        CHECK(stats.aux_slices_overlapped_decode == 1u);
+        CHECK(stats.decode_steps_total == 1u);
+        step.MarkSynchronized();
+    }
+}
+
 TEST_CASE("NAT-12: SubslicePlannedBatch and PlanSttAudioSlices cap active slices at <=512 tokens") {
     // 1. SubslicePlannedBatch splits an idle-planned 2048-token batch into <=512-token slices
     // with contiguous 0..k-1 seq_ids and exact original_index preservation.
@@ -835,6 +858,9 @@ TEST_CASE("NAT-12: end-to-end synthetic GGUF co-resident main decode plus gated 
     gate_cfg.max_aux_duty_cycle = 0.05;
     gate_cfg.active_slice_max_tokens = 64u;   // Cap active slices to <= 64 tokens for small 512-ctx fixture
     gate_cfg.active_slice_max_sequences = 2u; // <= 2 sequences per slice during decode
+    // Zero overlap is only guaranteed while the hold exceeds every aux slice, so use the maximum hold;
+    // a failure then means a slice ran longer than that (a hang).
+    gate_cfg.max_decode_hold_ms = kMaxAuxGateTimeoutMs;
     REQUIRE(shared_gate->Reconfigure(gate_cfg).ok());
 
     LlamaCppBackend main_be;
@@ -965,6 +991,9 @@ TEST_CASE("NAT-12: end-to-end synthetic GGUF co-resident main decode plus gated 
     CHECK(main_generated_total >= 24);
 
     const AuxGateStats gstats = shared_gate->GetStats("cpu");
+    CAPTURE(gstats.decode_hold_timeouts);
+    CAPTURE(gstats.decode_hold_wait_ns);
+    CHECK(gstats.decode_hold_timeouts == 0u);
     CHECK(gstats.aux_slices_overlapped_decode == 0u);
     CHECK(gstats.decode_steps_total >= 24u);
     CHECK(gstats.aux_slices_gated_between_steps >= 1u);
