@@ -236,7 +236,8 @@ stats only with `--stats text` or `--stats json`.
 `--telemetry PATH` writes Observatory envelope `sonder.observatory.event/1`
 JSONL to PATH (`-` for stderr); `--telemetry-level off|metrics|standard|deep`
 (default `standard`); `--capture-text` includes generated text in token
-events. With `--telemetry -`, telemetry lines and status lines never
+events (`sonder-infer serve` also has `--text-capture off|on|full`,
+see [TELEMETRY.md](TELEMETRY.md#text-capture-policy)). With `--telemetry -`, telemetry lines and status lines never
 interleave mid-line (stderr is written line by line under one lock).
 
 ## Correlation and scheduling options
@@ -378,6 +379,15 @@ summary and writes it next to `--out`. `--quiet` suppresses progress lines.
 - With no arguments it prints its usage on stderr and exits 2; `--help`
   prints it on stdout and exits 0.
 - Options use the same spec parser (did-you-mean, checked numbers).
+- The default backend is `llamacpp` (requires `SONDER_WITH_LLAMA_CPP=ON`).
+  `--model <path.gguf>` selects local weights. Native-only `--ctx-size N`
+  sets context tokens (default 4096; 0 = model training context), `--threads N`
+  sets CPU threads (default 0 = backend default), and `--gpu-layers N` sets
+  offloaded layers (default -1 = all with a compiled GPU backend; 0 = CPU).
+  For example: `sonder-bench --model models/test.gguf --ctx-size 4096 --threads 4 --gpu-layers 0`.
+  Builds without native support exit 2 with a configuration hint.
+  `--backend ollama` and `--backend llamaserver` remain compatibility options;
+  `--require-idle` is only valid with explicit `--backend ollama`.
 - `--concurrency N` (1 to 64, default 1) runs `N` parallel barrier-synchronized
   worker sessions per measured iteration on non-fanout prompts, recording
   per-row `worker_index`, `summary.wall_seconds`, and

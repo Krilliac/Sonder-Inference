@@ -378,12 +378,13 @@ Result<LaunchProfile> parse_one(const json::Value& value, std::size_t index) {
     const std::string where = name && name->is_string() ? "'" + name->as_string() + "'" : at;
     Reader r(value.as_object(), where);
     SONDER_TRY(r.check_keys({"name", "backend", "model", "mmproj", "mmproj_offload", "image_max_tokens", "ctx_size",
-                             "n_gpu_layers", "device", "main_gpu", "split_mode", "tensor_split", "load_mode",
+                             "n_gpu_layers", "device", "devices", "main_gpu", "split_mode", "tensor_split", "load_mode",
                              "no_repack", "moe_cache_mib", "moe_cache_cpu_share", "batch_size", "ubatch_size",
-                             "parallel", "kv_unified", "swa_kv_mode", "flash_attn", "cache_type_k", "cache_type_v",
-                             "ctx_checkpoints", "checkpoint_min_step", "cache_ram_mib", "context_shift", "fit",
-                             "speculative", "threads", "threads_batch", "jinja", "reasoning_format", "reasoning",
-                             "reasoning_budget", "sampling", "extra_args", "vram_budget_mib"}));
+                             "parallel", "kv_unified", "swa_kv_mode", "startup_smoke_test", "flash_attn",
+                             "cache_type_k", "cache_type_v", "ctx_checkpoints", "checkpoint_min_step", "cache_ram_mib",
+                             "context_shift", "fit", "speculative", "threads", "threads_batch", "jinja",
+                             "reasoning_format", "reasoning", "reasoning_budget", "sampling", "extra_args",
+                             "vram_budget_mib"}));
     LaunchProfile p;
     SONDER_TRY(r.string("name", p.name, true));
     SONDER_TRY(r.string("backend", p.backend, true));
@@ -394,6 +395,7 @@ Result<LaunchProfile> parse_one(const json::Value& value, std::size_t index) {
     SONDER_TRY(r.integer("ctx_size", p.ctx_size, 0, kMaxContext));
     SONDER_TRY(r.integer("n_gpu_layers", p.n_gpu_layers, -1, 100000));
     SONDER_TRY(r.string("device", p.device));
+    SONDER_TRY(r.strings("devices", p.devices));
     SONDER_TRY(r.integer("main_gpu", p.main_gpu, 0, 1024));
     SONDER_TRY(r.string("split_mode", p.split_mode));
     SONDER_TRY(r.numbers("tensor_split", p.tensor_split));
@@ -405,6 +407,7 @@ Result<LaunchProfile> parse_one(const json::Value& value, std::size_t index) {
     SONDER_TRY(r.integer("ubatch_size", p.ubatch_size, 1, kMaxBatch));
     SONDER_TRY(r.integer("parallel", p.parallel, 1, 256));
     SONDER_TRY(r.boolean("kv_unified", p.kv_unified));
+    SONDER_TRY(r.boolean("startup_smoke_test", p.startup_smoke_test));
     {
         std::optional<std::string> swa_mode_str;
         SONDER_TRY(r.string("swa_kv_mode", swa_mode_str));
@@ -509,6 +512,17 @@ Status validate_launch_profile(const LaunchProfile& p) {
     if (p.device && !valid_device_spec(*p.device)) {
         return bad(where, "'device' must be a comma-separated list of device names (e.g. CUDA0, ROCm0, Vulkan0)");
     }
+    if (!p.devices.empty()) {
+        if (p.backend != kLaunchProfileBackendLlamaCpp) {
+            return bad(where, "'devices' is only for the llamacpp backend; llamaserver profiles use 'device'");
+        }
+        if (p.devices.size() > 16) return bad(where, "'devices' lists at most 16 devices");
+        for (const std::string& d : p.devices) {
+            if (d.find(',') != std::string::npos || !valid_device_spec(d)) {
+                return bad(where, "'devices' entries must be single device names (e.g. CUDA0, Vulkan1)");
+            }
+        }
+    }
     if (p.main_gpu && *p.main_gpu < 0) return bad(where, "'main_gpu' must be 0 or more");
     if (p.split_mode && *p.split_mode != "none" && *p.split_mode != "layer" && *p.split_mode != "row") {
         return bad(where, "'split_mode' must be none, layer or row");
@@ -531,6 +545,9 @@ Status validate_launch_profile(const LaunchProfile& p) {
     }
     if (p.swa_kv_mode && to_string(*p.swa_kv_mode) == "unknown") {
         return bad(where, "'swa_kv_mode' must be full or compact_if_qualified");
+    }
+    if (p.backend == kLaunchProfileBackendLlamaServer && p.startup_smoke_test) {
+        return bad(where, "'startup_smoke_test' applies only to the llamacpp backend");
     }
     if (p.flash_attn && canonical_flash_attn(*p.flash_attn) != *p.flash_attn) {
         return bad(where, "'flash_attn' must be on, off or auto");
@@ -846,6 +863,7 @@ Status apply_llamacpp_profile(const LaunchProfile& p, BackendSetup& setup, std::
     if (p.cache_type_v) next.llamacpp_kv_cache_type_v = *p.cache_type_v;
     if (p.flash_attn) next.llamacpp_flash_attention = *p.flash_attn;
     if (p.swa_kv_mode) next.llamacpp_swa_kv_mode = *p.swa_kv_mode;
+    if (p.startup_smoke_test) next.llamacpp_startup_smoke_test = *p.startup_smoke_test;
     if (p.ctx_size) next.llamacpp_context_length = *p.ctx_size;
     if (p.parallel) next.llamacpp_slots = *p.parallel;
     if (p.kv_unified) next.llamacpp_kv_unified = *p.kv_unified;
@@ -857,6 +875,17 @@ Status apply_llamacpp_profile(const LaunchProfile& p, BackendSetup& setup, std::
         if (spec_mapping->draft_max) next.llamacpp_spec_draft_max = *spec_mapping->draft_max;
     }
     std::string next_device = device;
+    if (!p.devices.empty()) {
+        // An allowlist only takes effect on a gpu:* device_id (cpu:* offloads no layers).
+        if (p.n_gpu_layers && *p.n_gpu_layers == 0) {
+            return bad(where_of(p), "'devices' conflicts with 'n_gpu_layers' 0 (CPU only)");
+        }
+        if (next_device.empty()) {
+            next_device = "gpu:0";
+        } else if (next_device.rfind("gpu:", 0) != 0) {
+            return bad(where_of(p), "'devices' needs a gpu:* --device (got " + next_device + ")");
+        }
+    }
     if (p.n_gpu_layers) {
         next.llamacpp_gpu_layers = *p.n_gpu_layers;
         // The backend offloads only for gpu:* devices; a cpu device would
@@ -930,11 +959,20 @@ json::Object launch_profile_metadata(const LaunchProfile& p, const std::optional
     if (p.kv_unified.has_value()) {
         o.set("kv_unified", json::Value(*p.kv_unified));
     }
+    if (p.startup_smoke_test.has_value()) {
+        o.set("startup_smoke_test", json::Value(*p.startup_smoke_test));
+    }
     if (p.cache_ram_mib.has_value()) {
         o.set("cache_ram_mib", json::Value(*p.cache_ram_mib));
     }
     if (p.threads.has_value()) {
         o.set("threads", json::Value(*p.threads));
+    }
+    if (!p.devices.empty()) {
+        json::Array devs;
+        devs.reserve(p.devices.size());
+        for (const std::string& d : p.devices) devs.emplace_back(d);
+        o.set("devices", std::move(devs));
     }
     o.set("estimated_vram_mib", estimate ? json::Value(estimate->total_mib()) : json::Value());
     o.set("vram_budget_mib", budget_mib ? json::Value(*budget_mib) : json::Value());

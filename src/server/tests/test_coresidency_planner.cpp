@@ -9,7 +9,7 @@
 #include <utility>
 #include <vector>
 
-#include "backends/llamaserver/env_policy.hpp"
+#include "server/src/env_policy.hpp"
 #include "sonder/inference/coresidency_planner.hpp"
 #include "sonder/inference/device.hpp"
 #include "sonder/inference/json.hpp"

@@ -1,6 +1,6 @@
 // Shared injectable counter source for spill-guard and calibration tests.
 #pragma once
-#include "../gpu_memory.hpp"
+#include "devices/gpu_memory.hpp"
 #include <atomic>
 #include <functional>
 #include <utility>

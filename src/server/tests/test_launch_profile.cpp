@@ -435,6 +435,42 @@ TEST_CASE("launch profile llamacpp: context and GPU layers map onto the backend 
     CHECK(cpu_device == "cpu:0");
 }
 
+TEST_CASE("NAT-07 launch profile llamacpp: devices allowlist parses, forces a gpu device and is validated") {
+    const LaunchProfile p = parse_single(
+        R"({"name":"pinned","backend":"llamacpp","model":"D:/m.gguf","devices":["CUDA0","Vulkan1"]})");
+    REQUIRE(p.devices.size() == 2u);
+    CHECK(p.devices[0] == "CUDA0");
+    CHECK(p.devices[1] == "Vulkan1");
+    si::BackendSetup setup;
+    setup.backend = "llamacpp";
+    std::string device;
+    REQUIRE(si::apply_llamacpp_profile(p, setup, device).ok());
+    CHECK(device == "gpu:0");  // cpu:* ids offload no layers, so the list would be ignored
+
+    const auto meta = si::launch_profile_metadata(p, std::nullopt, std::nullopt);
+    REQUIRE(meta.find("devices") != nullptr);
+    REQUIRE(meta.find("devices")->as_array().size() == 2u);
+    CHECK(meta.find("devices")->as_array()[0].as_string() == "CUDA0");
+    CHECK(meta.find("devices")->as_array()[1].as_string() == "Vulkan1");
+
+    std::string cpu = "cpu:0";
+    si::BackendSetup untouched;
+    const si::Status refused = si::apply_llamacpp_profile(p, untouched, cpu);
+    CHECK_FALSE(refused.ok());
+    CHECK(contains(refused.message(), "'devices' needs a gpu:* --device"));
+
+    const LaunchProfile cpu_layers = parse_single(
+        R"({"name":"x","backend":"llamacpp","model":"D:/m.gguf","devices":["CUDA0"],"n_gpu_layers":0})");
+    std::string d2;
+    si::BackendSetup s2;
+    CHECK_FALSE(si::apply_llamacpp_profile(cpu_layers, s2, d2).ok());
+
+    CHECK(contains(parse_error(R"({"name":"x","backend":"llamacpp","model":"D:/m.gguf","devices":["CUDA0,CUDA1"]})"),
+                   "single device names"));
+    CHECK(contains(parse_error(R"({"name":"x","backend":"llamaserver","model":"D:/m.gguf","devices":["CUDA0"]})"),
+                   "only for the llamacpp backend"));
+}
+
 TEST_CASE("launch profile llamacpp: fields the direct backend cannot honour are rejected and never dropped") {
     const std::vector<std::pair<std::string, std::string>> cases{
         {R"("mmproj":"p.gguf","image_max_tokens":100)", "image_max_tokens"},
@@ -2941,4 +2977,64 @@ TEST_CASE("SWA rollback guard: fails closed on cuts below min_retained_pos and s
     CHECK(guard.min_retained_pos() == 1324u);
     CHECK_FALSE(guard.CheckAndApplyRollback(1200));  // < 1324 -> rejected!
     CHECK(guard.rollback_rejections() == 2u);
+}
+
+TEST_CASE("launch profile: startup_smoke_test parses for llamacpp, rejects non-bool and llamaserver") {
+    const LaunchProfile enabled =
+        parse_single(R"({"name":"bonsai","backend":"llamacpp","model":"m.gguf","startup_smoke_test":true})");
+    CHECK(enabled.startup_smoke_test == std::optional<bool>(true));
+    {
+        si::BackendSetup setup;
+        std::string dev;
+        REQUIRE(si::apply_llamacpp_profile(enabled, setup, dev).ok());
+        CHECK(setup.llamacpp_startup_smoke_test == std::optional<bool>(true));
+    }
+    const json::Object meta_on = si::launch_profile_metadata(enabled, std::nullopt, std::nullopt);
+    REQUIRE(meta_on.find("startup_smoke_test") != nullptr);
+    CHECK(meta_on.find("startup_smoke_test")->as_bool() == true);
+
+    const LaunchProfile disabled =
+        parse_single(R"({"name":"bonsai-off","backend":"llamacpp","model":"m.gguf","startup_smoke_test":false})");
+    CHECK(disabled.startup_smoke_test == std::optional<bool>(false));
+    {
+        si::BackendSetup setup;
+        std::string dev;
+        REQUIRE(si::apply_llamacpp_profile(disabled, setup, dev).ok());
+        CHECK(setup.llamacpp_startup_smoke_test == std::optional<bool>(false));
+    }
+    const json::Object meta_off = si::launch_profile_metadata(disabled, std::nullopt, std::nullopt);
+    REQUIRE(meta_off.find("startup_smoke_test") != nullptr);
+    CHECK(meta_off.find("startup_smoke_test")->as_bool() == false);
+
+    const LaunchProfile unset =
+        parse_single(R"({"name":"bonsai-default","backend":"llamacpp","model":"m.gguf"})");
+    CHECK_FALSE(unset.startup_smoke_test.has_value());
+    {
+        si::BackendSetup setup;
+        std::string dev;
+        REQUIRE(si::apply_llamacpp_profile(unset, setup, dev).ok());
+        CHECK_FALSE(setup.llamacpp_startup_smoke_test.has_value());
+    }
+    const json::Object meta_unset = si::launch_profile_metadata(unset, std::nullopt, std::nullopt);
+    CHECK(meta_unset.find("startup_smoke_test") == nullptr);
+
+    // Transactional failure on an unsupported field must not mutate setup.
+    {
+        const LaunchProfile rejected = parse_single(
+            R"({"name":"bad","backend":"llamacpp","model":"m.gguf","startup_smoke_test":true,"fit":false})");
+        si::BackendSetup clean;
+        std::string dev;
+        CHECK_FALSE(si::apply_llamacpp_profile(rejected, clean, dev).ok());
+        CHECK_FALSE(clean.llamacpp_startup_smoke_test.has_value());
+    }
+
+    // Non-boolean values are rejected.
+    CHECK(contains(parse_error(R"({"name":"p","backend":"llamacpp","model":"m.gguf","startup_smoke_test":1})"),
+                   "'startup_smoke_test' must be true or false"));
+    CHECK(contains(parse_error(R"({"name":"p","backend":"llamacpp","model":"m.gguf","startup_smoke_test":"true"})"),
+                   "'startup_smoke_test' must be true or false"));
+
+    // llamaserver profiles reject startup_smoke_test rather than silently dropping it.
+    CHECK(contains(parse_error(R"({"name":"p","backend":"llamaserver","model":"m.gguf","startup_smoke_test":true})"),
+                   "'startup_smoke_test'"));
 }

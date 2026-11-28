@@ -199,6 +199,14 @@ struct ModelDescriptor {
 struct ModelLoadOptions {
     std::string model;
     std::string device_id = "cpu:0";
+    // Optional exact device allowlist for this model (backend-specific names;
+    // llamacpp: ggml names such as "CUDA0" or "Vulkan0", case-insensitive).
+    // Non-empty overrides the backend-wide list and takes precedence over a
+    // "gpu:N" device_id pin. Empty = backend default.
+    // The model only runs on these devices when device_id is gpu:* or empty
+    // (a cpu:* id offloads no layers, so the default "cpu:0" ignores the list);
+    // the server sets gpu:0 for it. Ignored by backends without named devices.
+    std::vector<std::string> devices{};
 };
 
 struct GenerateRequest {
@@ -229,6 +237,9 @@ struct GenerateRequest {
     int priority_rank = 0;
     // Allow cost-aware spill-to-checkpoint when selectively preempted under pressure.
     bool allow_preempt_spill = false;
+    // The caller requires on-premises execution. Remote providers (e.g.
+    // ollama_cloud) refuse such a request before any network I/O.
+    bool local_only = false;
     // Telemetry-only probability probe, [0, kMaxTelemetryTopK]; 0 = off. Set
     // by the session when token telemetry is recorded (for native in-process
     // backends only when `TelemetryOptions::native_token_probabilities` is set,
@@ -254,7 +265,12 @@ const char* to_string(EmbedPoolingType pooling) noexcept;
 
 struct EmbedRequest {
     std::string request_id;
+    // Text inputs. Exactly one of `inputs` / `token_inputs` is non-empty.
     std::vector<std::string> inputs;
+    // Pre-tokenized inputs (OpenAI `input` as token arrays). The ids are in the
+    // loaded model's own vocabulary, so only backends that tokenize natively
+    // can serve them; others fail the request.
+    std::vector<std::vector<TokenId>> token_inputs;
     bool normalize = true;
     // Optional requested output dimension. Backends must fail closed if
     // unsupported or > native dimension; never silently truncate arbitrary models.
@@ -576,6 +592,8 @@ struct ChatRequest {
     std::optional<double> target_itl_ms = std::nullopt;
     // Opt-in per-request stage timing hooks (false by default: zero extra clocks).
     bool enable_stage_profiling = false;
+    // Same meaning as GenerateRequest::local_only.
+    bool local_only = false;
     // Telemetry-only probability probe; same contract as
     // GenerateRequest::telemetry_*.
     std::int32_t telemetry_top_k = 0;

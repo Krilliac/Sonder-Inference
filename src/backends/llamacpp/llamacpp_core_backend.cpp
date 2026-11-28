@@ -15,30 +15,36 @@
 #include <utility>
 #include <vector>
 
-#if defined(SONDER_HAS_LLAMASERVER_BACKEND)
-#  if defined(_WIN32)
-#    ifndef WIN32_LEAN_AND_MEAN
-#      define WIN32_LEAN_AND_MEAN
-#    endif
-#    ifndef NOMINMAX
-#      define NOMINMAX
-#    endif
-#    include <windows.h>
-#  else
-#    include <unistd.h>
+#if defined(_WIN32)
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
 #  endif
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
+#  include <windows.h>
+#else
+#  include <unistd.h>
 #endif
 
 #include "common/diag_log.hpp"
+#include "common/sha256.hpp"
+#include "device_health.hpp"
+#include "graph_telemetry.hpp"
+#include "kv_telemetry.hpp"
 #include "sonder/backends/llamacpp/llamacpp_backend.h"
 #include "sonder/inference/backends/llamacpp.hpp"
 #include "sonder/inference/json.hpp"
+#include "json_schema_normalize.hpp"
+#include "kv_policy.hpp"
+#include "llguidance_sampler.hpp"
 #include "llamacpp_internal.hpp"
+#include "lora_registry.hpp"
+#include "tool_grammar_preflight.hpp"
 #include "request_guards.hpp"
+#include "spec_controller.hpp"
 
-#if defined(SONDER_HAS_LLAMASERVER_BACKEND)
-#  include "backends/llamaserver/gpu_memory.hpp"
-#endif
+#include "devices/gpu_memory.hpp"
 
 namespace sonder::inference {
 
@@ -87,7 +93,7 @@ Result<std::int32_t> ResolveGpuLayers(const LlamaCppBackendOptions& options, std
         return options.devices.empty() ? std::int32_t{0} : options.gpu_layers;
     }
     if (device_id.rfind("gpu", 0) == 0) {
-        if (!has_gpu_backend) {
+        if (!has_gpu_backend && options.devices.empty()) {
             return Status(ErrorCode::unsupported, "this llama.cpp build has no GPU backend");
         }
         return options.gpu_layers;
@@ -286,6 +292,22 @@ using llamacpp_detail::ApplyNoThinkScaffolding;
 using llamacpp_detail::PathFromUtf8;
 using llamacpp_detail::PathToUtf8;
 using llamacpp_detail::StopSequenceFilter;
+
+// Drains every resident model's physical KV event queue into the (type, attributes)
+// pairs the engine sampler emits. Each event carries per-model `model_id` (and
+// `model` when known); the engine adds `backend`; `observed_ms` rides in attrs.
+std::vector<std::pair<std::string, json::Object>> DrainKvEvents(lc::KvTelemetryRegistry& registry) {
+    std::vector<std::pair<std::string, json::Object>> out;
+    for (auto& ev : registry.DrainAll()) {
+        json::Object attrs;
+        for (auto& a : ev.attrs) {
+            std::visit([&](auto&& v) { attrs.set(std::move(a.key), json::Value(std::forward<decltype(v)>(v))); },
+                       std::move(a.value));
+        }
+        out.emplace_back(std::move(ev.type), std::move(attrs));
+    }
+    return out;
+}
 using llamacpp_detail::ThinkingSplitResult;
 using llamacpp_detail::ThinkingStreamSplitter;
 using llamacpp_detail::ToLlamaSampling;
@@ -324,7 +346,6 @@ std::uint64_t SaturatingAddBytes(std::uint64_t a, std::uint64_t b) noexcept {
                : a + b;
 }
 
-#if defined(SONDER_HAS_LLAMASERVER_BACKEND)
 std::uint32_t CurrentProcessId() noexcept {
 #  if defined(_WIN32)
     return static_cast<std::uint32_t>(GetCurrentProcessId());
@@ -333,7 +354,6 @@ std::uint32_t CurrentProcessId() noexcept {
     return pid > 0 ? static_cast<std::uint32_t>(pid) : 0u;
 #  endif
 }
-#endif
 
 std::string FormatMiBText(std::uint64_t bytes) {
     constexpr std::uint64_t kMiB = 1024ull * 1024ull;
@@ -341,16 +361,9 @@ std::string FormatMiBText(std::uint64_t bytes) {
 }
 
 llamacpp_detail::ProcessGpuMemoryProbe MakeDefaultGpuMemoryProbe(std::vector<std::string> configured_devices) {
-#if defined(SONDER_HAS_LLAMASERVER_BACKEND)
     auto os_source = llamaserver::make_gpu_counter_source();
-#endif
-    return [configured_devices = std::move(configured_devices)
-#if defined(SONDER_HAS_LLAMASERVER_BACKEND)
-            ,
-            os_source = std::move(os_source)
-#endif
-    ]() -> llamacpp_detail::ProcessGpuMemoryReading {
-#if defined(SONDER_HAS_LLAMASERVER_BACKEND)
+    return [configured_devices = std::move(configured_devices),
+            os_source = std::move(os_source)]() -> llamacpp_detail::ProcessGpuMemoryReading {
         if (os_source && os_source->supported()) {
             const std::uint32_t pid = CurrentProcessId();
             const auto counters = os_source->read(pid);
@@ -371,8 +384,19 @@ llamacpp_detail::ProcessGpuMemoryProbe MakeDefaultGpuMemoryProbe(std::vector<std
                 return reading;
             }
         }
-#endif
-        return llamacpp_detail::SummarizeGgmlDeviceMemory(lc::LlamaCppBackend::EnumerateDevices(), configured_devices);
+        const auto enumerated = lc::LlamaCppBackend::EnumerateDevices();
+        lc::DeviceSelection used;
+        if (lc::SelectDevices(enumerated, configured_devices, &used).ok()) {
+            if (used.names.empty()) {
+                llamacpp_detail::ProcessGpuMemoryReading none;
+                none.probe = "none";
+                none.status = "unsupported";
+                none.error = "no GPU device selected";
+                return none;
+            }
+            return llamacpp_detail::SummarizeGgmlDeviceMemory(enumerated, used.names);
+        }
+        return llamacpp_detail::SummarizeGgmlDeviceMemory(enumerated, configured_devices);
     };
 }
 
@@ -388,6 +412,10 @@ struct ActiveModelEntry {
 struct RuntimeState {
     static constexpr std::uint64_t kDefaultSpillThresholdBytes = 256ull * 1024ull * 1024ull;
 
+    // Per-loaded-model physical KV event queues; drained by the engine sampler
+    // through BackendRuntimeStatus::take_events so resident models stay isolated.
+    std::shared_ptr<lc::KvTelemetryRegistry> kv_registry = std::make_shared<lc::KvTelemetryRegistry>();
+
     mutable std::mutex mutex;
     llamacpp_detail::ProcessGpuMemoryProbe probe;
     std::chrono::milliseconds sample_interval{1000};
@@ -402,6 +430,8 @@ struct RuntimeState {
     std::uint32_t configured_slots = 1;
     std::uint32_t configured_cache_ram_mib = 0;
     bool configured_mmproj = false;
+    bool configured_lora = false;
+    bool configured_layer_telemetry = false;
 
     bool has_sampled = false;
     bool probe_in_flight = false;
@@ -415,7 +445,9 @@ struct RuntimeState {
     bool observed_device_prefix_reuse = false;
     bool observed_host_l2_restore = false;
     bool observed_concurrent_batch = false;
+    bool observed_layer_telemetry = false;
     std::optional<EffectiveExecutionReport> last_execution_report;
+    std::shared_ptr<lc::DeviceHealthTracker> device_health;
 
     RuntimeState(llamacpp_detail::ProcessGpuMemoryProbe probe_fn, std::chrono::milliseconds interval,
                  const LlamaCppBackendOptions& opts, bool uma_override, std::optional<bool> gpu_offload_override)
@@ -429,27 +461,49 @@ struct RuntimeState {
           configured_prefix_cache(opts.prefix_cache),
           configured_slots(opts.slots),
           configured_cache_ram_mib(opts.cache_ram_mib),
-          configured_mmproj(!opts.mmproj_path.empty()) {
+          configured_mmproj(!opts.mmproj_path.empty()),
+          configured_lora(!opts.lora_aliases.empty()),
+          configured_layer_telemetry(lc::ShouldInstallGraphCallback(opts.telemetry_level)),
+          device_health(std::make_shared<lc::DeviceHealthTracker>(kLlamaCppBackendName)) {
         gpu_memory.probe = "none";
         gpu_memory.status = "not_sampled";
         gpu_memory.spill_threshold_bytes = kDefaultSpillThresholdBytes;
         gpu_memory.shared_baseline_bytes = 0;
     }
 
-    std::uint64_t RegisterModel(std::uint32_t n_ctx, bool gpu_offload, bool uma_target, std::string target_identity,
-                                lc::SpeculativeLoadInfo spec_info) {
+    std::shared_ptr<lc::DeviceHealthTracker> DeviceHealth() const {
         std::lock_guard<std::mutex> lock(mutex);
-        const std::uint64_t id = next_model_id++;
-        active_models.push_back(
-            ActiveModelEntry{id, n_ctx, gpu_offload, uma_target, std::move(target_identity), std::move(spec_info)});
+        return device_health;
+    }
+
+    void SetDeviceHealth(std::shared_ptr<lc::DeviceHealthTracker> dh) {
+        std::lock_guard<std::mutex> lock(mutex);
+        device_health = std::move(dh);
+    }
+
+    std::uint64_t RegisterModel(std::uint32_t n_ctx, bool gpu_offload, bool uma_target, std::string target_identity,
+                                lc::SpeculativeLoadInfo spec_info, std::shared_ptr<lc::KvTelemetry> kv) {
+        std::uint64_t id = 0;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            id = next_model_id++;
+            active_models.push_back(
+                ActiveModelEntry{id, n_ctx, gpu_offload, uma_target, target_identity, std::move(spec_info)});
+        }
+        if (kv) {
+            kv_registry->Register(id, std::move(target_identity), std::move(kv));
+        }
         return id;
     }
 
     void UnregisterModel(std::uint64_t id) noexcept {
-        std::lock_guard<std::mutex> lock(mutex);
-        active_models.erase(std::remove_if(active_models.begin(), active_models.end(),
-                                           [id](const ActiveModelEntry& e) noexcept { return e.id == id; }),
-                            active_models.end());
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            active_models.erase(std::remove_if(active_models.begin(), active_models.end(),
+                                               [id](const ActiveModelEntry& e) noexcept { return e.id == id; }),
+                                active_models.end());
+        }
+        kv_registry->Unregister(id);
     }
 
     void RecordExecution(const EffectiveExecutionReport& report) {
@@ -467,6 +521,11 @@ struct RuntimeState {
             observed_concurrent_batch = true;
         }
         last_execution_report = bound_effective_execution_report(report);
+    }
+
+    void RecordGraphTelemetryObserved() {
+        std::lock_guard<std::mutex> lock(mutex);
+        observed_layer_telemetry = true;
     }
 
     std::vector<CapabilityStatusEntry> BuildCapabilityStatusesLocked() const {
@@ -560,6 +619,30 @@ struct RuntimeState {
             s.qualified_beneficial = CapabilityState::unknown;
             if (!mtmd_build) s.note = "libmtmd_not_in_build";
             out.emplace_back("multimodal", std::move(s));
+        }
+        {
+            CapabilityStatus s;
+            s.adapter_supports = CapabilityState::yes;
+            s.build_supports = CapabilityState::yes;
+            s.configured = capability_state_from_bool(configured_lora);
+            s.observed_active = configured_lora ? CapabilityState::unknown : CapabilityState::no;
+            s.qualified_beneficial = CapabilityState::unknown;
+            out.emplace_back("lora", std::move(s));
+        }
+        {
+            CapabilityStatus s;
+            s.adapter_supports = CapabilityState::yes;
+            s.build_supports = CapabilityState::yes;
+            s.configured = capability_state_from_bool(configured_layer_telemetry);
+            if (observed_layer_telemetry) {
+                s.observed_active = CapabilityState::yes;
+            } else if (!configured_layer_telemetry) {
+                s.observed_active = CapabilityState::no;
+            } else {
+                s.observed_active = CapabilityState::unknown;
+            }
+            s.qualified_beneficial = CapabilityState::unknown;
+            out.emplace_back("layer_telemetry", std::move(s));
         }
         for (const char* cap_name :
              {"structured_output", "embeddings", "reranking", "logprobs", "recurrent_checkpoint",
@@ -737,6 +820,15 @@ struct RuntimeState {
         }
         status.capability_statuses = BuildCapabilityStatusesLocked();
         status.effective_execution = BuildEffectiveExecutionLocked();
+        status.take_events = [dh = device_health, reg = kv_registry] {
+            auto events = dh ? dh->DrainTelemetryEvents() : decltype(DrainKvEvents(*reg)){};
+            if (reg) {
+                auto kv_events = DrainKvEvents(*reg);
+                events.insert(events.end(), std::make_move_iterator(kv_events.begin()),
+                              std::make_move_iterator(kv_events.end()));
+            }
+            return events;
+        };
         return status;
     }
 };
@@ -764,6 +856,9 @@ Status ApplyBackendOptions(const LlamaCppBackendOptions& o, lc::LoadOptions& lo)
     lo.spec_draft_max = o.spec_draft_max;
     lo.spec_verification_mode = o.spec_verification_mode;
     lo.cache_ram_mib = o.cache_ram_mib;
+    lo.checkpoint_spacing_tokens = o.checkpoint_spacing_tokens;
+    lo.checkpoint_dense_spacing_tokens = o.checkpoint_dense_spacing_tokens;
+    lo.checkpoint_max_per_slot = o.checkpoint_max_per_slot;
     lo.moe_cache_mib = o.moe_cache_mib;
     lo.moe_cache_cpu_share = o.moe_cache_cpu_share;
     lo.mmproj_path = o.mmproj_path;
@@ -775,28 +870,48 @@ Status ApplyBackendOptions(const LlamaCppBackendOptions& o, lc::LoadOptions& lo)
     lo.spec_batch_max_aggregate_draft_tokens = o.spec_batch_max_aggregate_draft_tokens;
     lo.embed_batch_tokens = o.embed_batch_tokens;
     lo.embed_max_sequences = o.embed_max_sequences;
+    lo.startup_smoke_test = o.startup_smoke_test;
+    lo.embed_max_total_tokens = o.embed_max_total_tokens;
+    lo.embed_max_input_tokens = o.embed_max_input_tokens;
+    if (o.graph_telemetry_sample_every == 0) {
+        return Status(ErrorCode::invalid_argument, "graph_telemetry_sample_every must be >= 1");
+    }
+    lo.graph_telemetry_enabled = lc::ShouldInstallGraphCallback(o.telemetry_level);
+    lo.graph_telemetry_sample_every = o.graph_telemetry_sample_every;
+    lo.graph_telemetry_timings = o.graph_telemetry_timings;
     if (!lc::ParseSplitMode(o.split_mode, lo.split_mode)) {
         return Status(ErrorCode::invalid_argument,
                       "unknown split mode '" + o.split_mode + "' (expected none, layer or row)");
-    }
-    if (!lc::ParseKvCacheType(o.kv_cache_type_k, lo.type_k)) {
-        return Status(ErrorCode::invalid_argument,
-                      "unknown K cache type '" + o.kv_cache_type_k +
-                          "' (expected f16, f32, bf16, q8_0, q5_1, q5_0, q4_1, q4_0, iq4_nl, f8_e4m3, q2_0 or pq2_0)");
-    }
-    if (!lc::ParseKvCacheType(o.kv_cache_type_v, lo.type_v)) {
-        return Status(ErrorCode::invalid_argument,
-                      "unknown V cache type '" + o.kv_cache_type_v +
-                          "' (expected f16, f32, bf16, q8_0, q5_1, q5_0, q4_1, q4_0, iq4_nl, f8_e4m3, q2_0 or pq2_0)");
     }
     if (!lc::ParseFlashAttention(o.flash_attention, lo.flash_attn)) {
         return Status(ErrorCode::invalid_argument,
                       "unknown flash attention mode '" + o.flash_attention + "' (expected auto, on or off)");
     }
+    if (Status kv_st = lc::ValidateKvPolicyOptions(
+            o.kv_cache_type_k, o.kv_cache_type_v, o.kv_k_q4_allowed,
+            lc::InferConfiguredKvDeviceKind(o.gpu_layers, o.devices), lo.type_k, lo.type_v, lo.flash_attn);
+        !kv_st.ok()) {
+        return kv_st;
+    }
     if (lc::Status s = lc::ValidatePlacementOptions(lo); !s.ok()) {
         return ToStatus(s);
     }
-    return ToStatus(lc::ValidateContextOptions(lo));
+    if (lc::Status s = lc::ValidateLoraAliasOptions(o.lora_aliases); !s.ok()) {
+        return ToStatus(s);
+    }
+    if (lc::Status s = lc::ValidateContextOptions(lo); !s.ok()) {
+        return ToStatus(s);
+    }
+    lc::SpecControllerConfig spec_cfg;
+    std::string spec_err;
+    if (!lc::BuildSpecControllerConfig(o, spec_cfg, spec_err)) {
+        return Status(ErrorCode::invalid_argument, std::move(spec_err));
+    }
+    lo.spec_may_use_mtp = spec_cfg.MayUseMtp();
+    lo.spec_may_use_p_min = spec_cfg.MayUsePMin();
+    lo.spec_max_route_draft = spec_cfg.MaxPlannedDraft();
+    lo.spec_mtp_route_draft = spec_cfg.MaxMtpRouteDraft();
+    return Status::success();
 }
 
 bool IsGguf(const fs::path& p) {
@@ -809,13 +924,33 @@ bool IsGguf(const fs::path& p) {
 class LlamaCppModel final : public BackendModel {
 public:
     LlamaCppModel(ModelDescriptor desc, lc::LlamaCppBackend runtime, double load_ms, std::uint32_t slots,
-                  std::shared_ptr<RuntimeState> runtime_state = nullptr, std::uint64_t runtime_model_id = 0)
+                  std::shared_ptr<RuntimeState> runtime_state = nullptr, std::uint64_t runtime_model_id = 0,
+                  std::vector<std::string> gpu_devices = {},
+                  std::shared_ptr<lc::SpecController> spec_controller = nullptr,
+                  lc::SpecModelCaps spec_caps = {})
         : desc_(std::move(desc)),
           runtime_(std::move(runtime)),
           load_ns_(MsToNs(load_ms)),
           slots_(std::max<std::uint32_t>(1u, slots)),
           runtime_state_(std::move(runtime_state)),
-          runtime_model_id_(runtime_model_id) {
+          runtime_model_id_(runtime_model_id),
+          chat_template_id_(detail::sha256_hex(runtime_.ChatTemplate())),
+          tool_grammar_preflight_(llamacpp_detail::MakeLlamaCppToolGrammarCompiler(runtime_)),
+          gpu_devices_(std::move(gpu_devices)),
+          spec_controller_(std::move(spec_controller)),
+          spec_caps_(spec_caps) {
+        if (runtime_state_ && !gpu_devices_.empty()) {
+            if (auto dh = runtime_state_->DeviceHealth()) {
+                lc::BindBackendDeviceHealth(&runtime_, std::move(dh), gpu_devices_);
+            }
+        }
+        if (spec_controller_) {
+            const auto& sc = spec_controller_->config();
+            const bool has_class_rule =
+                std::any_of(sc.class_rules.begin(), sc.class_rules.end(), [](const auto& r) { return r.has_value(); });
+            spec_controller_active_ = sc.auto_base || sc.base.mode != lc::SpecStrategy::kNone || sc.deterministic ||
+                                      has_class_rule || !sc.routes.empty();
+        }
         // The chat template is fixed once the model is loaded, so decide here
         // rather than under mutex_, which is held for a whole generation.
         std::string ignored;
@@ -823,6 +958,7 @@ public:
     }
 
     ~LlamaCppModel() override {
+        lc::UnbindBackendDeviceHealth(&runtime_);
         if (runtime_state_ && runtime_model_id_ != 0) {
             runtime_state_->UnregisterModel(runtime_model_id_);
         }
@@ -874,8 +1010,12 @@ public:
 
     Result<EmbedResult> embed(const EmbedRequest& request, const CancellationToken& cancel) override {
         if (cancel.cancelled()) return Status(ErrorCode::cancelled, "cancelled before start");
-        if (request.inputs.empty()) {
+        if (Status dh = check_device_health(); !dh.ok()) return dh;
+        if (request.inputs.empty() && request.token_inputs.empty()) {
             return Status(ErrorCode::invalid_argument, "embed request inputs are empty");
+        }
+        if (!request.inputs.empty() && !request.token_inputs.empty()) {
+            return Status(ErrorCode::invalid_argument, "embed request mixes text inputs and token inputs");
         }
         if (request.pooling_type == EmbedPoolingType::rank) {
             return Status(ErrorCode::invalid_argument,
@@ -883,7 +1023,12 @@ public:
         }
         std::unique_lock<std::shared_mutex> lock(mutex_);
         std::vector<std::vector<lc::Token>> tokenized;
-        tokenized.reserve(request.inputs.size());
+        tokenized.reserve(request.inputs.size() + request.token_inputs.size());
+        // Pre-tokenized inputs are evaluated exactly as given (no special tokens are added).
+        for (const std::vector<TokenId>& ids : request.token_inputs) {
+            if (ids.empty()) return Status(ErrorCode::invalid_argument, "embed token input is empty");
+            tokenized.emplace_back(ids.begin(), ids.end());
+        }
         for (const std::string& input : request.inputs) {
             if (cancel.cancelled()) return Status(ErrorCode::cancelled, "embedding cancelled");
             std::vector<lc::Token> toks;
@@ -904,6 +1049,7 @@ public:
             runtime_.Embed(tokenized, emb_opts, emb_out, [&] { return cancel.cancelled(); });
         if (!st.ok()) {
             if (cancel.cancelled()) return Status(ErrorCode::cancelled, "embedding cancelled");
+            if (Status dh = check_device_health(); !dh.ok()) return dh;
             return ToStatus(st);
         }
         EmbedResult result;
@@ -919,6 +1065,7 @@ public:
 
     Result<RerankResult> rerank(const RerankRequest& request, const CancellationToken& cancel) override {
         if (cancel.cancelled()) return Status(ErrorCode::cancelled, "cancelled before start");
+        if (Status dh = check_device_health(); !dh.ok()) return dh;
         if (Status st = validate_rerank_request(request); !st.ok()) return st;
         std::unique_lock<std::shared_mutex> lock(mutex_);
         if (!runtime_.SupportsReranking()) {
@@ -940,6 +1087,7 @@ public:
             runtime_.ScorePairs(tokenized_pairs, score_out, [&] { return cancel.cancelled(); });
         if (!st.ok()) {
             if (cancel.cancelled()) return Status(ErrorCode::cancelled, "reranking cancelled");
+            if (Status dh = check_device_health(); !dh.ok()) return dh;
             return ToStatus(st);
         }
         if (score_out.scores.size() != request.documents.size()) {
@@ -965,6 +1113,7 @@ public:
 
     Result<ScoreResult> score(const ScoreRequest& request, const CancellationToken& cancel) override {
         if (cancel.cancelled()) return Status(ErrorCode::cancelled, "cancelled before start");
+        if (Status dh = check_device_health(); !dh.ok()) return dh;
         if (Status st = validate_score_request(request); !st.ok()) return st;
         std::unique_lock<std::shared_mutex> lock(mutex_);
         if (!runtime_.SupportsReranking()) {
@@ -986,6 +1135,7 @@ public:
             runtime_.ScorePairs(tokenized_pairs, score_out, [&] { return cancel.cancelled(); });
         if (!st.ok()) {
             if (cancel.cancelled()) return Status(ErrorCode::cancelled, "pair scoring cancelled");
+            if (Status dh = check_device_health(); !dh.ok()) return dh;
             return ToStatus(st);
         }
         if (score_out.scores.size() != request.pairs.size()) {
@@ -1004,6 +1154,7 @@ public:
 
     Result<GenerateStats> generate(const GenerateRequest& request, const CancellationToken& cancel,
                                    const TokenCallback& on_chunk) override {
+        if (Status dh = check_device_health(); !dh.ok()) return dh;
         if (Status v = validate(request.sampling); !v.ok()) return v;
         // The llama.cpp context size is fixed at load (ModelLoadOptions::context_length).
         // A smaller num_ctx is honoured by the engine's scheduling limit; a larger one
@@ -1037,8 +1188,10 @@ public:
                           request.priority_class, request.target_ttft_ms, request.target_itl_ms,
                           request.enable_stage_profiling, request.on_safe_point, request.suspended_state,
                           request.execution_resume, request.priority_rank, request.allow_preempt_spill,
-                          /*start_in_thinking=*/false, request.telemetry_top_k, request.telemetry_candidates_stride,
-                          request.telemetry_candidates_max_events, request.telemetry_capture_text);
+                          /*start_in_thinking=*/false, /*llguidance_json_schema=*/{},
+                          lc::ClassifyGenerateRequest(request), request.telemetry_top_k,
+                          request.telemetry_candidates_stride, request.telemetry_candidates_max_events,
+                          request.telemetry_capture_text);
     }
 
     // Chat through the GGUF chat template (llama_chat_apply_template). Models
@@ -1048,6 +1201,7 @@ public:
     // strictly tokenized with parse_special=false (G0028).
     Result<GenerateStats> chat(const ChatRequest& request, const CancellationToken& cancel,
                                const TokenCallback& on_chunk) override {
+        if (Status dh = check_device_health(); !dh.ok()) return dh;
         if (Status v = validate_chat_messages(request.messages); !v.ok()) return v;
         if (Status v = validate(request.sampling); !v.ok()) return v;
         if (request.sampling.num_ctx > 0 && desc_.context_length > 0 &&
@@ -1056,6 +1210,23 @@ public:
                           "num_ctx " + std::to_string(request.sampling.num_ctx) +
                               " exceeds the loaded llama.cpp context (" + std::to_string(desc_.context_length) +
                               "); reload with a larger context_length");
+        }
+        if (!request.tools.empty() &&
+            !(request.tool_choice.has_value() && request.tool_choice->mode == ToolChoiceMode::none)) {
+            const auto preflight = tool_grammar_preflight_.Preflight(chat_template_id_, request.tools);
+            if (!preflight.ok) {
+                return preflight.to_status();
+            }
+        }
+        // Optional llguidance JSON-Schema path (SONDER_WITH_LLGUIDANCE). Computed before any
+        // chat-template fallback so template-less models never drop the schema constraint onto
+        // BackendModel::chat() -> generate(). With the option OFF, llg_schema stays empty.
+        std::string llg_schema;
+        if (lc::LlguidanceAvailable()) {
+            auto llg = llamacpp_detail::LlguidanceSchemaForResponseFormat(request.response_format_type,
+                                                                          request.response_format_schema);
+            if (!llg.ok()) return llg.status();
+            llg_schema = std::move(llg.value());
         }
         const bool concurrent_batch = (slots_ > 1u);
         std::shared_lock<std::shared_mutex> shared_guard;
@@ -1075,12 +1246,32 @@ public:
             });
         if (!plan.status.ok()) {
             if (plan.template_unsupported) {
-                if (shared_guard.owns_lock()) shared_guard.unlock();
-                if (exclusive_guard.owns_lock()) exclusive_guard.unlock();
                 if (!plan.media_blobs.empty()) {
+                    if (shared_guard.owns_lock()) shared_guard.unlock();
+                    if (exclusive_guard.owns_lock()) exclusive_guard.unlock();
                     return Status(ErrorCode::invalid_argument,
                                   "multimodal chat requires a model with a chat template");
                 }
+                if (!llg_schema.empty()) {
+                    std::vector<lc::Token> fallback_tokens;
+                    const std::string prompt = format_chat_prompt(request.messages);
+                    if (lc::Status s = runtime_.Tokenize(prompt, /*add_special=*/true, fallback_tokens,
+                                                         /*parse_special=*/false);
+                        !s.ok()) {
+                        return ToStatus(s);
+                    }
+                    return run_tokens(std::move(fallback_tokens), request.sampling, cancel, on_chunk,
+                                      request.session_key, request.grammar, /*separate_reasoning=*/false,
+                                      /*checkpoint=*/nullptr, {}, {}, {}, request.priority_class,
+                                      request.target_ttft_ms, request.target_itl_ms,
+                                      request.enable_stage_profiling, {}, nullptr, nullptr, 0, false,
+                                      /*start_in_thinking=*/false, std::move(llg_schema),
+                                      lc::ClassifyChatRequest(request), request.telemetry_top_k,
+                                      request.telemetry_candidates_stride, request.telemetry_candidates_max_events,
+                                      request.telemetry_capture_text);
+                }
+                if (shared_guard.owns_lock()) shared_guard.unlock();
+                if (exclusive_guard.owns_lock()) exclusive_guard.unlock();
                 return BackendModel::chat(request, cancel, on_chunk);
             }
             return plan.status;
@@ -1099,13 +1290,15 @@ public:
                           request.priority_class, request.target_ttft_ms, request.target_itl_ms,
                           request.enable_stage_profiling, {}, nullptr, nullptr, 0, false,
                           request.separate_reasoning && llamacpp_detail::PromptEndsInsideThink(plan.segments),
-                          request.telemetry_top_k, request.telemetry_candidates_stride,
-                          request.telemetry_candidates_max_events, request.telemetry_capture_text);
+                          std::move(llg_schema), lc::ClassifyChatRequest(request), request.telemetry_top_k,
+                          request.telemetry_candidates_stride, request.telemetry_candidates_max_events,
+                          request.telemetry_capture_text);
     }
 
     [[nodiscard]] bool has_native_chat() const override { return native_chat_; }
 
     Result<RecurrentStateSnapshot> capture_recurrent_state(std::uint64_t token_position) override {
+        if (Status dh = check_device_health(); !dh.ok()) return dh;
         if (token_position == 0) {
             return Status(ErrorCode::invalid_argument, "recurrent checkpoint token_position must be > 0");
         }
@@ -1119,6 +1312,7 @@ public:
     }
 
     Status restore_recurrent_state(std::span<const std::uint8_t> bytes) override {
+        if (Status dh = check_device_health(); !dh.ok()) return dh;
         if (bytes.empty()) {
             return Status(ErrorCode::invalid_argument, "recurrent checkpoint snapshot is empty");
         }
@@ -1133,6 +1327,7 @@ public:
     Result<std::vector<std::uint8_t>> capture_execution_state(std::uint64_t token_position,
                                                               std::size_t max_bytes) override {
         (void)token_position;
+        if (Status dh = check_device_health(); !dh.ok()) return dh;
         const std::size_t cap = std::min(max_bytes, kMaxRecurrentCheckpointBytes);
         if (cap == 0) {
             return Status(ErrorCode::invalid_argument, "execution state max_bytes must be > 0");
@@ -1147,6 +1342,7 @@ public:
 
     Status restore_execution_state(std::span<const std::uint8_t> bytes, std::uint64_t token_position) override {
         (void)token_position;
+        if (Status dh = check_device_health(); !dh.ok()) return dh;
         if (bytes.empty()) {
             return Status(ErrorCode::invalid_argument, "execution state snapshot is empty");
         }
@@ -1177,7 +1373,9 @@ private:
                                      SuspendedExecutionState* suspended_state = nullptr,
                                      const ExecutionResumeState* execution_resume = nullptr,
                                      int priority_rank = 0, bool allow_preempt_spill = false,
-                                     bool start_in_thinking = false, std::int32_t telemetry_top_k = 0,
+                                     bool start_in_thinking = false, std::string llguidance_json_schema = {},
+                                     lc::SpecTaskClass spec_task = lc::SpecTaskClass::kChat,
+                                     std::int32_t telemetry_top_k = 0,
                                      std::uint32_t telemetry_candidates_stride = 1,
                                      std::uint32_t telemetry_candidates_max_events = 0,
                                      bool telemetry_capture_text = false) {
@@ -1187,6 +1385,15 @@ private:
         req.prompt = std::move(prompt_tokens);
         if (req.prompt.empty()) return Status(ErrorCode::invalid_argument, "prompt produced no tokens");
         if (lc::Status s = lc::ValidateStopSequences(sampling.stop); !s.ok()) return ToStatus(s);
+        lc::SpecDecision spec_decision;
+        if (spec_controller_ && spec_controller_active_) {
+            lc::SpecRequestContext sctx;
+            sctx.route = desc_.name;
+            sctx.task = spec_task;
+            sctx.caps = spec_caps_;
+            spec_decision = spec_controller_->Decide(sctx);
+            lc::ApplySpecDecisionToRequest(spec_decision, req);
+        }
         req.max_new_tokens = sampling.max_tokens;
         req.sampling = ToLlamaSampling(sampling);
         req.sampling.telemetry_top_k = std::clamp<std::int32_t>(telemetry_top_k, 0, kMaxTelemetryTopK);
@@ -1202,6 +1409,7 @@ private:
             req.sampling.telemetry_candidates_max_events = 0u;
         }
         req.sampling.grammar = std::string(grammar);
+        req.sampling.llguidance_json_schema = std::move(llguidance_json_schema);
         req.session_key = std::string(session_key);
         req.media_blobs = std::move(media_blobs);
         req.media_prompt_text = std::move(media_prompt_text);
@@ -1366,6 +1574,12 @@ private:
             }
         }
 
+        if (spec_controller_ && spec_controller_active_) {
+            lc::FinishSpecRequest(*spec_controller_, spec_decision, desc_.name, spec_task, r.draft_tokens,
+                                  r.draft_accepted_tokens,
+                                  !r.status.ok() || r.stop_reason == lc::StopReason::kCancelled);
+        }
+
         llamacpp_detail::PopulateGenerateStats(r, req.restore_tokens, load_ns_, stats);
         if (stats.effective_execution) {
             stats.effective_execution->target_identity = desc_.name;
@@ -1374,7 +1588,10 @@ private:
             }
         }
 
-        if (!r.status.ok()) return ToStatus(r.status);
+        if (!r.status.ok()) {
+            if (Status dh = check_device_health(); !dh.ok()) return dh;
+            return ToStatus(r.status);
+        }
 
         switch (r.stop_reason) {
             case lc::StopReason::kEndOfGeneration: stats.stop_reason = StopReason::end_of_sequence; break;
@@ -1426,12 +1643,26 @@ private:
         return stats;
     }
 
+    [[nodiscard]] Status check_device_health() const {
+        if (!runtime_state_ || gpu_devices_.empty()) {
+            return Status::success();
+        }
+        const auto dh = runtime_state_->DeviceHealth();
+        return dh ? dh->CheckDevicesStatus(gpu_devices_) : Status::success();
+    }
+
     ModelDescriptor desc_;
     lc::LlamaCppBackend runtime_;
     std::uint64_t load_ns_ = 0;
     std::uint32_t slots_ = 1;
     std::shared_ptr<RuntimeState> runtime_state_;
     std::uint64_t runtime_model_id_ = 0;
+    std::string chat_template_id_;
+    llamacpp_detail::ToolGrammarPreflight tool_grammar_preflight_;
+    std::vector<std::string> gpu_devices_;
+    std::shared_ptr<lc::SpecController> spec_controller_;
+    lc::SpecModelCaps spec_caps_;
+    bool spec_controller_active_ = false;
     bool native_chat_ = false;  // set in the constructor, read-only afterwards
     mutable std::shared_mutex mutex_;
 };
@@ -1447,10 +1678,21 @@ public:
           runtime_state_(std::make_shared<RuntimeState>(
               probe ? std::move(probe) : MakeDefaultGpuMemoryProbe(options_.devices), sample_interval, options_,
               force_uma_mode, force_gpu_offload)) {
+        lc::BindCoreBackendDeviceHealth(
+            this, runtime_state_->DeviceHealth(),
+            [rs = runtime_state_](std::shared_ptr<lc::DeviceHealthTracker> dh) {
+                if (dh) rs->SetDeviceHealth(std::move(dh));
+            });
+        lc::SpecControllerConfig spec_cfg;
+        std::string spec_err;
+        (void)lc::BuildSpecControllerConfig(options_, spec_cfg, spec_err);
+        spec_controller_ = std::make_shared<lc::SpecController>(std::move(spec_cfg));
         // llama.cpp's log callback runs on inference threads: send its lines
         // through the non-blocking diagnostic queue, never to stderr directly.
         lc::SetLogSink(&ForwardLogToDiagnosticQueue);
     }
+
+    ~LlamaCppCoreBackend() override { lc::UnbindCoreBackendDeviceHealth(this); }
 
     [[nodiscard]] std::string name() const override { return kLlamaCppBackendName; }
     [[nodiscard]] std::string description() const override {
@@ -1475,12 +1717,16 @@ public:
             .add(Capability::logprobs)
             .add(Capability::reranking)
             .add(Capability::execution_checkpoint)
-            .add(Capability::selective_preemption);
+            .add(Capability::selective_preemption)
+            .add(Capability::lora);
         if (options_.slots > 1u) {
             caps.add(Capability::continuous_batch_decode);
         }
         if (!options_.mmproj_path.empty()) {
             caps.add(Capability::multimodal);
+        }
+        if (lc::ShouldInstallGraphCallback(options_.telemetry_level)) {
+            caps.add(Capability::layer_telemetry);
         }
         return caps;
     }
@@ -1517,21 +1763,48 @@ public:
                 out.push_back(std::move(d));
             }
         }
+        for (const auto& alias_opt : options_.lora_aliases) {
+            if (alias_opt.alias.empty()) continue;
+            const bool exists = std::any_of(out.begin(), out.end(),
+                                            [&](const ModelDescriptor& m) { return m.name == alias_opt.alias; });
+            if (exists) continue;
+            ModelDescriptor d;
+            d.name = alias_opt.alias;
+            d.backend = kLlamaCppBackendName;
+            d.format = "gguf";
+            out.push_back(std::move(d));
+        }
         std::sort(out.begin(), out.end(), [](const auto& a, const auto& b) { return a.name < b.name; });
         return out;
     }
 
     Result<std::shared_ptr<BackendModel>> load_model(const ModelLoadOptions& options) override {
         if (options.model.empty()) return Status(ErrorCode::invalid_argument, "model path is empty");
-        const std::string path = Resolve(options.model);
+        std::optional<lc::LoraAliasEntry> matched_alias;
+        std::vector<std::string> effective_lora_roots;
+        if (lc::Status s = lc::ResolveConfiguredLoraAlias(options.model, options_.lora_aliases, options_.lora_roots,
+                                                          options_.model_dirs, matched_alias, effective_lora_roots);
+            !s.ok()) {
+            return ToStatus(s);
+        }
+        const std::string path = Resolve(matched_alias ? matched_alias->base_model : options.model);
 
         lc::LoadOptions lo;
         lo.model_path = path;
-        if (Status s = ApplyBackendOptions(options_, lo); !s.ok()) return s;
+        // A per-model device allowlist overrides the backend-wide one.
+        LlamaCppBackendOptions effective = options_;
+        if (!options.devices.empty()) effective.devices = options.devices;
+        if (Status s = ApplyBackendOptions(effective, lo); !s.ok()) return s;
         for (const auto& [pattern, device] : options_.tensor_overrides) {
             lo.tensor_overrides.push_back({pattern, device});
         }
         const std::string_view dev = options.device_id;
+        const auto health = runtime_state_ ? runtime_state_->DeviceHealth() : nullptr;
+        if (health) {
+            if (Status dh = health->CheckDevicesStatus(lc::CollectInitialGpuDevices(lo, dev)); !dh.ok()) {
+                return dh;
+            }
+        }
         bool has_gpu = false;
         std::vector<lc::DeviceInfo> enumerated_devices;
         if (dev.rfind("gpu", 0) == 0) {
@@ -1540,10 +1813,13 @@ public:
                 has_gpu = has_gpu || d.kind == lc::DeviceKind::kGpu || d.kind == lc::DeviceKind::kIntegratedGpu;
             }
         }
-        const auto gpu_layers = llamacpp_detail::ResolveGpuLayers(options_, dev, has_gpu);
+        const auto gpu_layers = llamacpp_detail::ResolveGpuLayers(effective, dev, has_gpu);
         if (!gpu_layers.ok()) return gpu_layers.status();
         lo.n_gpu_layers = gpu_layers.value();
         if (lo.n_gpu_layers != 0) {
+            if (enumerated_devices.empty() && lo.devices.empty()) {
+                enumerated_devices = lc::LlamaCppBackend::EnumerateDevices();
+            }
             const std::vector<GpuDeviceInfo> os_gpus =
                 (dev.rfind("gpu:", 0) == 0 && lo.devices.empty() && lo.tensor_split.empty())
                     ? enumerate_gpu_devices()
@@ -1553,19 +1829,78 @@ public:
                 !s.ok()) {
                 return s;
             }
+            if (dev.rfind("gpu", 0) == 0 && dev.rfind("gpu:", 0) != 0 && lo.devices.empty()) {
+                lc::DeviceSelection auto_sel;
+                if (!lc::SelectDevices(enumerated_devices, {}, &auto_sel).ok() || auto_sel.names.empty()) {
+                    return Status(ErrorCode::not_found,
+                                  "requested device '" + std::string(dev) +
+                                      "' has no available discrete llama.cpp GPU (integrated GPUs require an explicit "
+                                      "devices allowlist)");
+                }
+            }
+        }
+        std::vector<std::string> active_gpu_devices = lc::CollectActiveGpuDevices(lo, enumerated_devices, dev);
+        if (health && !active_gpu_devices.empty()) {
+            if (dev.rfind("gpu:", 0) == 0 && active_gpu_devices.size() == 1u) {
+                (void)health->RegisterAlias(dev, active_gpu_devices[0]);
+            }
+            if (Status dh = health->CheckDevicesStatus(active_gpu_devices); !dh.ok()) {
+                return dh;
+            }
+        }
+        if (Status s = lc::CheckKvPolicyAtLoad(lo, options_.kv_cache_type_k, options_.kv_cache_type_v,
+                                               options_.kv_k_q4_allowed, enumerated_devices, path);
+            !s.ok()) {
+            return s;
         }
 
         lc::LlamaCppBackend runtime;
+        if (health && !active_gpu_devices.empty()) {
+            lc::BindBackendDeviceHealth(&runtime, health, active_gpu_devices);
+        }
         double load_ms = 0.0;
+        auto kv_telemetry = std::make_shared<lc::KvTelemetry>();
+        runtime.SetKvTelemetry(kv_telemetry);
         runtime.SetTelemetrySink([&](const lc::TelemetryEvent& e) {
             if (e.kind == lc::TelemetryKind::kModelLoaded) load_ms = e.elapsed_ms;
         });
-        if (lc::Status s = runtime.Load(lo); !s.ok()) return ToStatus(s);
+        if (lc::Status s = runtime.Load(lo); !s.ok()) {
+            if (health && !active_gpu_devices.empty()) {
+                if (Status dh = health->CheckDevicesStatus(active_gpu_devices); !dh.ok()) {
+                    return dh;
+                }
+            }
+            return ToStatus(s);
+        }
         runtime.SetTelemetrySink({});
+        if (matched_alias.has_value()) {
+            if (lc::Status ls = lc::ApplyLoraAdapters(runtime, matched_alias->adapters, effective_lora_roots);
+                !ls.ok()) {
+                return ToStatus(ls);
+            }
+        }
+        if (lc::ShouldInstallGraphCallback(options_.telemetry_level)) {
+            TelemetryContext gctx = options_.telemetry_context;
+            if (gctx.session_id.empty()) {
+                gctx.session_id = kLlamaCppBackendName;
+            }
+            if (!gctx.device_id.has_value() && !options.device_id.empty()) {
+                gctx.device_id = options.device_id;
+            }
+            TelemetryBus* bus = options_.telemetry_bus;
+            const TelemetryLevel level = options_.telemetry_level;
+            runtime.SetGraphEvalSink([state = runtime_state_, bus, gctx = std::move(gctx),
+                                      level](const lc::GraphEvalSummary& summary) {
+                if (state) state->RecordGraphTelemetryObserved();
+                if (bus != nullptr) {
+                    (void)lc::EmitGraphTelemetry(*bus, gctx, summary, level, kLlamaCppBackendName);
+                }
+            });
+        }
 
         const lc::ModelInfo info = runtime.GetModelInfo();
         ModelDescriptor d;
-        d.name = PathToUtf8(PathFromUtf8(path).filename());
+        d.name = matched_alias ? matched_alias->alias : PathToUtf8(PathFromUtf8(path).filename());
         d.backend = kLlamaCppBackendName;
         d.format = "gguf";
         d.family = info.description;  // e.g. "llama 7B Q4_0"
@@ -1585,15 +1920,38 @@ public:
             if (enumerated_devices.empty()) {
                 enumerated_devices = lc::LlamaCppBackend::EnumerateDevices();
             }
-            uma_target = llamacpp_detail::HasIntegratedUmaTarget(enumerated_devices, lo.devices);
+            // Mirror the load's device selection: an iGPU that auto selection
+            // skipped is not a UMA target.
+            lc::DeviceSelection used;
+            if (lc::SelectDevices(enumerated_devices, lo.devices, &used).ok()) {
+                uma_target =
+                    !used.names.empty() && llamacpp_detail::HasIntegratedUmaTarget(enumerated_devices, used.names);
+            } else {
+                uma_target = llamacpp_detail::HasIntegratedUmaTarget(enumerated_devices, lo.devices);
+            }
         }
         const std::uint32_t loaded_slots = std::max<std::uint32_t>(1u, runtime.SlotCount());
         const lc::SpeculativeLoadInfo spec_info = runtime.GetSpeculativeInfo();
-        const std::uint64_t model_id =
-            runtime_state_->RegisterModel(info.n_ctx, lo.n_gpu_layers != 0, uma_target, d.name, spec_info);
+        const std::uint64_t model_id = runtime_state_->RegisterModel(
+            info.n_ctx, lo.n_gpu_layers != 0, uma_target, d.name, spec_info, std::move(kv_telemetry));
         runtime_state_->RefreshGpuMemory(/*force=*/true);
+        lc::SpecModelCaps spec_caps;
+        spec_caps.mtp_available = spec_info.mtp_build_supported && spec_info.mtp_model_supported;
+        spec_caps.architecture = d.architecture;
+        spec_caps.hybrid_rs_cap = spec_info.hybrid_rs_cap;
+        spec_caps.can_hybrid_spec_ckpt = spec_info.can_hybrid_spec_ckpt;
+        spec_caps.ctx_outputs_max_per_seq = spec_info.ctx_outputs_max_per_seq;
         return std::shared_ptr<BackendModel>(std::make_shared<LlamaCppModel>(
-            std::move(d), std::move(runtime), load_ms, loaded_slots, runtime_state_, model_id));
+            std::move(d), std::move(runtime), load_ms, loaded_slots, runtime_state_, model_id,
+            std::move(active_gpu_devices), spec_controller_, spec_caps));
+    }
+
+    Status RecoverDevice(std::string_view device) {
+        const auto dh = runtime_state_ ? runtime_state_->DeviceHealth() : nullptr;
+        if (!dh) {
+            return Status(ErrorCode::internal, "device health tracker is not initialized");
+        }
+        return dh->RecoverDevice(device);
     }
 
 private:
@@ -1609,6 +1967,7 @@ private:
 
     LlamaCppBackendOptions options_;
     std::shared_ptr<RuntimeState> runtime_state_;
+    std::shared_ptr<lc::SpecController> spec_controller_;
 };
 
 }  // namespace
@@ -1623,6 +1982,18 @@ std::shared_ptr<Backend> MakeLlamaCppBackendForTest(LlamaCppBackendOptions optio
 }
 
 }  // namespace llamacpp_detail
+
+bool is_llamacpp_device_unhealthy_error(const Status& status) noexcept {
+    return lc::IsDeviceUnhealthyInferenceStatus(status);
+}
+
+Status recover_llamacpp_device(Backend& backend, std::string_view device) {
+    auto* core = dynamic_cast<LlamaCppCoreBackend*>(&backend);
+    if (core == nullptr) {
+        return lc::RecoverCoreBackendDevice(backend, device);
+    }
+    return core->RecoverDevice(device);
+}
 
 Status validate_llamacpp_options(const LlamaCppBackendOptions& options) {
     lc::LoadOptions lo;

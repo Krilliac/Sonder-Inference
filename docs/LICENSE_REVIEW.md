@@ -116,6 +116,42 @@ No license conclusions from the initial broad web sweep are considered authorita
   than written independently, its exact repository, revision, and license must
   be verified and recorded here before adoption.
 
+### llguidance (optional, `SONDER_WITH_LLGUIDANCE=ON`)
+- repository: https://github.com/guidance-ai/llguidance
+- revision/tag: v1.0.1, commit `d795912fedc7d393de740177ea9ea761e7905774` (`parser/Cargo.toml` and
+  `toktrie/Cargo.toml` both read `version = "1.0.1"`); the same commit llama.cpp `v1.0.0` pins in
+  `common/CMakeLists.txt` for `LLAMA_LLGUIDANCE`. Pinned in `src/backends/llamacpp/CMakeLists.txt`
+  (`SONDER_LLGUIDANCE_GIT_TAG`); configure warns if the llama.cpp tree in use pins a different commit
+- evaluated: 2026-11-26, against that exact commit: `LICENSE` ("MIT License, Copyright (c)
+  Microsoft Corporation."), `license = "MIT"` in `parser/Cargo.toml` (crate `llguidance`) and
+  `toktrie/Cargo.toml`, and `cargo metadata` of the crates one `cargo build --release --package
+  llguidance` compiles on x86_64-pc-windows-msvc
+- license: MIT. Its Rust dependency closure is 48 crates (including `llguidance` and `toktrie`
+  themselves), every one permissively licensed. By SPDX expression: 32 `MIT OR Apache-2.0`,
+  7 `MIT` (`llguidance`, `toktrie`, `derivre`, `referencing`, `fluent-uri`, `strum`,
+  `strum_macros`), 2 `Zlib OR Apache-2.0 OR MIT`, 2 `Apache-2.0 OR MIT`, and one each of `MIT-0`
+  (borrow-or-share), `Unlicense OR MIT` (memchr),
+  `Apache-2.0 OR BSL-1.0` (ryu), `(MIT OR Apache-2.0) AND Unicode-3.0` (unicode-ident) and
+  `BSD-2-Clause OR Apache-2.0 OR MIT` (zerocopy). The full list with versions comes from the
+  `cargo metadata` command above (check it again whenever the pin moves)
+- intended use: constrained decoding for `response_format: {type: json_schema}` in the native
+  llama.cpp backend (`llguidance_sampler.cpp` adapts llama.cpp's `common/llguidance.cpp`, MIT, to this
+  repository's sampler contract). The default build does not use it
+- linkage/process boundary: in-process static link of `llguidance.lib` / `libllguidance.a`, built by
+  `cargo build --release --package llguidance` from a `git clone` at the pinned commit, only with
+  `SONDER_WITH_LLGUIDANCE=ON` (requires `cargo` and `git`; configure fails with a clear message when
+  either is missing and the option is ON). No llguidance code is copied into this repository other
+  than the adapted sampler glue
+- notices required: include the llguidance MIT license text and Microsoft copyright notice, plus the
+  notices of the crates above, in any binary distribution built with the option ON. Not yet added to
+  `NOTICE`; do that before shipping such a binary
+- security/maintenance notes: the build downloads source from github.com and crates from crates.io at
+  build time (the commit hash pins llguidance, but not the crate versions: `cargo build` uses the
+  `Cargo.lock` committed at that commit); it is therefore opt-in and unsuitable for offline builds
+  without a prepared cargo vendor/cache. Schemas are normalised (`additionalProperties: false`) and
+  bounded (`json_schema_normalize.hpp`) before llguidance sees them
+- approved: pending: not yet reviewed by Nate; the option stays OFF by default until then
+
 ### cpp-httplib
 - repository: https://github.com/yhirose/cpp-httplib
 - revision/tag: v0.58.0 (single `httplib.h`, SHA-256 `aa14e7e7bd2703694e0a6b6855af3b8c406102ab1fc56ac905fe33619b31faa5`)
@@ -138,6 +174,17 @@ No license conclusions from the initial broad web sweep are considered authorita
 - notices required: none for dynamic linking to the system library; nothing is redistributed
 - security/maintenance notes: security updates come from the OS package. The Windows CI build (`tls-windows` in `.github/workflows/ci.yml`) downloads the tarball above, refuses it unless the SHA-256 matches, builds it with MSVC (`VC-WIN64A no-asm no-apps no-tests no-docs`) and caches the install under that hash; to move it, bump `OPENSSL_VERSION` and `OPENSSL_SHA256` together after checking the new release's hash and license. Certificate verification, pinning and the `insecure_skip_verify` warning are documented in `docs/integration/tls.md`
 - approved: yes, approved by Nate on 2026-09-26 (dynamic link to the system library, OFF by default; CI revisions pinned as above)
+
+### Ollama Cloud (hosted HTTPS API only)
+- repository: none used; the service at https://ollama.com
+- revision/tag: the hosted API as documented at https://docs.ollama.com/api/introduction.md (checked 2026-11-26)
+- evaluated: 2026-11-26
+- license: not applicable; no code is copied, linked or fetched. Use of the service is governed by Ollama's terms and privacy policy (https://ollama.com/privacy), which the operator accepts with their account
+- intended use: the `ollama_cloud` provider (`src/backends/ollama_cloud`) sends chat requests to Ollama's hosted models
+- linkage/process boundary: remote service over HTTPS through the existing internal HTTP client and the already-reviewed optional TLS layer (Schannel on Windows, the OpenSSL record above elsewhere). No new dependency
+- notices required: none
+- security/maintenance notes: opt-in per model; certificate verification always on; API key from an env var or token file, never logged or echoed (docs/integration/ollama-cloud.md "Secrets"). Prompts leave the machine, so `X-Sonder-Local-Only` requests are refused
+- approved: no approval needed for code (none is used); recorded because prompts now cross a network boundary when an operator opts in
 
 ### Ollama (process boundary only)
 - repository: https://github.com/ollama/ollama

@@ -30,6 +30,12 @@
       "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" }
     },
     {
+      "name": "msvc-debug-no-llamaserver",
+      "displayName": "MSVC Debug without llamaserver (Ninja)",
+      "inherits": "msvc-debug",
+      "cacheVariables": { "SONDER_BUILD_LLAMASERVER": "OFF" }
+    },
+    {
       "name": "msvc-release",
       "displayName": "MSVC RelWithDebInfo (Ninja)",
       "inherits": "windows-base",
@@ -185,6 +191,7 @@
   ],
   "buildPresets": [
     { "name": "msvc-debug", "configurePreset": "msvc-debug" },
+    { "name": "msvc-debug-no-llamaserver", "configurePreset": "msvc-debug-no-llamaserver" },
     { "name": "msvc-release", "configurePreset": "msvc-release" },
     { "name": "linux-debug", "configurePreset": "linux-debug" },
     { "name": "linux-release", "configurePreset": "linux-release" },
@@ -202,6 +209,7 @@
   ],
   "testPresets": [
     { "name": "msvc-debug", "configurePreset": "msvc-debug", "output": { "outputOnFailure": true } },
+    { "name": "msvc-debug-no-llamaserver", "configurePreset": "msvc-debug-no-llamaserver", "output": { "outputOnFailure": true } },
     { "name": "msvc-release", "configurePreset": "msvc-release", "output": { "outputOnFailure": true } },
     { "name": "linux-debug", "configurePreset": "linux-debug", "output": { "outputOnFailure": true } },
     { "name": "linux-release", "configurePreset": "linux-release", "output": { "outputOnFailure": true } },

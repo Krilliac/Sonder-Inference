@@ -566,7 +566,7 @@ Session::Session(Engine& engine, std::shared_ptr<Model> model, SessionOptions op
                                           {"backend", model_->backend_name()},
                                           {"priority", options_.priority},
                                           {"workload", to_string(options_.workload)},
-                                          {"text_capture", engine_.telemetry().options().capture_text ? "on" : "off"},
+                                          {"text_capture", to_string(resolved_text_capture(engine_.telemetry().options()))},
                                           {"sampling", sampling_json(options_.sampling)}},
                              TelemetryLevel::metrics);
 }
@@ -1522,10 +1522,14 @@ Result<EmbedResult> Session::embed(const std::vector<std::string>& inputs, const
 }
 
 Result<EmbedResult> Session::embed_request(const EmbedRequest& request, const RequestOptions& request_options) {
-    if (request.inputs.empty()) {
+    const std::size_t n_embed_inputs = request.inputs.size() + request.token_inputs.size();
+    if (n_embed_inputs == 0) {
         return Status(ErrorCode::invalid_argument, "embed inputs must be non-empty");
     }
-    if (request.inputs.size() > kMaxEmbedInputs) {
+    if (!request.inputs.empty() && !request.token_inputs.empty()) {
+        return Status(ErrorCode::invalid_argument, "embed request mixes text inputs and token inputs");
+    }
+    if (n_embed_inputs > kMaxEmbedInputs) {
         return Status(ErrorCode::invalid_argument,
                       "embed inputs exceeds maximum of " + std::to_string(kMaxEmbedInputs) + " items");
     }
@@ -1541,15 +1545,35 @@ Result<EmbedResult> Session::embed_request(const EmbedRequest& request, const Re
                                    : (!request.request_id.empty() ? request.request_id : make_id("req"));
     TelemetryBus& bus = engine_.telemetry();
     const auto ctx = telemetry_context(req_id);
-    const std::uint64_t input_count = static_cast<std::uint64_t>(request.inputs.size());
+    const std::uint64_t input_count = static_cast<std::uint64_t>(n_embed_inputs);
     bool terminal_attempted = false;
     auto t_start = std::chrono::steady_clock::now();
     const auto current_queue_ms = [&]() {
         return request_options.admission ? request_options.admission->queue_ms()
                                          : request_options.admission_queue_ms;
     };
+    const auto sanitize_model = [](std::string_view text) {
+        if (text.size() > kMaxEvidenceStringBytes) {
+            std::size_t n = kMaxEvidenceStringBytes;
+            while (n > 0 && (static_cast<unsigned char>(text[n]) & 0xC0u) == 0x80u) {
+                --n;
+            }
+            text = text.substr(0, n);
+        }
+        return sanitize_bounded_evidence_string(text, kMaxEvidenceStringBytes);
+    };
+    const std::string resolved_model = sanitize_model(
+        (request_options.served_model && !request_options.served_model->empty())
+            ? std::string_view(*request_options.served_model)
+            : std::string_view(model_->descriptor().name));
+    const std::string req_model =
+        (request_options.requested_model && !request_options.requested_model->empty())
+            ? sanitize_model(*request_options.requested_model)
+            : resolved_model;
     const auto& parent = request_options.parent_request_id;
-    const auto with_parent = [&parent](json::Object attrs) {
+    const auto with_parent = [&parent, &resolved_model, &req_model](json::Object attrs) {
+        attrs.set("model", resolved_model);
+        attrs.set("requested_model", req_model);
         if (parent) {
             attrs.set("parent_request_id", *parent);
         }
@@ -1754,8 +1778,28 @@ Result<RerankResult> Session::rerank(const RerankRequest& request, const Request
         return request_options.admission ? request_options.admission->queue_ms()
                                          : request_options.admission_queue_ms;
     };
+    const auto sanitize_model = [](std::string_view text) {
+        if (text.size() > kMaxEvidenceStringBytes) {
+            std::size_t n = kMaxEvidenceStringBytes;
+            while (n > 0 && (static_cast<unsigned char>(text[n]) & 0xC0u) == 0x80u) {
+                --n;
+            }
+            text = text.substr(0, n);
+        }
+        return sanitize_bounded_evidence_string(text, kMaxEvidenceStringBytes);
+    };
+    const std::string resolved_model = sanitize_model(
+        (request_options.served_model && !request_options.served_model->empty())
+            ? std::string_view(*request_options.served_model)
+            : std::string_view(model_->descriptor().name));
+    const std::string req_model =
+        (request_options.requested_model && !request_options.requested_model->empty())
+            ? sanitize_model(*request_options.requested_model)
+            : resolved_model;
     const auto& parent = request_options.parent_request_id;
-    const auto with_parent = [&parent](json::Object attrs) {
+    const auto with_parent = [&parent, &resolved_model, &req_model](json::Object attrs) {
+        attrs.set("model", resolved_model);
+        attrs.set("requested_model", req_model);
         if (parent) {
             attrs.set("parent_request_id", *parent);
         }
@@ -1953,8 +1997,28 @@ Result<ScoreResult> Session::score(const ScoreRequest& request, const RequestOpt
         return request_options.admission ? request_options.admission->queue_ms()
                                          : request_options.admission_queue_ms;
     };
+    const auto sanitize_model = [](std::string_view text) {
+        if (text.size() > kMaxEvidenceStringBytes) {
+            std::size_t n = kMaxEvidenceStringBytes;
+            while (n > 0 && (static_cast<unsigned char>(text[n]) & 0xC0u) == 0x80u) {
+                --n;
+            }
+            text = text.substr(0, n);
+        }
+        return sanitize_bounded_evidence_string(text, kMaxEvidenceStringBytes);
+    };
+    const std::string resolved_model = sanitize_model(
+        (request_options.served_model && !request_options.served_model->empty())
+            ? std::string_view(*request_options.served_model)
+            : std::string_view(model_->descriptor().name));
+    const std::string req_model =
+        (request_options.requested_model && !request_options.requested_model->empty())
+            ? sanitize_model(*request_options.requested_model)
+            : resolved_model;
     const auto& parent = request_options.parent_request_id;
-    const auto with_parent = [&parent](json::Object attrs) {
+    const auto with_parent = [&parent, &resolved_model, &req_model](json::Object attrs) {
+        attrs.set("model", resolved_model);
+        attrs.set("requested_model", req_model);
         if (parent) {
             attrs.set("parent_request_id", *parent);
         }
@@ -2210,6 +2274,7 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
     request.target_ttft_ms = request_options.target_ttft_ms;
     request.target_itl_ms = request_options.target_itl_ms;
     request.enable_stage_profiling = request_options.enable_stage_profiling;
+    request.local_only = request_options.local_only;
     request.priority_rank = static_cast<int>(options_.workload) - options_.priority;
     request.allow_preempt_spill =
         request_options.allow_preempt_spill || engine_.scheduling_options().enable_spill_preemption;
@@ -2218,6 +2283,24 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
     // can replace an exception from a public C++ callback.
     TelemetryBus& bus = engine_.telemetry();
     const auto ctx = telemetry_context(request.request_id);
+    const auto sanitize_model = [](std::string_view text) {
+        if (text.size() > kMaxEvidenceStringBytes) {
+            std::size_t n = kMaxEvidenceStringBytes;
+            while (n > 0 && (static_cast<unsigned char>(text[n]) & 0xC0u) == 0x80u) {
+                --n;
+            }
+            text = text.substr(0, n);
+        }
+        return sanitize_bounded_evidence_string(text, kMaxEvidenceStringBytes);
+    };
+    const std::string resolved_model = sanitize_model(
+        (request_options.served_model && !request_options.served_model->empty())
+            ? std::string_view(*request_options.served_model)
+            : std::string_view(model_->descriptor().name));
+    const std::string req_model =
+        (request_options.requested_model && !request_options.requested_model->empty())
+            ? sanitize_model(*request_options.requested_model)
+            : resolved_model;
     detail::RequestRuntime* runtime = engine_.request_runtime();
     std::optional<std::uint64_t> sched_id;
     bool finish_attempted = false;
@@ -2242,7 +2325,10 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
             if (!terminal_attempted) {
                 terminal_attempted = true;
                 if (request_options.admission) result.scheduling.queue_ms = request_options.admission->queue_ms();
-                json::Object failed{{"outcome", "failed"},
+                json::Object failed{{"kind", kind},
+                                    {"outcome", "failed"},
+                                    {"model", resolved_model},
+                                    {"requested_model", req_model},
                                     {"stop_reason", to_string(result.stats.stop_reason)},
                                     {"prompt_tokens", result.stats.prompt_tokens},
                                     {"completion_tokens", result.stats.completion_tokens},
@@ -2311,13 +2397,17 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
     }
 
     const bool emit_tokens = bus.enabled(TelemetryLevel::standard);
-    const bool capture_text = bus.options().capture_text;
+    const TextCapturePolicy configured_text_policy = resolved_text_capture(bus.options());
+    const TextCapturePolicy text_policy =
+        apply_request_opt_out(configured_text_policy, request_options.no_text_capture);
+    const bool capture_text = captures_output_text(text_policy);
     // Token-probability / candidates bounds. Sonder's own sampler (`token_logits`)
     // and remote backends (`llamaserver`) use `telemetry_top_k` whenever
     // standard token telemetry is enabled. Native in-process backends
     // (`llamacpp`) opt in via `native_token_probabilities`, `TelemetryLevel::deep`,
     // or caller-requested `sampling.logprobs`, preserving GPU backend sampling
-    // (`llama_set_sampler`) on the default server path.
+    // (`llama_set_sampler`) on the default server path. The candidates bounds count
+    // the probability-bearing tokens of this request.
     const std::int32_t telemetry_top_k =
         emit_tokens ? std::clamp<int>(bus.options().token_probability_top_k, 0, kMaxTelemetryTopK) : 0;
     const std::uint64_t candidates_stride = std::max<std::uint32_t>(1u, bus.options().token_candidates_stride);
@@ -2352,7 +2442,9 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
          (backend && ((!request_options.tools.empty() && backend->capabilities().has(Capability::tool_calling)) ||
                       (has_media && backend->capabilities().has(Capability::multimodal)))));
     const auto& parent = request_options.parent_request_id;
-    const auto with_parent = [&parent](json::Object attrs) {
+    const auto with_parent = [&parent, &resolved_model, &req_model](json::Object attrs) {
+        attrs.set("model", resolved_model);
+        attrs.set("requested_model", req_model);
         if (parent) {
             attrs.set("parent_request_id", *parent);
         }
@@ -2531,6 +2623,13 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
         }
         if (messages != nullptr) {
             started.set("chat_template", native_chat ? "native" : "generic");
+        }
+        if (captures_prompt_text(text_policy)) {
+            const std::string_view shown = truncate_utf8(effective_prompt, kMaxCapturedPromptBytes);
+            started.set("prompt", std::string(shown));
+            started.set("prompt_truncated", shown.size() < effective_prompt.size());
+        } else if (configured_text_policy != TextCapturePolicy::off && request_options.no_text_capture) {
+            started.set("text_capture_opt_out", true);
         }
         bus.emit("request.started", ctx,
                  with_parent(with_admission(std::move(started), request_options.admission_queue_ms)),
@@ -2965,6 +3064,7 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
                 chat_request.target_ttft_ms = request_options.target_ttft_ms;
                 chat_request.target_itl_ms = request_options.target_itl_ms;
                 chat_request.enable_stage_profiling = stage_profiling;
+                chat_request.local_only = request.local_only;
                 chat_request.telemetry_top_k = backend_telemetry_top_k;
                 chat_request.telemetry_candidates_stride = static_cast<std::uint32_t>(candidates_stride);
                 chat_request.telemetry_candidates_max_events = candidates_cap;
@@ -3311,7 +3411,8 @@ Result<GenerationResult> Session::run_request(const char* kind, const std::strin
     const std::uint64_t cancel_ns = cancel_requested_ns_.load();
     const std::uint64_t now_ns = monotonic_ns();
 
-    json::Object summary{{"outcome", to_string(outcome)},
+    json::Object summary{{"kind", kind},
+                         {"outcome", to_string(outcome)},
                          {"stop_reason", to_string(result.stats.stop_reason)},
                          {"prompt_tokens", result.stats.prompt_tokens},
                          {"completion_tokens", result.stats.completion_tokens},
